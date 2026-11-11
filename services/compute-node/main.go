@@ -37,11 +37,11 @@ func entry(args []string) error {
   node stop | status              Stop the node or inspect its connection
   node autostart enable|disable|status  Portable package: current-user logon startup
   node version
+  Update.cmd                     Double-click to download, verify and install updates
 
 All commands accept --home PATH (default: data beside node.exe).
 Copy the entire release folder; a new computer needs its own node credentials.
-Stop before overwriting package files. Keep data, payload and .setup directories.
-Logic-only updates reuse the installed environment and models.
+Update.cmd preserves node data and reuses unchanged environments and models.
 Autostart is opt-in and runs after user sign-in, not before login.`)
 		return nil
 	}
@@ -59,6 +59,12 @@ Autostart is opt-in and runs after user sign-in, not before login.`)
 		return err
 	}
 	root := filepath.Dir(executable)
+	if command == "_update" {
+		if !strings.EqualFold(filepath.Base(executable), "update-host.exe") || !strings.EqualFold(filepath.Base(root), ".setup") {
+			return errors.New("use Update.cmd to run the updater outside the program files")
+		}
+		root = filepath.Dir(root)
+	}
 	flags := flag.NewFlagSet("node "+command, flag.ContinueOnError)
 	home := flags.String("home", filepath.Join(root, "data"), "private node data directory")
 	from := flags.String("from", "", "import an existing private node configuration")
@@ -81,6 +87,8 @@ Autostart is opt-in and runs after user sign-in, not before login.`)
 	case "version":
 		fmt.Println("Node Comics Node", version)
 		return nil
+	case "_update":
+		return a.update()
 	case "init":
 		return a.initialize(*from)
 	case "start", "prepare":

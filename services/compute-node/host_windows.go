@@ -47,6 +47,24 @@ func acquireLock(path string) (*os.File, error) {
 	return os.NewFile(uintptr(handle), path), nil
 }
 
+// Multiple data directories may share a package. Updates take an exclusive
+// handle on this file so none of those workers can read code during a switch.
+func (a app) shareRuntime() (*os.File, error) {
+	path := filepath.Join(a.root, ".setup", "runtime.lock")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	handle, err := windows.CreateFile(name, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(handle), path), nil
+}
+
 type hostState struct {
 	PID       int       `json:"pid"`
 	Created   int64     `json:"process_created"`
@@ -115,9 +133,28 @@ func (a app) startBackground(waitForHeartbeat bool) error {
 		return nil // Spawn requested, not proof of a connected node; use status.
 	}
 	deadline := time.Now().Add(600 * time.Second)
+	lastPhase := ""
+	lastReport := time.Time{}
 	for time.Now().Before(deadline) {
 		if a.status()["connected"] == true {
 			return printJSON(a.status())
+		}
+		state, alive := a.liveHost()
+		phase := "starting supervisor"
+		if alive {
+			phase = state.Phase
+			var worker struct {
+				Phase string `json:"phase"`
+				PID   int    `json:"pid"`
+			}
+			if readJSON(filepath.Join(a.statePath(), "status.json"), &worker) == nil && worker.PID == state.WorkerPID && worker.Phase != "" {
+				phase += "/" + worker.Phase
+			}
+		}
+		if phase != lastPhase || time.Since(lastReport) >= 10*time.Second {
+			fmt.Printf("  Startup: %s; waiting for GPU warmup / controller heartbeat (%ds elapsed).\n", phase, int((600*time.Second - time.Until(deadline)).Seconds()))
+			lastPhase = phase
+			lastReport = time.Now()
 		}
 		time.Sleep(time.Second)
 	}
@@ -239,9 +276,17 @@ func (r rotatingLog) Write(data []byte) (int, error) {
 }
 
 func (a app) supervise() error {
+	if a.updatePending() {
+		return errors.New("interrupted update; run Update.cmd before starting")
+	}
 	if _, err := os.Stat(filepath.Join(a.root, ".setup", "stop")); err == nil {
 		return nil
 	}
+	runtime, err := a.shareRuntime()
+	if err != nil {
+		return errors.New("this release is being updated")
+	}
+	defer runtime.Close()
 	lock, err := acquireLock(filepath.Join(a.home, "host.lock"))
 	if err != nil {
 		return errors.New("another supervisor owns this node")

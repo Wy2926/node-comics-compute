@@ -22,6 +22,13 @@ def event(stage, **values):
     print(json.dumps({'stage': stage, **values}), flush=True)
 
 
+def progress(label, completed, total=0):
+    amount = f'{completed / 1048576:.1f} MiB'
+    if total:
+        amount += f' / {total / 1048576:.1f} MiB ({min(100, completed * 100 // total)}%)'
+    print(f'  {label}: {amount}', flush=True)
+
+
 def download(url, checksum, target):
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -39,8 +46,21 @@ def download(url, checksum, target):
                     resumed = offset and getattr(response, 'status', None) == 206
                     if resumed and not response.headers.get('Content-Range', '').startswith(f'bytes {offset}-'):
                         raise ValueError(f'Invalid download range: {target.name}')
+                    completed = offset if resumed else 0
+                    length = response.headers.get('Content-Length', '')
+                    total = completed + int(length) if length.isdigit() else 0
+                    progress(target.name, completed, total)
+                    reported = time.monotonic()
                     with temporary.open('ab' if resumed else 'wb') as output:
-                        shutil.copyfileobj(response, output, 1024 * 1024)
+                        while chunk := response.read(1024 * 1024):
+                            output.write(chunk)
+                            completed += len(chunk)
+                            if time.monotonic() - reported >= 1:
+                                progress(target.name, completed, total)
+                                reported = time.monotonic()
+                    progress(target.name, completed, total)
+                    if total and completed != total:
+                        raise OSError('Incomplete download: ' + target.name)
                 break
             except urllib.error.HTTPError as error:
                 if error.code == 416 and temporary.exists() and sha256(temporary) == checksum:
@@ -58,6 +78,7 @@ def download(url, checksum, target):
             temporary.unlink()
             raise ValueError(f'Download checksum mismatch: {target.name}')
         temporary.replace(target)
+    print(f'  Verifying {target.name}', flush=True)
     if sha256(target) != checksum:
         raise ValueError(f'Cached input checksum mismatch: {target.name}')
     return target

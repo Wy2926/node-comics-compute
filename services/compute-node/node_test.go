@@ -17,10 +17,17 @@ import (
 func TestMain(m *testing.M) {
 	if os.Getenv("NODE_TEST_FIXTURE") == "1" {
 		if len(os.Args) > 1 && os.Args[1] == "-B" {
+			if len(os.Args) > 3 && os.Args[3] == "pending" {
+				config := os.Args[len(os.Args)-3]
+				if _, err := os.Stat(filepath.Join(filepath.Dir(config), "state/pending")); err == nil {
+					os.Exit(1)
+				}
+				os.Exit(0)
+			}
 			fixtureWorker()
 			os.Exit(0)
 		}
-		if len(os.Args) > 1 && (os.Args[1] == "_host" || os.Args[1] == "doctor" || os.Args[1] == "_autostart") {
+		if len(os.Args) > 1 && (os.Args[1] == "_host" || os.Args[1] == "doctor" || os.Args[1] == "_autostart" || os.Args[1] == "_update") {
 			if err := entry(os.Args[1:]); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)

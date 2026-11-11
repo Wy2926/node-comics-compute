@@ -16,15 +16,40 @@ function Initialize-NodeTools([string]$LockFile, [string]$WorkDirectory) {
         $target = Join-Path $downloads $name
         if (-not (Test-Path -LiteralPath $target)) {
             Write-Host "Downloading pinned $name"
-            Invoke-WebRequest -UseBasicParsing -Uri $asset.url -OutFile ($target + '.partial')
+            $request = [Net.HttpWebRequest]::Create($asset.url)
+            $request.Timeout = 120000
+            $request.ReadWriteTimeout = 120000
+            $response = $request.GetResponse()
+            try {
+                $inputStream = $response.GetResponseStream()
+                $outputStream = [IO.File]::Create($target + '.partial')
+                try {
+                    $buffer = New-Object byte[] 1048576
+                    $received = 0L
+                    $timer = [Diagnostics.Stopwatch]::StartNew()
+                    while (($count = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                        $outputStream.Write($buffer, 0, $count)
+                        $received += $count
+                        if ($timer.ElapsedMilliseconds -ge 1000) {
+                            $detail = '{0:N1} MiB' -f ($received / 1MB)
+                            if ($response.ContentLength -gt 0) { $detail += ' / {0:N1} MiB ({1:N0}%)' -f ($response.ContentLength / 1MB), (100 * $received / $response.ContentLength) }
+                            Write-Host "  ${name}: $detail"
+                            $timer.Restart()
+                        }
+                    }
+                    Write-Host ('  {0}: {1:N1} MiB downloaded; verifying SHA-256' -f $name, ($received / 1MB))
+                } finally { $inputStream.Dispose(); $outputStream.Dispose() }
+            } finally { $response.Dispose() }
             if ((Get-FileDigest ($target + '.partial')) -ne $asset.sha256) { throw "Download checksum mismatch: $name" }
             Move-Item -LiteralPath ($target + '.partial') -Destination $target
         }
+        Write-Host "  Verifying cached $name"
         if ((Get-FileDigest $target) -ne $asset.sha256) { throw "Cached archive checksum mismatch: $name" }
         return $target
     }
     $uvArchive = Get-VerifiedArchive $toolchain.uv 'uv.zip'
     $pythonArchive = Get-VerifiedArchive $toolchain.python 'python.tar.gz'
+    Write-Host '[2/6] Extracting private Python and package tools...'
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $uvRoot = Join-Path $run 'uv'
     $zip = [IO.Compression.ZipFile]::OpenRead($uvArchive)

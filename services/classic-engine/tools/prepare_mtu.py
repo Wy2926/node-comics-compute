@@ -46,6 +46,7 @@ def prepare(output, cache, ocr_backend='classic'):
                                     ('ballons', 'BallonsTranslator', ('ballontranslator', 'resources')),
                                     ('comic_translate', 'comic-translate', ('modules', 'imkit'))):
         source = LOCK[key]
+        print(f'Preparing source: {repository}', flush=True)
         archive = download(source['url'], source['sha256'], cache / source['sha256'])
         with zipfile.ZipFile(archive) as package:
             prefix = repository + '-' + source['revision'] + '/'
@@ -76,6 +77,7 @@ def prepare(output, cache, ocr_backend='classic'):
     for asset in LOCK['support']:
         if not selected_asset(asset['file'], ocr_backend):
             continue
+        print(f'Preparing support: {asset["file"]}', flush=True)
         target = (output / asset['file']).resolve()
         if not target.is_relative_to(output / 'upstream'):
             raise ValueError('Unsafe upstream support path')
@@ -84,6 +86,7 @@ def prepare(output, cache, ocr_backend='classic'):
     for asset in LOCK['models']:
         if not selected_asset('models/' + asset['file'], ocr_backend):
             continue
+        print(f'Preparing model: {asset["file"]}', flush=True)
         cached = download(asset['url'], asset['sha256'], cache / asset['sha256'])
         if 'archive' in asset:
             with zipfile.ZipFile(cached) as package:
@@ -97,6 +100,7 @@ def prepare(output, cache, ocr_backend='classic'):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(cached, target)
     dictionaries = LOCK['hyphenation']
+    print('Preparing hyphenation dictionaries...', flush=True)
     wheel = download(dictionaries['url'], dictionaries['sha256'], cache / dictionaries['sha256'])
     registry = {}
     directory = output / 'hyphenation'
@@ -120,6 +124,7 @@ def prepare(output, cache, ocr_backend='classic'):
     (directory / 'dictionaries.json').write_text(json.dumps(registry, indent=2) + '\n', encoding='utf-8')
     fonts = json.loads((HOST / 'assets.json').read_text(encoding='utf-8'))['fonts']
     for font in fonts:
+        print(f'Preparing font: {font["name"]}', flush=True)
         for directory, name, url, checksum in (
             ('fonts', font['name'], font['url'], font['sha256']),
             ('licenses', font['notice'], font['notice_url'], font['notice_sha256']),

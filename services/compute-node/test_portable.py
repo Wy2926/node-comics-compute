@@ -75,6 +75,35 @@ def test_installer_rejects_unknown_package_format_before_any_download(tmp_path, 
     assert not (args.root / '.setup').exists()
 
 
+def test_update_preparation_reuses_cache_without_touching_active_payload(tmp_path, monkeypatch):
+    args = seed(tmp_path / 'next')
+    active = tmp_path / 'installed'
+    (active / 'payload').mkdir(parents=True)
+    (active / 'payload/runtime').write_bytes(b'active environment')
+    args.work = active / '.setup'
+    (args.work / 'downloads').mkdir(parents=True)
+    (args.work / 'downloads/verified').write_bytes(b'cached asset')
+
+    class FixtureBuilder:
+        def __init__(self, options):
+            assert options.work == active / '.setup'
+            self.output = options.output
+        def prepare_models(self):
+            assert (args.work / 'downloads/verified').read_bytes() == b'cached asset'
+        def package_runtime(self):
+            (self.output / 'runtime').write_bytes(b'new environment')
+        def package_fonts(self):
+            pass
+        def write_manifest(self):
+            (self.output / 'release.json').write_text('{}')
+
+    monkeypatch.setattr(portable_install, 'Builder', FixtureBuilder)
+    portable_install.install(args)
+    assert (args.root / 'payload/runtime').read_bytes() == b'new environment'
+    assert (active / 'payload/runtime').read_bytes() == b'active environment'
+    assert (args.work / 'downloads/verified').is_file()
+
+
 def test_manifest_dependency_hashes_are_independent_of_application_version(tmp_path):
     from build_release import ENGINE
     manifests = []

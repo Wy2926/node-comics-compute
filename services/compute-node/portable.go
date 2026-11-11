@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -91,6 +90,9 @@ func (a app) beginLaunch(phase string) (func(), error) {
 			lock.Close()
 		}
 	}()
+	if phase != "updating" && a.updatePending() {
+		return nil, errors.New("an interrupted update needs recovery; double-click Update.cmd first")
+	}
 	_ = os.Remove(filepath.Join(setup, "stop"))
 	if _, err := safePath(a.root, ".setup"); err != nil {
 		return nil, err
@@ -147,16 +149,8 @@ func (a app) launch(from, backend string, prepareOnly, unattended bool) error {
 			}
 		}
 		fmt.Println("Preparing private environment and models. First run downloads several GB; no system installation.")
-		setup := filepath.Join(a.root, ".setup")
-		powershell := filepath.Join(os.Getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-		cmd := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(a.root, "source/compute-node/prepare.ps1"), "-Root", a.root, "-Backend", backend)
-		cmd.Dir, cmd.Env = a.root, localEnvironment(setup)
-		if err := localDirectories(setup); err != nil {
+		if err := a.prepareEnvironment(a.root, backend); err != nil {
 			return err
-		}
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-		if err := runContained(cmd, a.jobName("prepare")); err != nil {
-			return fmt.Errorf("preparation failed; verified downloads retained: %w", err)
 		}
 	}
 	if err := a.checkPayload(backend); err != nil {
@@ -215,7 +209,9 @@ func (a app) cancelLaunch() (*os.File, error) {
 		var state hostState
 		if readJSON(filepath.Join(setup, "launcher.json"), &state) == nil && state.PID > 0 && state.PID != os.Getpid() {
 			exe, created, err := processIdentity(state.PID)
-			if err == nil && created == state.Created && strings.EqualFold(exe, filepath.Join(a.root, "node.exe")) {
+			owned := strings.EqualFold(exe, filepath.Join(a.root, "node.exe")) ||
+				(state.Phase == "updating" && strings.EqualFold(exe, filepath.Join(setup, "update-host.exe")))
+			if err == nil && created == state.Created && owned {
 				if err := terminateOwnedProcess(state); err != nil {
 					return nil, err
 				}

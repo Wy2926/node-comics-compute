@@ -79,6 +79,8 @@ def test_download_resumes_partial_and_restarts_when_range_is_ignored(tmp_path, m
     payload = b'complete verified model'
     checksum = hashlib.sha256(payload).hexdigest()
     for status in (200, 206):
+        reports = []
+        monkeypatch.setattr(build_support, 'progress', lambda name, completed, total: reports.append((completed, total)))
         target = tmp_path / str(status)
         target.with_name(target.name + '.partial').write_bytes(payload[:8])
 
@@ -86,12 +88,29 @@ def test_download_resumes_partial_and_restarts_when_range_is_ignored(tmp_path, m
             assert request.get_header('Range') == 'bytes=8-'
             response = BytesIO(payload[8:] if status == 206 else payload)
             response.status = status
-            response.headers = {'Content-Range': f'bytes 8-{len(payload) - 1}/{len(payload)}'}
+            response.headers = {'Content-Range': f'bytes 8-{len(payload) - 1}/{len(payload)}',
+                                'Content-Length': str(len(payload) - (8 if status == 206 else 0))}
             return response
 
         monkeypatch.setattr(build_support.urllib.request, 'urlopen', open_url)
         download('https://example.com/model', checksum, target)
         assert target.read_bytes() == payload
+        assert reports[0] == (8 if status == 206 else 0, len(payload))
+        assert reports[-1] == (len(payload), len(payload))
+
+
+def test_download_unknown_size_reports_bytes_without_inventing_percentage(tmp_path, monkeypatch):
+    from io import BytesIO
+    import hashlib
+    import build_support
+    payload = b'chunked response'
+    response = BytesIO(payload)
+    response.headers = {}
+    reports = []
+    monkeypatch.setattr(build_support.urllib.request, 'urlopen', lambda *a, **k: response)
+    monkeypatch.setattr(build_support, 'progress', lambda name, completed, total: reports.append((completed, total)))
+    download('https://example.com/model', hashlib.sha256(payload).hexdigest(), tmp_path / 'model')
+    assert reports[-1] == (len(payload), 0)
 
 
 def test_tool_archive_cannot_escape_destination(tmp_path):
@@ -195,6 +214,7 @@ def test_build_only_emits_portable_package(tmp_path, monkeypatch):
     builder.build()
     assert manifests == ['portable.json']
     assert (builder.output / 'Start.cmd').is_file()
+    assert (builder.output / 'Update.cmd').is_file()
     assert not (builder.output / 'payload').exists()
     with pytest.raises(ValueError, match='never overwrite a configured node'):
         builder.build()

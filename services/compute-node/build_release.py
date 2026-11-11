@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import time
 import tomllib
 
 # The bootstrap uses -I: import only the helper adjacent to this source file.
@@ -171,17 +172,24 @@ class Builder:
         run([self.tool_envs['packaging'], '-B', '-m', 'pytest', ROOT / 'test_build_release.py',
              ROOT / 'test_portable.py', ROOT / 'test_run_node.py', '-q'], cwd=ROOT, env=self.env)
         self.package_sources()
-        for name in ('Start.cmd', 'Stop.cmd', 'Status.cmd', 'Enable-Autostart.cmd', 'Disable-Autostart.cmd'):
+        for name in ('Start.cmd', 'Stop.cmd', 'Status.cmd', 'Update.cmd', 'Enable-Autostart.cmd', 'Disable-Autostart.cmd'):
             shutil.copy2(ROOT / name, self.output / name)
         self.write_manifest('portable.json')
 
     def write_manifest(self, filename='release.json'):
         portable = filename == 'portable.json'
+        paths = sorted(p for p in self.output.rglob('*') if p.is_file())
+        files = {}
+        reported = time.monotonic()
+        for index, path in enumerate(paths, 1):
+            files[path.relative_to(self.output).as_posix()] = sha256(path)
+            if time.monotonic() - reported >= 1 or index == len(paths):
+                print(f'  Verifying files: {index}/{len(paths)} ({index * 100 // len(paths)}%)', flush=True)
+                reported = time.monotonic()
         manifest = {'version': self.version, 'platform': 'windows-amd64', 'python': self.lock['python']['version'],
                     'toolchain': self.lock, 'models': {} if portable else self.model_hashes,
                     'fonts': [] if portable else self.fonts,
-                    'files': {p.relative_to(self.output).as_posix(): sha256(p)
-                              for p in sorted(self.output.rglob('*')) if p.is_file()}}
+                    'files': files}
         if portable:
             manifest['format'] = 'gpu-portable-v1'
             manifest['requirements_sha256'] = {}

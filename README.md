@@ -2,7 +2,7 @@
 
 独立图像计算节点：OCR、抹字、嵌字、覆盖层输出，以及 PDF/ZIP 文件处理。通过 HTTPS 连接 `node-comics-backend`，无需后端或插件源码。
 
-- [Windows 便携包](services/compute-node/README.md)
+- [Windows 便携包](services/compute-node/README.md)：安装进度、双击升级
 - [Linux NVIDIA](services/compute-node/linux/README.md)
 - [引擎开发](services/classic-engine/README.md) · [配置与恢复](docs/NODE_CONFIGURATION.md)
 - 文件解析包：`packages/document-files/`

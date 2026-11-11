@@ -46,6 +46,19 @@ STAGE = 'arguments'
 def event(stage, **values):
     global STAGE
     STAGE = stage
+    steps = {
+        'platform_preflight': (1, 'Checking platform and system dependencies'),
+        'source_prepare': (2, 'Preparing pinned source'),
+        'python_dependencies': (3, 'Installing locked Python/GPU dependencies'),
+        'model_font_download': (4, 'Downloading and verifying models and fonts'),
+        'node_preflight': (5, 'Checking node configuration'),
+        'asset_verification': (6, 'Verifying installed assets'),
+        'gpu_warmup': (7, 'Warming up GPU models'),
+        'service_activation': (8, 'Starting node service'),
+    }
+    if stage in steps:
+        step, description = steps[stage]
+        print(f'[{step}/8] {description}...', flush=True)
     print(json.dumps({'stage': stage, **values}), flush=True)
 
 
@@ -116,13 +129,13 @@ def host_preflight():
 
 
 def download(url, partial):
-    command = ['curl', '--fail', '--location', '--silent', '--show-error', '--proto', '=https',
+    command = ['curl', '--fail', '--location', '--progress-bar', '--show-error', '--proto', '=https',
                '--proto-redir', '=https', '--retry', '5', '--retry-all-errors', '--connect-timeout', '30',
                '--max-time', '7200', '--continue-at', '-', '--output', str(partial), url]
-    result = subprocess.run(command, stderr=subprocess.DEVNULL)
+    result = subprocess.run(command)
     if result.returncode == 33:
         partial.unlink(missing_ok=True)
-        subprocess.run(command, check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(command, check=True)
     elif result.returncode:
         raise RuntimeError('Download failed; partial cache retained')
 
