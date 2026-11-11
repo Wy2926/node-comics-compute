@@ -18,6 +18,8 @@ AMD 使用 `uv sync --project environments/amd --locked --group test`；Apple Si
 
 [OCR 耗时与并发对比](docs/OCR_PERFORMANCE.md)：阶段耗时、模型锁等待、批量、吞吐与识别摘要。
 
+[抹字耗时](docs/INPAINT_PERFORMANCE.md)：LaMa 调用、GPU 等待、AMD 图重放与预热约束。
+
 真实模型测试设置 `MTU_TEST_ASSETS`；默认测试不证明 GPU 或实图效果。中心联调在后端仓库显式设置 `COMICS_COMPUTE_ROOT`。
 
 [引擎约束](ENGINE.md) · [配置](../../docs/NODE_CONFIGURATION.md) · [第三方来源](THIRD_PARTY.md)

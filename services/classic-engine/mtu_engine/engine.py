@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 from threading import Lock, current_thread, main_thread
+from time import perf_counter
 
 import numpy as np
 
@@ -311,6 +312,9 @@ class Engine:
                                   model=ocr_model, **options)
         self._capture_guard = (self.ocr.capture_lock if backend == 'amd' and ocr_backend == 'hayai'
                                else nullcontext())
+        if backend == 'amd':
+            from .inpainting import LamaGraphs
+            self.inpainter.model.generator = LamaGraphs(self.inpainter.model.generator)
         # Upstream imports can disable OpenCV threading. Apply the node's CPU
         # budget after loading them, including DBNet and mask bilateral filters.
         cv2.setNumThreads(threads)
@@ -344,6 +348,7 @@ class Engine:
                     sample_mask[center - 15:center + 15, center - 15:center + 15] = 255
                     await self.inpainter.inpaint(sample, sample_mask, c.inpainter,
                                                 c.inpainter.inpainting_size)
+                self.inpainter.model.generator.prepare()
         with device_context(self.backend, self.gpu), self._detector_lock, self._bubble_lock:
             asyncio.run(run())
             self.bubbles.detect(rgb, device=self.device)
@@ -423,17 +428,22 @@ class Engine:
                     labels.flags.writeable = stats.flags.writeable = False
                     cache['bubble_labels'], cache['bubble_stats'] = components
         with stage('inpaint_solid_fill'):
-            filled, remaining, _ = solid_fill_pure_bubbles(rgb, mask, blocks, tight,
+            filled, remaining, solid_regions = solid_fill_pure_bubbles(rgb, mask, blocks, tight,
                 inset, self.config.ocr.model_bubble_overlap_threshold, components=components)
+            record('inpaint_solid_regions', solid_regions)
         async def inpaint(crop, local_mask):
             # The loaded FP32 LaMa eval path only reads model state; its input
             # tensors and padding are per-call. The compute pool bounds readers.
+            started = perf_counter()
             with self._capture_guard:
-                return await self.inpainter.inpaint(crop, local_mask, self.config.inpainter,
-                                                    self.config.inpainter.inpainting_size)
+                record('inpaint_lock_wait', perf_counter() - started)
+                with stage('inpaint_model'):
+                    return await self.inpainter.inpaint(crop, local_mask, self.config.inpainter,
+                                                        self.config.inpainter.inpainting_size)
         with stage('inpaint_lama'), device_context(self.backend, self.gpu):
             # solid_fill returns an owned mask; the native block loop may clear it.
-            result, _ = asyncio.run(inpaint_regions_per_block(filled, remaining, inpaint))
+            result, count = asyncio.run(inpaint_regions_per_block(filled, remaining, inpaint))
+            record('inpaint_blocks', count)
         return result
 
     def close(self):

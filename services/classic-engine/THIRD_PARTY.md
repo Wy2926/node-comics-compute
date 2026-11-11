@@ -64,6 +64,14 @@ Request-local adapters keep OCR tokens isolated between pages and preserve nativ
 
 An analysis-local bounded cache reuses identical native perspective crops, RGB/BGR conversion and Paddle preprocessing only when crop identity and padding parameters match. It does not change native preprocessing or reuse differently padded long-line inputs; arrays and retained input owners are accounted for and released at analysis exit.
 
+The AMD LaMa adapter in [inpainting.py](mtu_engine/inpainting.py) wraps the pinned
+upstream FP32 generator with PyTorch HIP graphs, captured only during startup for
+eight native square sizes (64 through 512). Original weights, preprocessing,
+window ordering and masked paste-back remain upstream-owned. Replay uses the
+caller's stream and holds its lock until the owned output clone completes;
+unsupported inputs and capture failures retain native eager inference. No model export or additional
+upstream source patch is used.
+
 ## RapidOCR
 
 [RapidAI/RapidOCR](https://github.com/RapidAI/RapidOCR) 3.9.2 provides the unmodified `TextRecognizer` aspect-ratio sorting, bounded batching, resize/padding and order restoration. Its wheel and SHA-256 are pinned in `uv.lock`; Apache-2.0 notices remain in the package metadata and source. The adapter supplies the existing MTU CUDA session and decoder instead of loading RapidOCR's default models or dictionary. Before calling it, the adapter separates crops whose width at height 48 is at most 320 from longer crops; each group uses a configurable native batch limit (default four) and native resize/padding. On a recognized allocation failure only, a request-local adapter retries the group with a smaller native batch; long-line padding and therefore predictions may change. No upstream recognition algorithm is copied or rewritten. CUDA arena extension and shrinkage use ONNX Runtime 1.23.2's provider options and public RunOptions, without a custom allocator or binary patch; color batches are configured separately.

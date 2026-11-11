@@ -23,7 +23,8 @@ LOCAL_TIMINGS = WIRE_FIELDS | OCR_FIELDS | frozenset((
     'download_get', 'download_get_attempts', 'download_retries',
     'upload_sign', 'upload_sign_attempts', 'upload_put', 'upload_put_attempts',
     'upload_retries', 'complete', 'complete_attempts', 'complete_retries',
-    'inpaint_prepare', 'inpaint_solid_fill', 'inpaint_lama'))
+    'inpaint_prepare', 'inpaint_solid_fill', 'inpaint_lama', 'inpaint_model',
+    'inpaint_blocks', 'inpaint_solid_regions', 'inpaint_graph_blocks', 'inpaint_eager_blocks'))
 
 
 def json_bytes(value):

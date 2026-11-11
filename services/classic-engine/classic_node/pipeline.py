@@ -156,9 +156,9 @@ class Pipeline:
                 finally:
                     page.timings.update(details)
                     page.timings[name] = time.monotonic() - start
-                    if name == 'analyze' and 'action' not in page.lease:
-                        LOG.info('event=page_stage lease_id=%s stage=analyze timings=%s',
-                                 page.lease['lease_id'], json.dumps(safe_timings(page.timings),
+                    if name in ('analyze', 'inpaint') and 'action' not in page.lease:
+                        LOG.info('event=page_stage lease_id=%s stage=%s timings=%s',
+                                 page.lease['lease_id'], name, json.dumps(safe_timings(page.timings),
                                      sort_keys=True, separators=(',', ':')))
 
         page.future = pool.submit(run)

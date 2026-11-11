@@ -876,6 +876,51 @@ def test_cuda_models_warmup_and_local_inpaint_offline(assets, offline, monkeypat
         engine.close()
 
 
+@pytest.mark.skipif(os.environ.get('MTU_TEST_BACKEND') != 'amd', reason='Requires explicit AMD GPU validation')
+def test_lama_graphs_match_native_pixels_through_cpu_transfer_and_concurrent_pages(assets, offline, monkeypatch):
+    import asyncio
+    from classic_node.timing import collect
+    from mtu_engine.backend import device_context
+    from mtu_engine.engine import configuration
+    from mtu_engine.inpainting import LamaGraphs
+    Renderer(*assets)
+    from manga_translator.utils import ModelWrapper
+    from manga_translator.inpainting.inpainting_lama_mpe import LamaLargeInpainter
+    monkeypatch.setattr(ModelWrapper, '_MODEL_DIR', str(assets[0]))
+    class TorchLama(LamaLargeInpainter):
+        _MODEL_MAPPING = {'model': LamaLargeInpainter._MODEL_MAPPING['model']}
+    native = TorchLama()
+    asyncio.run(native.load('cuda', force_torch=True))
+    config = configuration().inpainter
+    samples = []
+    rng = np.random.default_rng(317)
+    def infer(image, mask):
+        with device_context('amd', 0):
+            return asyncio.run(native.inpaint(image, mask, config, 512))
+    try:
+        for height, width in ((64, 64), (128, 128), (257, 257), (512, 512), (777, 777), (80, 150)):
+            image = rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
+            mask = np.zeros((height, width), np.uint8)
+            mask[height//3:height*2//3, width//4:width*3//4] = 255
+            mask[0, :width//3] = 255
+            samples.append((image, mask, infer(image, mask)))
+        native.model.generator = LamaGraphs(native.model.generator)
+        native.model.generator.prepare()
+        assert len(native.model.generator.graphs) == 8
+        def check(sample):
+            image, mask, expected = sample
+            with collect() as timings:
+                actual = infer(image, mask)
+            np.testing.assert_array_equal(actual, expected)
+            np.testing.assert_array_equal(actual[mask == 0], image[mask == 0])
+            key = 'inpaint_graph_blocks' if image.shape[0] == image.shape[1] else 'inpaint_eager_blocks'
+            assert timings[key] == 1
+        with ThreadPoolExecutor(2) as workers:
+            list(workers.map(check, samples * 2))
+    finally:
+        asyncio.run(native.unload())
+
+
 def test_missing_cuda_fails_before_loading_an_alternate_backend(monkeypatch):
     import torch
     monkeypatch.setattr(torch.version, 'hip', None)

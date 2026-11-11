@@ -95,12 +95,16 @@ def test_warmup_covers_amd_block_shapes_without_changing_cuda(analysis, backend,
     engine.ocr.recognizers = {name: SimpleNamespace(recognize=record(name)) for name in ('en', 'ch', 'korean')}
     engine.ocr.router.choose = lambda *args: calls.append(('route', None))
     engine.colors.apply = lambda *args: calls.append(('colors', None))
-    engine.inpainter = SimpleNamespace(inpaint=inpaint)
+    def prepare_graphs():
+        assert shapes == expected
+        calls.append(('graphs', None))
+    engine.inpainter = SimpleNamespace(inpaint=inpaint,
+        model=SimpleNamespace(generator=SimpleNamespace(prepare=prepare_graphs)))
     with pytest.raises(RuntimeError, match='fixture inpaint failed') if fail_at else nullcontext():
         engine.warmup()
     assert shapes == expected
     assert [name for name, _ in calls] == ['detect', 'en', 'ch', 'korean', 'route', 'colors'] + (
-        [] if fail_at else ['bubbles'])
+        [] if fail_at else (['graphs', 'bubbles'] if backend == 'amd' else ['bubbles']))
     assert not engine._detector_lock.locked() and not engine._bubble_lock.locked()
 
 

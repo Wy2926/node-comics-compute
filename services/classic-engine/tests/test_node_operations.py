@@ -69,7 +69,8 @@ def test_registration_reports_selected_backend_without_changing_protocol(tmp_pat
         journal.close()
 
 
-def test_attach_and_image_stage_never_sample_or_write_diagnostics(tmp_path, monkeypatch):
+@pytest.mark.parametrize('stage', ['analyze', 'inpaint'])
+def test_image_stage_logs_numeric_timings_without_resource_sampling(tmp_path, monkeypatch, stage):
     from classic_node.timing import record
     agent, transport, journal = make_agent(tmp_path, lambda _: httpx.Response(200, json=registration()))
     operations = Operations(tmp_path, agent.stop)
@@ -83,19 +84,24 @@ def test_attach_and_image_stage_never_sample_or_write_diagnostics(tmp_path, monk
         record('inpaint_solid_fill', .02)
         record('inpaint_lama', .03)
         return 'done'
-    page = SimpleNamespace(check=lambda: None, ready_at=time.monotonic(), timings={})
+    page = SimpleNamespace(check=lambda: None, ready_at=time.monotonic(), timings={}, lease={'lease_id': 'fixture'})
+    logs = []
     try:
         with monkeypatch.context() as patch:
             patch.setattr(agent.runtime, 'resource_snapshot', unexpected, raising=False)
             patch.setattr(operations, 'record_stage', unexpected, raising=False)
-            patch.setattr(LOG, 'info', unexpected)
+            patch.setattr(LOG, 'info', lambda message, *args: logs.append(message % args))
             operations.attach(agent)
-            agent.pipeline.submit(page, agent.pipeline.compute, 'analyze', operation)
+            agent.pipeline.submit(page, agent.pipeline.compute, stage, operation)
             assert page.future.result(timeout=5) == 'done'
             assert 'resources' not in operations.snapshot()
-        assert set(page.timings) == {'analyze_queue', 'analyze', 'ocr_lock_wait',
+        assert set(page.timings) == {stage + '_queue', stage, 'ocr_batches', 'ocr_lock_wait',
                                     'inpaint_prepare', 'inpaint_solid_fill', 'inpaint_lama'}
         assert page.timings['ocr_lock_wait'] == .125
+        assert len(logs) == 1 and f'stage={stage} timings=' in logs[0]
+        values = json.loads(logs[0].split('timings=', 1)[1])
+        assert values['inpaint_lama'] == .03
+        assert all(type(value) in (int, float) for value in values.values())
     finally:
         agent.close()
         transport.close()
