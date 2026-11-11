@@ -1,5 +1,6 @@
 """Assemble MTU stages; image algorithms and typesetting live entirely upstream."""
 import asyncio
+from contextlib import nullcontext
 import json
 import logging
 import os
@@ -308,6 +309,8 @@ class Engine:
                 imgsz=768, conf=0.25, iou=0.7, auto_download=False, auto_load=True)
             self.ocr = create_ocr(ocr_backend, self.models, gpu, threads, backend=backend,
                                   model=ocr_model, **options)
+        self._capture_guard = (self.ocr.capture_lock if backend == 'amd' and ocr_backend == 'hayai'
+                               else nullcontext())
         # Upstream imports can disable OpenCV threading. Apply the node's CPU
         # budget after loading them, including DBNet and mask bilateral filters.
         cv2.setNumThreads(threads)
@@ -352,7 +355,7 @@ class Engine:
             TextBlock, build_bubble_mask_from_mangalens_result, is_valuable_text)
         async def run():
             c = self.config
-            with stage('analyze_detect'), waiting_for(self._detector_lock, 'detect_lock_wait'):
+            with stage('analyze_detect'), waiting_for(self._detector_lock, 'detect_lock_wait'), self._capture_guard:
                 lines, raw, _ = await self.detector.detect(rgb, c.detector.detection_size,
                     c.detector.text_threshold, c.detector.box_threshold, c.detector.unclip_ratio)
             # Retain the approved upstream paragraph grouping and reading
@@ -378,11 +381,11 @@ class Engine:
             # Original pixels and OCR remain untouched. Color selection does
             # not depend on bubbles; gray text goes straight to default colors.
             # Checkpoints retain colors; resume/render never predicts again.
-            with stage('analyze_colors'):
+            with stage('analyze_colors'), self._capture_guard:
                 self.colors.apply(rgb, regions)
-            with stage('analyze_bubbles'), self._bubble_lock:
+            with stage('analyze_bubbles'), self._bubble_lock, self._capture_guard:
                 detected_bubbles = self.bubbles.detect(rgb, device=self.device)
-            with stage('analyze_bubble_mask'):
+            with stage('analyze_bubble_mask'), self._capture_guard:
                 bubbles = build_bubble_mask_from_mangalens_result(detected_bubbles, rgb.shape[:2])
                 associate_bubbles(regions, bubbles)
             with stage('analyze_refine'):
@@ -425,8 +428,9 @@ class Engine:
         async def inpaint(crop, local_mask):
             # The loaded FP32 LaMa eval path only reads model state; its input
             # tensors and padding are per-call. The compute pool bounds readers.
-            return await self.inpainter.inpaint(crop, local_mask, self.config.inpainter,
-                                                self.config.inpainter.inpainting_size)
+            with self._capture_guard:
+                return await self.inpainter.inpaint(crop, local_mask, self.config.inpainter,
+                                                    self.config.inpainter.inpainting_size)
         with stage('inpaint_lama'), device_context(self.backend, self.gpu):
             # solid_fill returns an owned mask; the native block loop may clear it.
             result, _ = asyncio.run(inpaint_regions_per_block(filled, remaining, inpaint))

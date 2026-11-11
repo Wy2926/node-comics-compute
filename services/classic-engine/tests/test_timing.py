@@ -5,7 +5,7 @@ from threading import Lock
 import pytest
 
 from classic_node import timing
-from classic_node.timing import WIRE_FIELDS, collect, record, stage, waiting_for
+from classic_node.timing import OCR_FIELDS, WIRE_FIELDS, collect, record, stage, waiting_for
 
 
 def test_collector_isolates_pages_and_accumulates_ocr_workers():
@@ -30,6 +30,13 @@ def test_timed_lock_releases_on_failure():
         except ValueError:
             pass
     assert not lock.locked() and values['inpaint_lock_wait'] >= 0
+
+
+def test_local_lock_breakdown_retains_the_wire_aggregate():
+    with collect() as values:
+        with waiting_for(Lock(), 'ocr_lock_wait', 'ocr_model_lock_wait'):
+            pass
+    assert values['ocr_lock_wait'] == values['ocr_model_lock_wait']
 
 
 def test_batch_gauges_keep_maximum_instead_of_sum_across_calls():
@@ -79,3 +86,16 @@ def test_offline_collection_nests_without_changing_production_filter():
     assert production['ocr_lock_wait'] >= 0
     assert offline['ocr_batches'] == 2 and offline['ocr_infer'] >= 0
     assert timing.current.get() is None
+
+
+def test_production_ocr_details_are_numeric_local_diagnostics_only():
+    from classic_node.document_runner import LOCAL_TIMINGS, safe_timings
+    with collect(LOCAL_TIMINGS) as values:
+        record('ocr_infer', .125)
+        record('ocr_batches', 3)
+        record('ocr_output_tokens', 42)
+        record('unlisted', 1)
+    assert OCR_FIELDS <= LOCAL_TIMINGS
+    assert safe_timings(values | {'source': 'private text', 'ocr_decode': float('nan'),
+                                 'ocr_transfer': -1, 'ocr_preprocess': 'private text'}) == values
+    assert {key: value for key, value in values.items() if key in WIRE_FIELDS} == {}

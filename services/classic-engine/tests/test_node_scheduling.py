@@ -94,6 +94,27 @@ def test_configured_network_pools_are_independent(tmp_path):
         journal.close()
 
 
+def test_ordinary_page_logs_ocr_details_without_expanding_frozen_wire_timings(agent, caplog):
+    from classic_node.timing import record
+    page = add_page(agent)
+    page.step = 'analyze'
+    pool = PendingPool()
+    def analyze():
+        record('ocr_infer', .5)
+        record('ocr_batches', 2)
+        record('private_source', 100)
+    with caplog.at_level('INFO', logger='classic-node'):
+        agent.pipeline.submit(page, pool, 'analyze', analyze)
+        pool.finish()
+    page.future.result()
+    page.future = None
+    assert 'event=page_stage' in caplog.text and '"ocr_infer":0.5' in caplog.text
+    assert 'private_source' not in caplog.text and page.lease['lease_token'] not in caplog.text
+    agent.pipeline.freeze(page, {'result': {}, 'output_bytes': None})
+    assert 'analyze' in page.completion['timings']
+    assert not {'ocr_infer', 'ocr_batches'} & page.completion['timings'].keys()
+
+
 @pytest.mark.parametrize('error,expected', [(NodeFailure('FUTURE_RENDER_DETAIL'), 'FUTURE_RENDER_DETAIL'),
                                           (ValueError('private text'), 'CLASSIC_RENDER_FAILED')])
 def test_page_failure_preserves_diagnostic_codes_and_identifies_stage(agent, error, expected):

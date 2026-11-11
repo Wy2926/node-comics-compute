@@ -12,12 +12,12 @@ from uuid import uuid4
 from .object_transfer import ObjectTransfer
 from .operations import report_page_failure
 from .protocol import ControlFailure, NodeFailure, MAX_CHECKPOINT_BYTES
-from .timing import WIRE_FIELDS
+from .timing import OCR_FIELDS, WIRE_FIELDS
 from .config import LOCAL_DEFAULTS
 
 PREFIX = 'document-lease:'
 LOG = logging.getLogger('classic-node')
-LOCAL_TIMINGS = WIRE_FIELDS | frozenset((
+LOCAL_TIMINGS = WIRE_FIELDS | OCR_FIELDS | frozenset((
     'prepare', 'prepare_queue', 'package', 'package_queue', 'persist', 'persist_queue',
     'deliver', 'deliver_queue', 'download_sign', 'download_sign_attempts',
     'download_get', 'download_get_attempts', 'download_retries',

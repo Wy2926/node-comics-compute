@@ -19,15 +19,28 @@ def test_eight_leases_four_uploads_keep_making_progress(tmp_path, scenario, loca
                    and right['start_s'] < left['end_s'] for left in network for right in compute)
 
 
-def test_throughput_accepts_unchanged_pages_without_upload_or_duplicate_settlement(tmp_path):
+@pytest.mark.parametrize('empty_ocr', [False, True])
+def test_throughput_accepts_unchanged_pages_without_upload_or_duplicate_settlement(tmp_path, empty_ocr):
     from classic_node.protocol import pack_result
     class OriginalRuntime(FixtureRuntime):
+        def analyze(self, *args, **kwargs):
+            analysis = super().analyze(*args, **kwargs)
+            if empty_ocr:
+                analysis.update(segments=[], regions=[], mask=None)
+            return analysis
+        def inpaint(self, *args, **kwargs):
+            assert not empty_ocr, 'An empty OCR page must skip inpainting'
+            return super().inpaint(*args, **kwargs)
         def render(self, original, cleaned, analysis, translated, language, alpha, **kwargs):
+            if empty_ocr:
+                assert cleaned is original
             return pack_result(original, original, alpha, self.version, analysis, translated)
     result = exercise(tmp_path, 'throughput', OriginalRuntime(), total=8, timeout=15)
     assert result['completed'] == 8 and result['journal_empty']
     assert all(page['output_bytes'] == 0 for page in result['page_profiles'])
     assert result['network_peak'].get('upload', 0) == 0
+    if empty_ocr:
+        assert all('inpaint' not in page['timings'] for page in result['page_profiles'])
 
 
 def test_measurement_fails_immediately_on_a_stage_error(tmp_path):

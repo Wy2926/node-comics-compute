@@ -48,6 +48,7 @@ def analysis(monkeypatch):
         render=SimpleNamespace(stroke_width=0.1),
         ocr=SimpleNamespace(prob=0.5, min_text_length=1), mask_dilation_offset=0, kernel_size=3)
     engine._detector_lock, engine._bubble_lock = Lock(), Lock()
+    engine._capture_guard = nullcontext()
     engine.detector = SimpleNamespace(detect=detect)
     engine.ocr.router = SimpleNamespace(classify=lambda image, blocks, groups: (['en'] * len(blocks), [None] * len(blocks)))
     engine.ocr.recognizers = {}
@@ -283,6 +284,59 @@ def test_analysis_does_not_require_new_center_timing_keys(analysis):
     assert {'analyze_detect', 'analyze_route', 'analyze_ocr', 'analyze_colors',
             'analyze_bubbles', 'analyze_bubble_mask', 'analyze_refine'} <= values.keys()
     assert all(value >= 0 for value in values.values())
+
+
+def test_graph_capture_guard_covers_other_gpu_models_but_not_page_cpu_or_ocr_replay(analysis, monkeypatch):
+    engine, source, _, calls = analysis
+    engine._capture_guard = Lock()
+    detect, colors, bubbles = engine.detector.detect, engine.colors.apply, engine.bubbles.detect
+    async def detect_guarded(*args):
+        assert engine._capture_guard.locked()
+        return await detect(*args)
+    async def recognize(rgb, lines, config):
+        assert not engine._capture_guard.locked()
+        for line in lines:
+            line.text = 'recognized'
+    def colors_guarded(*args):
+        assert engine._capture_guard.locked()
+        return colors(*args)
+    def bubbles_guarded(*args, **kwargs):
+        assert engine._capture_guard.locked()
+        return bubbles(*args, **kwargs)
+    utils = sys.modules['manga_translator.utils']
+    build_mask = utils.build_bubble_mask_from_mangalens_result
+    def mask_guarded(*args):
+        assert engine._capture_guard.locked()  # Native mask extraction may copy GPU tensors.
+        return build_mask(*args)
+    monkeypatch.setattr(utils, 'build_bubble_mask_from_mangalens_result', mask_guarded)
+    engine.detector.detect, engine.colors.apply, engine.bubbles.detect = detect_guarded, colors_guarded, bubbles_guarded
+    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
+    assert engine.analyze(source)[0]
+    assert not engine._capture_guard.locked()
+    assert [name for name, _ in calls] == ['colors', 'bubbles', 'refine']
+
+
+def test_inpaint_gpu_calls_share_capture_guard_but_cpu_preparation_does_not(analysis, monkeypatch):
+    engine, source, _, _ = analysis
+    engine._capture_guard = Lock()
+    engine.config.inpainter = SimpleNamespace(inpainting_size=512)
+    engine.config.ocr.model_bubble_overlap_threshold = .5
+    monkeypatch.setattr(sys.modules['manga_translator.utils'], 'erode_bubble_mask', lambda mask, _: mask, raising=False)
+    def fill(rgb, mask, *args, **kwargs):
+        assert not engine._capture_guard.locked()
+        return rgb, mask, None
+    async def blocks(rgb, mask, callback):
+        assert not engine._capture_guard.locked()
+        return await callback(rgb, mask), None
+    async def inpaint(rgb, mask, *args):
+        assert engine._capture_guard.locked()
+        return rgb.copy()
+    monkeypatch.setitem(sys.modules, 'manga_translator.inpainting.ballon_fill', SimpleNamespace(
+        MODEL_BUBBLE_SHRINK_RATIO=.02, solid_fill_pure_bubbles=fill, inpaint_regions_per_block=blocks))
+    engine.inpainter = SimpleNamespace(inpaint=inpaint)
+    mask = np.zeros(source.shape[:2], dtype=np.uint8)
+    np.testing.assert_array_equal(engine.inpaint(source, mask, mask, mask, []), source)
+    assert not engine._capture_guard.locked()
 
 
 def test_analysis_failure_releases_locks_without_new_timing_keys(analysis):

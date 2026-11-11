@@ -22,6 +22,19 @@ algorithms. It checks EOS/pad tokens to reject truncated paragraphs and ignores 
 upstream training-only IDS head. Runtime settings and supported validation scope are
 specified in [the adapter](mtu_engine/ocr/hayai.py) and [its tests](tests/test_ocr_backends.py).
 
+On Windows AMD, the adapter enables the upstream HIP-compatible decoder graph path,
+including its four-state LRU and native eager fallback on capture failure. The shared
+model lock also protects graph/KV state. CPU shape/mask metadata stays on CPU as expected
+by `_FastEngine`; only image patches are transferred. Graph decoding uses upstream static
+padding and may change predictions (including punctuation); it is not a bit-identical
+replacement for eager decoding. NVIDIA and MPS retain eager decoding pending separate
+hardware validation. Local timings report preprocessing, transfer, inference, decoding,
+model wait, successful graph/eager batches and truncated paragraphs without OCR text.
+The AMD capture adapter delegates to the original `_capture` method under a guard shared
+with detector, color, bubble and inpainting model calls, preventing HIP device-wide
+synchronization during graph capture. Ordinary OCR replay and CPU preprocessing do not
+take this guard. The inference and graph algorithms remain upstream-owned.
+
 ## Manga Translator UI
 
 The image pipeline imports source from [hgmzhn/manga-translator-ui](https://github.com/hgmzhn/manga-translator-ui), pinned by commit, archive URL and SHA-256 in [upstream.lock.json](mtu_engine/upstream.lock.json). Preparation retains `manga_translator/`, the upstream `LICENSE.txt`, dependency manifests and checksums under `upstream/`. The project carries GPL-3.0 terms; original notices within source files remain intact.

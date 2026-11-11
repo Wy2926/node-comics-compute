@@ -14,6 +14,14 @@ WIRE_FIELDS = frozenset(('download', 'download_queue', 'analyze', 'analyze_queue
     'local_total', 'output_put', 'render_areas', 'render_layout', 'render_diff',
     'render_encode', 'detect_lock_wait', 'ocr_lock_wait', 'inpaint_lock_wait'))
 
+OCR_FIELDS = frozenset(('analyze_detect', 'analyze_group', 'analyze_route', 'analyze_ocr',
+    'analyze_colors', 'analyze_bubbles', 'analyze_bubble_mask', 'analyze_refine', 'analyze_checkpoint',
+    'ocr_crop', 'ocr_preprocess', 'ocr_transfer', 'ocr_infer', 'ocr_decode', 'ocr_lock_wait', 'ocr_model_lock_wait',
+    'ocr_paragraphs', 'ocr_batches', 'ocr_batch_max', 'ocr_output_tokens', 'ocr_truncated',
+    'ocr_graph_batches', 'ocr_eager_batches', 'ocr_capture_wait', 'ocr_capture', 'ocr_graph_captures',
+    'ocr_width_max', 'ocr_input_bytes_max', 'ocr_ooms', 'ocr_oom_retries',
+    'ocr_cache_release', 'ocr_cache_releases'))
+
 
 @contextmanager
 def collect(fields=None):
@@ -54,12 +62,14 @@ def stage(name):
 
 
 @contextmanager
-def waiting_for(lock, name):
-    start = perf_counter() if _target(name) is not None else None
+def waiting_for(lock, *names):
+    start = perf_counter() if any(_target(name) is not None for name in names) else None
     lock.acquire()
     try:
         if start is not None:
-            record(name, perf_counter() - start)
+            elapsed = perf_counter() - start
+            for name in names:
+                record(name, elapsed)
         yield
     finally:
         lock.release()

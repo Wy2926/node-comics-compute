@@ -1,15 +1,16 @@
 """Bounded page state, with computation independent of network and text waits."""
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import json
 from threading import Lock
 import re
 import time
 
 from .protocol import MAX_CHECKPOINT_BYTES, ControlFailure, NodeFailure, digest
-from .operations import report_page_failure
+from .operations import LOG, report_page_failure
 from .timing import WIRE_FIELDS, collect
 from .config import LOCAL_DEFAULTS
-from .document_runner import LOCAL_TIMINGS
+from .document_runner import LOCAL_TIMINGS, safe_timings
 
 
 class Pipeline:
@@ -155,6 +156,10 @@ class Pipeline:
                 finally:
                     page.timings.update(details)
                     page.timings[name] = time.monotonic() - start
+                    if name == 'analyze' and 'action' not in page.lease:
+                        LOG.info('event=page_stage lease_id=%s stage=analyze timings=%s',
+                                 page.lease['lease_id'], json.dumps(safe_timings(page.timings),
+                                     sort_keys=True, separators=(',', ':')))
 
         page.future = pool.submit(run)
         page.future.add_done_callback(lambda _: self.agent.wake.set())
@@ -258,6 +263,8 @@ class Pipeline:
                     page.analysis_future = self.control.submit(self.accepted, page)
                     page.analysis_future.add_done_callback(lambda _: self.agent.wake.set())
                     page.step = 'inpaint' if page.analysis['segments'] else 'text'
+                    if not page.analysis['segments']:
+                        page.cleaned = page.rgb
                 elif page.step == 'inpaint':
                     page.cleaned = value
                     self.retain_masks(page, *('bubble_inset', 'bubble_labels', 'bubble_stats')
