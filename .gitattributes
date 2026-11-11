@@ -1,0 +1,4 @@
+*.py text eol=lf
+*.go text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf

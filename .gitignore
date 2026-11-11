@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+dist/
+data/
+artifacts/
+document-spool/
+*.log
+*.sqlite*
+.DS_Store
+private-test-data/
