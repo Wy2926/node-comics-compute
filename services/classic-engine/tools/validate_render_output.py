@@ -30,6 +30,7 @@ from classic_node.timing import collect
 TEXTS = {'en': 'THIS PERSON COULD WIELD MAGIC TO CONTROL ALL THINGS.',
          'zh-Hans': '这个人能够运用魔法，控制世间的一切事物。',
          'ja': 'この人は魔法を使って、すべてのものを操ることができた。',
+         'ko': '이 사람은 마법을 사용하여 세상의 모든 것을 다스릴 수 있었다.',
          'ar': 'كان هذا الشخص قادرًا على تسخير السحر للتحكم في كل شيء.'}
 CASES = {'sparse': (720, 12000, 3), 'many': (720, 12000, 12),
          'alpha': (720, 1200, 3), 'original': (720, 1200, 0),
@@ -349,6 +350,8 @@ def main(argv=None):
               'source_sha256': {name: file_hash(Path(__file__).resolve().parents[1] / 'classic_node' / name)
                                for name in ('render_pool.py', 'protocol.py')},
               'run': run_pool(args, fonts, sources)}
+    report['source_sha256'].update({name: file_hash(Path(__file__).resolve().parents[1] / name)
+        for name in ('mtu_engine/engine.py', 'mtu_engine/layout.py', 'mtu_engine/upstream.lock.json')})
     report['summary'] = {}
     for name in dict.fromkeys(row['case'] for row in report['run']['rows']):
         report['summary'][name] = {'wall_median_seconds': statistics.median(

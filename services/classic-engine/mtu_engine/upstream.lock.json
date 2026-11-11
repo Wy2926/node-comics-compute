@@ -76,6 +76,30 @@
           "after": "    if layout_points is None:\n        _finalize_region_font_sizes(\n            text_regions, dst_points_list, anchor_modes, config,\n            skip_font_scaling=skip_font_scaling, debug_img=debug_img,\n        )\n    for region in text_regions:\n"
         }
       ],
+      "manga_translator/rendering/text_render/_fonts.py": [
+        {
+          "before": "    glyphs: dict = field(default_factory=OrderedDict)\n",
+          "after": "    glyphs: dict = field(default_factory=OrderedDict)\n    glyph_paths: dict = field(default_factory=OrderedDict)\n    glyph_path_elements: int = 0\n"
+        },
+        {
+          "before": "        for cache in (state.raw_fonts, state.qfonts, state.glyph_specs, state.glyphs,\n                      state.measures, state.vertical):\n            cache.clear()\n",
+          "after": "        for cache in (state.raw_fonts, state.qfonts, state.glyph_specs, state.glyphs,\n                      state.glyph_paths, state.measures, state.vertical):\n            cache.clear()\n        state.glyph_path_elements = 0\n"
+        }
+      ],
+      "manga_translator/rendering/text_render/_layout.py": [
+        {
+          "before": "from PyQt6.QtGui import QFontMetricsF, QPainterPath, QTransform\n",
+          "after": "from PyQt6.QtGui import QFontMetricsF, QPainterPath, QRawFont, QTransform\n"
+        },
+        {
+          "before": "def _horizontal_glyph_path(\n",
+          "after": "# Node Comics: cache only native outlines, never shaped text or page layouts.\n_GLYPH_PATH_MAX_ENTRIES = 2048\n_GLYPH_PATH_MAX_ELEMENTS = 65536\n\n\ndef _glyph_path(raw_font, glyph_id):\n    state = _state()\n    key = (raw_font, glyph_id)\n    path = state.glyph_paths.get(key)\n    if path is not None:\n        state.glyph_paths.move_to_end(key)\n        return QPainterPath(path)\n    path = raw_font.pathForGlyph(glyph_id)\n    elements = path.elementCount()\n    if elements <= _GLYPH_PATH_MAX_ELEMENTS:\n        while state.glyph_paths and (len(state.glyph_paths) >= _GLYPH_PATH_MAX_ENTRIES or\n                state.glyph_path_elements + elements > _GLYPH_PATH_MAX_ELEMENTS):\n            _, evicted = state.glyph_paths.popitem(last=False)\n            state.glyph_path_elements -= evicted.elementCount()\n        # Both keys and paths are values: callers may resize fonts or translate paths.\n        state.glyph_paths[(QRawFont(raw_font), glyph_id)] = QPainterPath(path)\n        state.glyph_path_elements += elements\n    return path\n\n\ndef _horizontal_glyph_path(\n"
+        },
+        {
+          "before": "            glyph_path = raw_font.pathForGlyph(glyph_id)\n",
+          "after": "            glyph_path = _glyph_path(raw_font, glyph_id)\n"
+        }
+      ],
       "manga_translator/inpainting/ballon_fill.py": [
         {
           "before": "    num_labels, label_map = cv2.connectedComponents(\n        np.where(bubble_bin > 0, 1, 0).astype(np.uint8),\n        connectivity=8,\n    )\n",

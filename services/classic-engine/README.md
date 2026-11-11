@@ -20,6 +20,8 @@ AMD 使用 `uv sync --project environments/amd --locked --group test`；Apple Si
 
 [抹字耗时](docs/INPAINT_PERFORMANCE.md)：LaMa 调用、GPU 等待、AMD 图重放与预热约束。
 
+[排版嵌字验证](docs/RENDER_PERFORMANCE.md)：离线 Qt、双进程耗时、结果摘要与字体轮廓缓存边界。
+
 真实模型测试设置 `MTU_TEST_ASSETS`；默认测试不证明 GPU 或实图效果。中心联调在后端仓库显式设置 `COMICS_COMPUTE_ROOT`。
 
 [引擎约束](ENGINE.md) · [配置](../../docs/NODE_CONFIGURATION.md) · [第三方来源](THIRD_PARTY.md)
