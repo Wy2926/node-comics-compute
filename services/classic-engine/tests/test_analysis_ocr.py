@@ -53,7 +53,7 @@ def analysis(monkeypatch):
     engine.ocr.router = SimpleNamespace(classify=lambda image, blocks, groups: (['en'] * len(blocks), [None] * len(blocks)))
     engine.ocr.recognizers = {}
     engine.ocr.japanese = SimpleNamespace(recognize=lambda *args: pytest.fail('Unexpected Japanese branch'))
-    def colors(image, regions):
+    def colors(image, regions, *, capture_guard=None):
         assert image is source and not hasattr(engine, '_ocr_lock')
         assert all(not region.adjust_bg_color and region.default_stroke_width == .1 for region in regions)
         calls.append(('colors', regions))
@@ -301,8 +301,8 @@ def test_graph_capture_guard_covers_other_gpu_models_but_not_page_cpu_or_ocr_rep
         assert not engine._capture_guard.locked()
         for line in lines:
             line.text = 'recognized'
-    def colors_guarded(*args):
-        assert engine._capture_guard.locked()
+    def colors_guarded(*args, capture_guard):
+        assert capture_guard is engine._capture_guard and not capture_guard.locked()
         return colors(*args)
     def bubbles_guarded(*args, **kwargs):
         assert engine._capture_guard.locked()
@@ -313,6 +313,12 @@ def test_graph_capture_guard_covers_other_gpu_models_but_not_page_cpu_or_ocr_rep
         assert engine._capture_guard.locked()  # Native mask extraction may copy GPU tensors.
         return build_mask(*args)
     monkeypatch.setattr(utils, 'build_bubble_mask_from_mangalens_result', mask_guarded)
+    from mtu_engine import engine as implementation
+    associate = implementation.associate_bubbles
+    def associate_cpu(*args):
+        assert not engine._capture_guard.locked()
+        return associate(*args)
+    monkeypatch.setattr(implementation, 'associate_bubbles', associate_cpu)
     engine.detector.detect, engine.colors.apply, engine.bubbles.detect = detect_guarded, colors_guarded, bubbles_guarded
     engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
     assert engine.analyze(source)[0]
@@ -378,7 +384,7 @@ def test_other_page_ocr_progresses_while_a_different_model_is_busy(analysis, hel
             for line in group:
                 line.text = 'first'
 
-    def colors(image, regions):
+    def colors(image, regions, *, capture_guard=None):
         if image is source and held_stage == 'colors':
             entered.set()
             assert release.wait(5), 'Test did not release the color model'

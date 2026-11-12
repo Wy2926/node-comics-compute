@@ -1,9 +1,10 @@
 """Fenced, task-private document files; no intermediate object-storage traffic.
 
 The node's existing Journal owns the process lock. All workspaces in that
-process share one spool budget/lock; native parsing remains in the isolated
+process share one reserved spool budget; native parsing remains in the isolated
 shared parser. A lease receipt does not delete this task-owned directory.
 """
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 import hashlib
 import json
@@ -13,8 +14,9 @@ import re
 import stat
 import struct
 from threading import RLock
+from weakref import WeakValueDictionary
 
-from comic_document_files import (DocumentFileError, FileLimits, MAX_IPC_BYTES,
+from comic_document_files import (DocumentFileError, FileLimits,
     MAX_PAGES, MAX_SOURCE_BYTES, package_zip, run_file_operation)
 
 from .protocol import MAX_CHECKPOINT_BYTES
@@ -144,6 +146,13 @@ def _walk(root):
 def inventory(state_dir):
     """Bounded startup/sync inventory, including incomplete generation dirs."""
     root = Path(state_dir).absolute() / 'documents'
+    with _ROOTS_LOCK:
+        spool = _ROOTS.get(root)
+    with spool.catalog if spool is not None else nullcontext():
+        return _inventory(root)
+
+
+def _inventory(root):
     if _info(root, directory=True, missing=True) is None:
         return []
     _directory(root)
@@ -171,26 +180,53 @@ class _Spool:
     def __init__(self, root):
         self.root = _directory(root, create=True)
         self.lock = RLock()
+        self.catalog = RLock()
         self.sizes = _walk(root)  # Once on startup, not once per page/write.
         self.used = sum(self.sizes.values())
+        self.reserved = 0
+        self.locks = WeakValueDictionary()
 
     def record(self, path, size=None):
-        self.used -= self.sizes.pop(path, 0)
-        if size is not None:
-            self.sizes[path] = size
-            self.used += size
+        with self.lock:
+            self.used -= self.sizes.pop(path, 0)
+            if size is not None:
+                self.sizes[path] = size
+                self.used += size
 
-    def refresh(self, directory):
-        for path in tuple(self.sizes):
-            if path.is_relative_to(directory):
-                self.record(path)
-        if directory.exists():
-            for path, size in _walk(directory).items():
-                self.record(path, size)
+    @contextmanager
+    def reserve(self, size, limit, *, paths=(), directory=None):
+        """Reserve before I/O, settle even partial files before returning credit.
 
-    def require(self, size, limit):
-        if size < 0 or self.used + size > limit:
-            _fail('DOCUMENT_SPOOL_BUDGET')
+        The caller holds its shared document lock, never this budget lock during
+        I/O. Parser growth can adjust the reservation from its IPC reader thread.
+        """
+        allocated = 0
+        def resize(amount):
+            nonlocal allocated
+            with self.lock:
+                if type(amount) is not int or amount < 0 or self.used + self.reserved + amount - allocated > limit:
+                    _fail('DOCUMENT_SPOOL_BUDGET')
+                self.reserved += amount - allocated
+                allocated = amount
+        resize(size)
+        try:
+            yield resize
+        finally:
+            sizes = _walk(directory) if directory is not None else {}
+            for path in paths:
+                info = _info(path, missing=True)
+                if info is not None:
+                    sizes[path] = info.st_size
+            with self.lock:
+                if directory is not None:
+                    for path in tuple(self.sizes):
+                        if path.is_relative_to(directory):
+                            self.record(path)
+                for path in paths:
+                    self.record(path)
+                for path, amount in sizes.items():
+                    self.record(path, amount)
+                self.reserved -= allocated
 
 
 class DocumentWorkspace:
@@ -215,10 +251,13 @@ class DocumentWorkspace:
                 self._spool = _ROOTS[root] = _Spool(root)
         self.path = root / self.job_id / str(generation)
         with self._spool.lock:
-            if (create and _info(self.path, directory=True, missing=True) is None
-                    and len(inventory(state_dir)) >= MAX_WORKSPACES):
-                _fail('DOCUMENT_WORKSPACE_BUDGET')
-            _directory(self.path, create=create)
+            self._lock = self._spool.locks.setdefault(self.path, RLock())
+        with self._lock:
+            with self._spool.catalog:
+                if (create and _info(self.path, directory=True, missing=True) is None
+                        and len(inventory(state_dir)) >= MAX_WORKSPACES):
+                    _fail('DOCUMENT_WORKSPACE_BUDGET')
+                _directory(self.path, create=create)
             if _info(self.path / 'manifest.json', missing=True) is None:
                 if create:
                     self._save({'version': 1, 'job_id': job_id, 'workspace_generation': generation,
@@ -257,22 +296,22 @@ class DocumentWorkspace:
         self._atomic('manifest.json', _json(manifest, MAX_MANIFEST_BYTES))
 
     def _atomic(self, relative, data):
-        path = self._file(relative)
-        temporary = self._file(relative + '.part')
-        self._unlink(temporary)
-        self._spool.require(len(data), self.limits.max_spool_bytes)
-        try:
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                                 | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-            with os.fdopen(descriptor, 'wb') as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-            self._spool.record(path, len(data))
-            _fsync_directory(path.parent)
-        finally:
+        with self._lock:
+            path = self._file(relative)
+            temporary = self._file(relative + '.part')
             self._unlink(temporary)
+            with self._spool.reserve(len(data), self.limits.max_spool_bytes, paths=(path, temporary)):
+                try:
+                    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                         | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+                    with os.fdopen(descriptor, 'wb') as stream:
+                        stream.write(data)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, path)
+                    _fsync_directory(path.parent)
+                finally:
+                    self._unlink(temporary)
 
     def _unlink(self, path):
         if _info(path, missing=True) is not None:
@@ -332,7 +371,7 @@ class DocumentWorkspace:
         if kind not in {'pdf', 'zip'} or ref['mime'] != {'pdf': 'application/pdf', 'zip': 'application/zip'}[kind]:
             _fail('DOCUMENT_FORMAT_MISMATCH')
         sandbox = self.require_sandbox if require_sandbox is None else require_sandbox
-        with self._spool.lock:
+        with self._lock:
             _check(check)
             manifest = self._load()
             if manifest.get('source') not in (None, ref) or manifest.get('source_type') not in (None, kind):
@@ -344,33 +383,34 @@ class DocumentWorkspace:
                 return [{**row['input_ref'], 'page_index': row['page_index'], 'source_name': row['source_name']}
                         for row in manifest['pages']]
             source = self._file('source.bin')
-            try:
-                if not source.exists():
-                    temporary = self._file('source.bin.part')
-                    self._unlink(temporary)
-                    self._spool.require(ref['byte_size'], self.limits.max_spool_bytes)
+            if not source.exists():
+                temporary = self._file('source.bin.part')
+                self._unlink(temporary)
+                with self._spool.reserve(ref['byte_size'], self.limits.max_spool_bytes, paths=(source, temporary)):
                     download_callback(source_ref, temporary, check or (lambda: None))
                     self._verify('source.bin.part', ref, check=check)
                     with temporary.open('r+b') as stream:
                         os.fsync(stream.fileno())
                     os.replace(temporary, source)
                     _fsync_directory(self.path)
-                    self._spool.record(source, ref['byte_size'])
-                else:
-                    self._verify('source.bin', ref, check=check)
-                manifest.update(source=ref, source_type=kind)
-                self._save(manifest)
-                pages_dir = self.path / 'pages'
-                if pages_dir.exists():
-                    self._remove(pages_dir)
-                _directory(pages_dir, create=True)
-                # Budget source + all already retained workspaces + parser IPC
-                # and the next atomic manifest, not merely this page/job.
-                available = self.limits.max_spool_bytes - self._spool.used - MAX_IPC_BYTES - MAX_MANIFEST_BYTES
-                self._spool.require(MAX_IPC_BYTES + MAX_MANIFEST_BYTES, self.limits.max_spool_bytes)
+            else:
+                self._verify('source.bin', ref, check=check)
+            manifest.update(source=ref, source_type=kind)
+            self._save(manifest)
+            pages_dir = self.path / 'pages'
+            if pages_dir.exists():
+                self._remove(pages_dir)
+            _directory(pages_dir, create=True)
+            # Source is already charged. The isolated parser requests credit
+            # before writing PNG/decompression bytes, rather than taking all free
+            # space for the duration of the book.
+            with self._spool.reserve(0, self.limits.max_spool_bytes, directory=pages_dir) as reserve:
+                with self._spool.lock:
+                    available = self.limits.max_spool_bytes - self._spool.used - self._spool.reserved
                 limits = replace(self.limits, max_spool_bytes=ref['byte_size'] + available)
                 rows = run_file_operation('normalize', source, kind, pages_dir, limits=limits,
-                    check_cancelled=check, require_sandbox=sandbox)
+                    check_cancelled=check, require_sandbox=sandbox,
+                    reserve_spool=lambda size: reserve(max(0, size - ref['byte_size'])))
                 if not 1 <= len(rows) <= MAX_PAGES:
                     _fail('DOCUMENT_INCOMPLETE_PAGES')
                 pages = []
@@ -383,16 +423,14 @@ class DocumentWorkspace:
                         os.fsync(stream.fileno())
                     pages.append({'page_index': index, 'source_name': row['source_name'], 'input_ref': page_ref})
                 _fsync_directory(pages_dir)
-                self._spool.refresh(self.path)
-                manifest.update(prepared=True, pages=pages)
-                self._save(manifest)
-                return [{**row['input_ref'], 'page_index': row['page_index'], 'source_name': row['source_name']}
-                        for row in pages]
-            finally:
-                self._spool.refresh(self.path)
+            _check(check)
+            manifest.update(prepared=True, pages=pages)
+            self._save(manifest)
+            return [{**row['input_ref'], 'page_index': row['page_index'], 'source_name': row['source_name']}
+                    for row in pages]
 
     def input(self, page_index, ref=None):
-        with self._spool.lock:
+        with self._lock:
             row = self._page(self._load(), page_index)
             saved = _ref(row['input_ref'], maximum=self.limits.max_page_bytes, mime='image/png')
             if ref is not None and not _same(saved, ref):
@@ -401,7 +439,7 @@ class DocumentWorkspace:
 
     def save_analysis(self, page_index, analysis):
         data = _json(analysis, MAX_CHECKPOINT_BYTES)
-        with self._spool.lock:
+        with self._lock:
             manifest = self._load()
             row = self._page(manifest, page_index)
             self._analysis_identity(analysis, row)
@@ -418,7 +456,7 @@ class DocumentWorkspace:
             _fail()
 
     def analysis(self, page_index, ref=None):
-        with self._spool.lock:
+        with self._lock:
             row = self._page(self._load(), page_index)
             if not row.get('analysis_ref'):
                 _fail('DOCUMENT_WORKSPACE_MISSING')
@@ -453,7 +491,7 @@ class DocumentWorkspace:
         if len(data) != ref['byte_size']:
             _fail()
         _png_dimensions(data[:24], ref, self.limits)
-        with self._spool.lock:
+        with self._lock:
             manifest = self._load()
             row = self._page(manifest, page_index)
             if any(ref[name] != row['input_ref'][name] for name in ('width', 'height')):
@@ -466,7 +504,7 @@ class DocumentWorkspace:
     def _checkpoint(self, page_index, action, *, verify_files):
         if action not in _ACTIONS:
             _fail()
-        with self._spool.lock:
+        with self._lock:
             row = self._page(self._load(), page_index)
             ref = (row.get('checkpoints') or {}).get(action)
             if ref is None:
@@ -529,7 +567,7 @@ class DocumentWorkspace:
         if action not in _ACTIONS:
             _fail()
         data = _json(body, MAX_CHECKPOINT_BYTES)
-        with self._spool.lock:
+        with self._lock:
             manifest = self._load()
             row = self._page(manifest, page_index)
             self._validate_checkpoint(row, action, body, verify_files=False)
@@ -547,7 +585,7 @@ class DocumentWorkspace:
             self._save(manifest)
 
     def package(self, pages=None, check=None):
-        with self._spool.lock:
+        with self._lock:
             _check(check)
             manifest = self._load()
             if not manifest.get('prepared') or not manifest['pages']:
@@ -586,22 +624,19 @@ class DocumentWorkspace:
             temporary, destination = self._file('result.zip.part'), self._file('result.zip')
             self._unlink(temporary)
             self._unlink(destination)  # An uncommitted complete/partial ZIP is not a result.
-            available = self.limits.max_spool_bytes - self._spool.used - MAX_MANIFEST_BYTES
-            self._spool.require(MAX_MANIFEST_BYTES, self.limits.max_spool_bytes)
-            try:
+            predicted = sum(entry['byte_size'] for entry in entries) + len(entries) * 256 + 128
+            with self._spool.reserve(predicted, self.limits.max_spool_bytes, paths=(temporary, destination)):
                 output = package_zip(entries, temporary, store=None,
-                    limits=replace(self.limits, max_spool_bytes=available), check_cancelled=check)
+                    limits=replace(self.limits, max_spool_bytes=predicted), check_cancelled=check)
                 ref = _ref(output, maximum=self.limits.max_output_bytes, mime='application/zip')
                 with temporary.open('r+b') as stream:
                     os.fsync(stream.fileno())
                 os.replace(temporary, destination)
                 _fsync_directory(self.path)
-                self._spool.record(destination, ref['byte_size'])
-                manifest.update(result=ref, result_pages_hash=pages_hash)
-                self._save(manifest)
-                return destination, ref
-            finally:
-                self._spool.refresh(self.path)
+            _check(check)
+            manifest.update(result=ref, result_pages_hash=pages_hash)
+            self._save(manifest)
+            return destination, ref
 
     def _remove(self, directory):
         if directory == self._spool.root or not directory.is_relative_to(self.path):
@@ -620,7 +655,7 @@ class DocumentWorkspace:
 
     def cleanup(self):
         """Caller must have the center's terminal-generation cleanup authority."""
-        with self._spool.lock:
+        with self._lock, self._spool.catalog:
             if _info(self.path, directory=True, missing=True) is None:
                 return
             if _info(self.path / 'manifest.json', missing=True) is not None:

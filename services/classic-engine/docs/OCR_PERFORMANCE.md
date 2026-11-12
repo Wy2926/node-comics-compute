@@ -19,6 +19,8 @@
 
 AMD Hayai 使用上游 HIP Graph 解码，缓存最多四组状态，捕获失败按上游逻辑回退 eager；`ocr_graph_batches` / `ocr_eager_batches` 记录成功批次。`ocr_capture_wait` / `ocr_capture` / `ocr_graph_captures` 分别记录捕获等待、耗时和次数，包含在 `ocr_infer` 中。捕获与其他 GPU 模型调用互斥，避免 HIP 的跨线程同步冲突。Graph 的静态填充可能改变识别标点或文字，不能视为逐字等价。CUDA/MPS 仍使用 eager。
 
+颜色的黑白筛查、代表行裁剪及气泡关联在捕获保护锁外执行；原生颜色批调用（含设备传输）和气泡掩膜中的 GPU 回传仍受保护。
+
 ## 离线对比
 
 在引擎目录、对应 GPU 环境中，使用完整的本地引擎配置及私有样本：

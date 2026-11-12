@@ -110,9 +110,9 @@ def test_ordinary_page_logs_ocr_details_without_expanding_frozen_wire_timings(ag
     page.future = None
     assert 'event=page_stage' in caplog.text and '"ocr_infer":0.5' in caplog.text
     assert 'private_source' not in caplog.text and page.lease['lease_token'] not in caplog.text
-    agent.pipeline.freeze(page, {'result': {}, 'output_bytes': None})
-    assert 'analyze' in page.completion['timings']
-    assert not {'ocr_infer', 'ocr_batches'} & page.completion['timings'].keys()
+    body = agent.pipeline.freeze(page, {'result': {}, 'output_bytes': None})
+    assert 'analyze' in body['timings']
+    assert not {'ocr_infer', 'ocr_batches'} & body['timings'].keys()
 
 
 @pytest.mark.parametrize('error,expected', [(NodeFailure('FUTURE_RENDER_DETAIL'), 'FUTURE_RENDER_DETAIL'),
@@ -366,7 +366,8 @@ def test_freeze_returns_peak_budget_but_keeps_delivery_buffers_accounted(agent):
     page.rgb = page.cleaned = page.analysis = page.alpha = object()
     agent.next_claim = time.monotonic() + 20
     result = {'output_bytes': b'a' * 3072, 'result': {'output': {'byte_size': 3072}}}
-    agent.pipeline.freeze(page, result)
+    page.rendered, page.step = result, 'persist'
+    finish_persist(agent, page)
     assert page.rgb is page.cleaned is page.analysis is page.alpha is None
     assert 0 < page.reserved == agent.pipeline.used < initial
     assert page.reserved >= 3072 * 2
@@ -385,6 +386,28 @@ def test_restored_frozen_completion_is_included_in_resident_budget(agent):
     assert page.reserved == agent.pipeline.used == agent.pipeline.delivery_reservation(completion)
 
 
+def test_shutdown_after_persist_before_advance_recovers_committed_bytes(agent):
+    page = add_page(agent)
+    page.step = 'persist'
+    page.rendered = {'result': {'output': {'byte_size': 5}}, 'output_bytes': b'image'}
+    agent.pipeline.tick()
+    body = page.future.result(timeout=5)
+    assert page.completion is None and page.step == 'persist'
+    agent.close()
+    root = agent.journal.root
+    agent.journal.close()
+    # Reopen the actual SQLite files, including its exclusive process owner.
+    agent.journal = reopened = Journal(root)
+    try:
+        assert reopened.output('lease:0') == b'image'
+        assert reopened.get('lease:0')['completion'] == body
+        agent.pages.clear()
+        restored = add_page(agent)
+        assert restored.step == 'deliver' and restored.completion == body
+    finally:
+        reopened.close()
+
+
 def test_late_configuration_response_never_rolls_back_newer_version(agent):
     original = dict(agent.config)
     agent.apply_config({**original, 'version': 2, 'execution_slots': 4})
@@ -393,9 +416,21 @@ def test_late_configuration_response_never_rolls_back_newer_version(agent):
 
 
 def isolate_pipeline_pools(agent):
-    for name in ('download', 'compute', 'render', 'control', 'delivery'):
+    for name in ('download', 'compute', 'render', 'control', 'persistence', 'delivery'):
         getattr(agent.pipeline, name).shutdown(wait=True)
         setattr(agent.pipeline, name, PendingPool())
+
+
+def finish_persist(agent, page):
+    assert page.step == 'persist'
+    if not page.future:
+        agent.pipeline.submit(page, agent.pipeline.persistence, 'persist', lambda: agent.pipeline.freeze(page, page.rendered))
+    if isinstance(agent.pipeline.persistence, PendingPool):
+        index = next(i for i, call in enumerate(agent.pipeline.persistence.calls) if call[0] is page.future)
+        agent.pipeline.persistence.finish(index)
+    else:
+        page.future.result(timeout=5)
+    agent.pipeline.advance(page)
 
 
 def render_analysis(page, blocks=2):
@@ -453,6 +488,64 @@ def test_real_render_thread_does_not_hold_compute_slot(agent):
         release.set()
         if rendering.future:
             rendering.future.result(timeout=5)
+
+
+@pytest.mark.parametrize('status', ['active', 'stop', 'terminal'])
+def test_slow_persistence_dispatches_other_compute_and_drains_before_cleanup(agent, monkeypatch, status):
+    from threading import Event
+    began, release, computed = Event(), Event(), Event()
+    page, other = add_page(agent), add_page(agent, 1)
+    page.step, other.step = 'persist', 'text'
+    page.rgb = sentinel = object()
+    page.rendered = {'result': {'output': {'byte_size': 5}}, 'output_bytes': b'image'}
+    agent.pipeline.resize_reservation(page, agent.pipeline.input_reservation(page))
+    initial = page.reserved
+    freeze = agent.journal.freeze
+    def slow(*args):
+        with agent.journal.lock:
+            began.set()
+            assert release.wait(5)
+            return freeze(*args)
+    monkeypatch.setattr(agent.journal, 'freeze', slow)
+    agent.runtime.inpaint = lambda *_, **__: (computed.set(), object())[1]
+    try:
+        agent.pipeline.tick()
+        assert began.wait(3)
+        assert agent.lease_entries(phases=True)[0]['phase'] == 'render'
+        if status != 'active':
+            page.update({'status': status})
+        other.step = 'inpaint'
+        agent.poll_control()  # Real claim-gate journal reads, while its DB lock is held.
+        agent.pipeline.tick()
+        assert computed.wait(3) and page.future and not page.future.done()
+        assert page.rgb is sentinel and page.reserved == initial and page.completion is None
+    finally:
+        release.set()
+        page.future.result(timeout=5)
+    agent.pipeline.advance(page)
+    assert page.rgb is page.rendered is None and page.step == 'deliver'
+    assert agent.journal.output('lease:0') == b'image'
+    assert agent.journal.get('lease:0')['completion'] == page.completion
+    if status == 'terminal':
+        agent.reap()
+        assert '0' not in agent.pages and agent.journal.get('lease:0') is None
+
+
+def test_persistence_is_bounded_and_can_run_beside_delivery(agent):
+    isolate_pipeline_pools(agent)
+    agent.local['delivery_workers'] = 1
+    pages = [add_page(agent, index) for index in range(4)]
+    for page in pages:
+        page.step = 'persist'
+        page.rendered = {'result': {'output': None}, 'output_bytes': None}
+    for _ in range(5):
+        agent.pipeline.tick()
+    assert len(agent.pipeline.persistence.calls) == 1
+    assert sum(p.future is not None for p in pages) == 1
+    agent.pipeline.persistence.finish()
+    agent.pipeline.tick()
+    assert pages[0].step == 'deliver' and pages[0].completion is not None
+    assert len(agent.pipeline.delivery.calls) == 1 and len(agent.pipeline.persistence.calls) == 2
 
 
 def test_rendering_uses_each_pages_frozen_font_choice(agent):
@@ -556,6 +649,8 @@ def test_render_cache_is_bounded_reserved_once_and_freed_after_drain(agent, spar
     for page in pages:
         agent.pipeline.advance(page)
         assert page.render_reserved == 0
+        assert page.step == 'persist' and page.completion is None
+        finish_persist(agent, page)
         assert page.reserved == agent.pipeline.delivery_reservation(page.completion)
     assert agent.pipeline.used == sum(page.reserved for page in pages) < initial
     for page in pages:
@@ -587,7 +682,7 @@ def test_render_cache_reservation_blocks_new_downloads_until_freeze(agent):
 
 
 @pytest.mark.parametrize('outcome', ['render-error', 'freeze-error', 'stop', 'cancel-future'])
-def test_render_cache_returns_before_slow_failure_receipt_without_discarding_working_buffers(agent, monkeypatch, outcome):
+def test_render_cache_returns_before_slow_failure_receipt_without_discarding_working_buffers(agent, outcome):
     isolate_pipeline_pools(agent)
     page = add_page(agent, pixels=24_000_000)
     page.step = 'render'
@@ -606,17 +701,22 @@ def test_render_cache_returns_before_slow_failure_receipt_without_discarding_wor
     if outcome == 'render-error':
         page.future.set_exception(NodeFailure('CLASSIC_LAYOUT_OVERFLOW'))
     elif outcome == 'freeze-error':
-        def fail_freeze(current, result):
-            assert current.render_reserved == 0 and current.reserved == initial
-            raise OSError('fixture freeze failed')
-        monkeypatch.setattr(agent.pipeline, 'freeze', fail_freeze)
-        agent.pipeline.render.finish(response={'result': {'output': None}, 'output_bytes': None})
+        with agent.journal.db:
+            agent.journal.db.execute("CREATE TRIGGER fail_output BEFORE INSERT ON outputs BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+        agent.pipeline.render.finish(response={'result': {'output': {'byte_size': 5}}, 'output_bytes': b'image'})
     elif outcome == 'stop':
         page.update({'status': 'stop'})
         agent.pipeline.render.finish()  # page.check fails before render starts.
     else:
         assert page.future.cancel()
     agent.reap()
+    if outcome == 'freeze-error':
+        assert page.render_reserved == 0 and page.reserved == initial and page.completion is None
+        finish_persist(agent, page)
+        assert agent.journal.output('lease:0') is None
+        assert page.completion['error']['code'] == 'CLASSIC_LOCAL_INTERRUPTED'
+        assert 'result' not in agent.journal.get('lease:0')['completion']
+        agent.reap()
     assert page.step == 'deliver' and page.future is not None and not page.future.done()
     assert page.render_reserved == 0 and page.reserved == initial
     assert page.rgb is page.cleaned is sentinel
@@ -660,6 +760,7 @@ def test_diagnostic_timings_survive_freeze_without_changing_result(agent, timing
     agent.pipeline.submit(page, agent.pipeline.render, 'render', operation)
     page.future.result(timeout=5)
     agent.pipeline.advance(page)
+    finish_persist(agent, page)
     saved = agent.journal.get('lease:0')['completion']
     assert saved['timings'][timing_name] == .125
     assert saved['result'] == {'output': None}
@@ -668,8 +769,8 @@ def test_diagnostic_timings_survive_freeze_without_changing_result(agent, timing
 def test_detailed_profiles_stay_local_and_do_not_extend_center_contract(agent):
     page = add_page(agent)
     page.timings = {'render_layout': .1, 'analyze_ocr': .2, 'render_cache_budget_bytes': 1024**3}
-    agent.pipeline.freeze(page, {'result': {'output': None}, 'output_bytes': None})
-    assert set(page.completion['timings']) == {'render_layout', 'local_total'}
+    body = agent.pipeline.freeze(page, {'result': {'output': None}, 'output_bytes': None})
+    assert set(body['timings']) == {'render_layout', 'local_total'}
     assert page.timings['analyze_ocr'] == .2
 
 
@@ -884,6 +985,7 @@ def test_native_masks_are_page_local_counted_and_trimmed_at_stage_boundaries(age
     assert page.render_reserved == (0 if prepared else 100)  # Never reserve a fractional mask.
     agent.pipeline.render.finish()
     agent.pipeline.advance(page)
+    finish_persist(agent, page)
     assert seen == ['inpaint', 'render'] and not page.masks and page.mask_reserved == 0
     assert page.reserved == agent.pipeline.used == agent.pipeline.delivery_reservation(page.completion)
     assert not other.masks and other.mask_reserved == 0

@@ -142,7 +142,7 @@ def main():
     source, output = (Path(p).resolve(strict=True) for p in sys.argv[1:3])
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from comic_document_files import FileLimits, MAX_IPC_BYTES, _child, _limit_child
-    payload = None if len(sys.argv) == 4 else json.loads(sys.stdin.buffer.read(MAX_IPC_BYTES + 1))
+    payload = None if len(sys.argv) == 4 else json.loads(sys.stdin.buffer.readline(MAX_IPC_BYTES + 1))
     _limit_child(FileLimits(**payload['limits']) if payload else FileLimits())
     restrict(source, output, expected_parent=int(os.environ['NODE_PARSER_PARENT_PID']))
     if len(sys.argv) == 4:

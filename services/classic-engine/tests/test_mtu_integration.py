@@ -723,6 +723,7 @@ def test_native_48px_colors_reuse_ocr_and_keep_failure_fallback_offline(assets, 
         x1, y1, x2, y2 = draw.textbbox((95, 45), 'COLOR TEST', font=font, stroke_width=4)
         block = TextBlock([[[x1-3, y1-3], [x2+3, y1-3], [x2+3, y2+3], [x1-3, y2+3]]],
                           ['COLOR TEST'], language='en', adjust_bg_color=False)
+        block.ocr_line_aligned = True
         def failed(*args, **kwargs):
             raise RuntimeError('Injected color prediction failure')
         parallel = colors.predictor.color_model._forced_colors

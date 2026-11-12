@@ -25,7 +25,10 @@ class ParserSandboxTests(unittest.TestCase):
                 with self.subTest(kind=kind):
                     source = root / ('book.' + kind)
                     manifest = run_file_operation('scan', source, kind)
-                    pages = run_file_operation('normalize', source, kind, root / kind, manifest=manifest)
+                    reservations = []
+                    pages = run_file_operation('normalize', source, kind, root / kind, manifest=manifest,
+                                               reserve_spool=reservations.append)
+                    self.assertTrue(reservations)
                     self.assertEqual([p['page_index'] for p in pages], [1, 2])
                     for page in pages:
                         with Image.open(page['path']) as image:

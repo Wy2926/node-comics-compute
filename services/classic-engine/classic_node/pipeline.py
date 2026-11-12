@@ -24,6 +24,7 @@ class Pipeline:
         self.download = ThreadPoolExecutor(self.download_workers, thread_name_prefix='download')
         self.control = ThreadPoolExecutor(cfg.get('analysis_workers', self.download_workers), thread_name_prefix='analysis')
         self.delivery = ThreadPoolExecutor(cfg.get('delivery_workers', LOCAL_DEFAULTS['delivery_workers']), thread_name_prefix='delivery')
+        self.persistence = ThreadPoolExecutor(1, thread_name_prefix='persist')
         self.limit = cfg.get('resident_bytes', LOCAL_DEFAULTS['resident_bytes'])
         self.used = 0
         self.memory_lock = Lock()
@@ -137,7 +138,7 @@ class Pipeline:
         return max(0, min(batch, self.download_workers - len(downloading), available // minimum))
 
     def close(self):
-        for pool in (self.download, self.compute, self.render, self.control, self.delivery):
+        for pool in (self.download, self.compute, self.render, self.control, self.persistence, self.delivery):
             pool.shutdown(wait=True)
         for page in list(self.agent.pages.values()):
             self.release_render_buffers(page)
@@ -156,7 +157,7 @@ class Pipeline:
                 finally:
                     page.timings.update(details)
                     page.timings[name] = time.monotonic() - start
-                    if name in ('analyze', 'inpaint') and 'action' not in page.lease:
+                    if name in ('analyze', 'inpaint', 'persist') and 'action' not in page.lease:
                         LOG.info('event=page_stage lease_id=%s stage=%s timings=%s',
                                  page.lease['lease_id'], name, json.dumps(safe_timings(page.timings),
                                      sort_keys=True, separators=(',', ':')))
@@ -194,17 +195,14 @@ class Pipeline:
         saved = self.agent.journal.get('lease:' + key)
         saved.pop('analysis', None)
         self.agent.journal.freeze('lease:' + key, {**saved, 'completion': body}, result['output_bytes'])
-        page.completion = body
-        page.rgb = page.cleaned = page.analysis = page.alpha = None
-        self.retain_masks(page)
-        self.resize_reservation(page, self.delivery_reservation(body))
-        page.step = 'deliver'
+        return body
 
     def release(self, page):
         self.release_render_buffers(page)
         self.retain_masks(page)
         self.resize_reservation(page, 0)
         page.data = page.rgb = page.cleaned = page.analysis = page.alpha = page.translations = page.completion = None
+        page.rendered = None
 
     def error(self, page, error):
         if not page.future and not page.analysis_future:
@@ -271,7 +269,15 @@ class Pipeline:
                                       if 'bubble_inset' in page.masks else ('bubble_mask',))
                     page.step = 'text'
                 elif page.step == 'render':
-                    self.freeze(page, value)
+                    page.rendered, page.step = value, 'persist'
+                elif page.step == 'persist':
+                    # The worker has committed bytes + completion atomically.
+                    # Only the drained state owner releases buffers or uploads.
+                    page.completion = value
+                    page.rendered = page.rgb = page.cleaned = page.analysis = page.alpha = None
+                    self.retain_masks(page)
+                    self.resize_reservation(page, self.delivery_reservation(value))
+                    page.step = 'deliver'
                 elif page.step == 'deliver':
                     page.terminal = value
             except Exception as error:
@@ -305,12 +311,20 @@ class Pipeline:
                     continue
                 page.mask_reserved = page.lease['input']['width'] * page.lease['input']['height'] * 6
                 self.submit(page, self.download, 'download', lambda p=page: self.agent.input_bytes(p))
-            elif page.step == 'deliver':
+            elif page.step == 'persist':
+                if not any(p.future and p.step == 'persist' for p in pages):
+                    self.submit(page, self.persistence, 'persist', lambda p=page: self.freeze(p, p.rendered))
+            elif page.step == 'deliver' and self.delivery_capacity():
                 self.submit(page, self.delivery, 'deliver', lambda p=page: self.agent.deliver(p, p.completion))
         # Drain both state machines before counting shared running slots or
         # selecting ready work. DocumentRunner owns local I/O, not image pools.
         self.agent.documents.tick()
         self.dispatch()
+
+    def delivery_capacity(self):
+        busy = sum(bool(p.future and (p.step == 'deliver' or 'action' in p.lease and p.step == 'persist'))
+                   for p in self.agent.active_pages())
+        return max(0, self.agent.local.get('delivery_workers', LOCAL_DEFAULTS['delivery_workers']) - busy)
 
     def dispatch(self):
         pages = self.agent.active_pages()

@@ -480,8 +480,7 @@ class DocumentRunner:
                 continue
             if page.stopped:
                 pipeline.release(page)
-                busy = sum(bool(p.future and p.step in ('persist', 'deliver')) for p in self.agent.active_pages())
-                if time.monotonic() >= page.next_stop and busy < self.agent.local.get('delivery_workers', 4):
+                if time.monotonic() >= page.next_stop and pipeline.delivery_capacity():
                     page.next_stop = time.monotonic() + 1
                     page.step = 'deliver'
                     page.future = pipeline.delivery.submit(self.post, f'/leases/{key}/complete',
@@ -501,7 +500,7 @@ class DocumentRunner:
                     continue
                 pipeline.submit(page, pipeline.download, page.step, lambda p=page: getattr(self, p.step)(p))
             elif page.step in ('persist', 'deliver'):
-                if sum(bool(p.future and p.step in ('persist', 'deliver')) for p in self.agent.active_pages()) < self.agent.local.get('delivery_workers', 4):
+                if pipeline.delivery_capacity():
                     pipeline.submit(page, pipeline.delivery, page.step, lambda p=page: getattr(self, p.step)(p))
 
     def close_control(self):

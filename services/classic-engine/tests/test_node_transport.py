@@ -306,6 +306,37 @@ def test_binary_freeze_failure_rolls_back_completion_together_with_bytes(tmp_pat
         journal.close()
 
 
+@pytest.mark.parametrize('key', ['claim', 'document-claim'])
+@pytest.mark.parametrize('operation', ['put', 'remove'])
+def test_claim_gate_cache_publishes_only_committed_receipts(tmp_path, key, operation):
+    import sqlite3
+    journal = Journal(tmp_path)
+    original, changed = {'request_id': 'old', 'count': 2}, {'request_id': 'new', 'count': 1}
+    try:
+        journal.put(key, original)
+        journal.get(key)['request_id'] = 'mutated copy'
+        assert journal.get(key) == original
+        action = {'put': lambda: journal.put(key, changed),
+                  'remove': lambda: journal.remove(key)}[operation]
+        event = 'DELETE' if operation == 'remove' else 'INSERT'
+        journal.db.execute(f"CREATE TRIGGER fail_claim BEFORE {event} ON journal BEGIN SELECT RAISE(ABORT, 'disk failure'); END")
+        with pytest.raises(sqlite3.IntegrityError, match='disk failure'):
+            action()
+        assert journal.get(key) == original
+        assert json.loads(journal.db.execute('SELECT value FROM journal WHERE key=?', (key,)).fetchone()[0]) == original
+        journal.db.execute('DROP TRIGGER fail_claim')
+        action()
+        expected = None if operation == 'remove' else changed
+        assert journal.get(key) == expected
+    finally:
+        journal.close()
+    reopened = Journal(tmp_path)
+    try:
+        assert reopened.get(key) == expected
+    finally:
+        reopened.close()
+
+
 def test_acknowledged_output_reclaims_space_without_losing_pending_delivery(tmp_path):
     journal = Journal(tmp_path)
     completed = {'completion': {'result': 'acknowledged'}}

@@ -24,27 +24,40 @@ class Journal:
         self.db.execute('CREATE TABLE IF NOT EXISTS journal (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         self.db.execute('CREATE TABLE IF NOT EXISTS outputs (key TEXT PRIMARY KEY, data BLOB NOT NULL)')
         self.db.commit()
+        # The scheduler checks these two small receipts on every tick. Reading
+        # their last committed JSON must not wait behind a large output write.
+        self.claims = {key: None for key in ('claim', 'document-claim')}
+        self.claims.update(self.db.execute('SELECT key,value FROM journal WHERE key IN (?,?)', tuple(self.claims)))
 
     def get(self, key, default=None):
+        if key in self.claims:
+            value = self.claims[key]
+            return json.loads(value) if value is not None else default
         with self.lock:
             row = self.db.execute('SELECT value FROM journal WHERE key=?', (key,)).fetchone()
             return json.loads(row[0]) if row else default
 
     def put(self, key, value):
-        with self.lock, self.db:
-            self.db.execute('INSERT OR REPLACE INTO journal VALUES (?,?)',
-                            (key, json.dumps(value, ensure_ascii=True, allow_nan=False)))
+        data = json.dumps(value, ensure_ascii=True, allow_nan=False)
+        with self.lock:
+            with self.db:
+                self.db.execute('INSERT OR REPLACE INTO journal VALUES (?,?)', (key, data))
+            if key in self.claims:
+                self.claims[key] = data
 
     def remove(self, key):
-        with self.lock, self.db:
-            self.db.execute('DELETE FROM outputs WHERE key=?', (key,))
-            self.db.execute('DELETE FROM journal WHERE key=?', (key,))
+        with self.lock:
+            with self.db:
+                self.db.execute('DELETE FROM outputs WHERE key=?', (key,))
+                self.db.execute('DELETE FROM journal WHERE key=?', (key,))
+            if key in self.claims:
+                self.claims[key] = None
 
     def freeze(self, key, value, output):
         """A durable completion and binary bytes are one SQLite transaction."""
+        data = json.dumps(value, ensure_ascii=True, allow_nan=False)
         with self.lock, self.db:
-            self.db.execute('INSERT OR REPLACE INTO journal VALUES (?,?)',
-                            (key, json.dumps(value, ensure_ascii=True, allow_nan=False)))
+            self.db.execute('INSERT OR REPLACE INTO journal VALUES (?,?)', (key, data))
             if output is None:
                 self.db.execute('DELETE FROM outputs WHERE key=?', (key,))
             else:

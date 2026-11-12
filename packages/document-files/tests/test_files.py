@@ -225,6 +225,7 @@ def test_child_is_not_given_r2_credentials(monkeypatch, tmp_path):
         returncode = 0
         def __init__(self, command, **kwargs):
             captured.update(kwargs)
+            self.stdin = BytesIO()
             self.stdout = BytesIO(json.dumps({'result': []}).encode())
         def poll(self):
             return 0
@@ -243,6 +244,7 @@ def test_parser_stdout_flood_is_bounded_and_killed(monkeypatch, tmp_path):
     class Child:
         returncode = 0
         def __init__(self, command, **kwargs):
+            self.stdin = BytesIO()
             self.stdout = BytesIO(b'x' * (files.MAX_IPC_BYTES + 1))
         def poll(self):
             return 0
@@ -259,22 +261,19 @@ def test_parser_stdout_flood_is_bounded_and_killed(monkeypatch, tmp_path):
 def test_parser_deadline_kills_child(monkeypatch, tmp_path):
     import comic_document_files as files
     source = archive(tmp_path / 'source.zip', [('page.png', png())])
-    killed = []
-    class Child:
-        returncode = None
-        def __init__(self, command, **kwargs):
-            self.stdout = BytesIO(b'')
-        def poll(self):
-            return self.returncode
-        def wait(self):
-            return self.returncode
-        def kill(self):
-            killed.append(True)
-            self.returncode = -9
-    monkeypatch.setattr(files.subprocess, 'Popen', Child)
+    processes, popen = [], files.subprocess.Popen
+    def start(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(files.subprocess, 'Popen', start)
+    monkeypatch.setattr(files, '_parser_command', lambda: [files.sys.executable, '-I', '-c',
+        'import time; time.sleep(60)'])
     with pytest.raises(DocumentFileError, match='DOCUMENT_PARSE_TIMEOUT'):
-        run_file_operation('scan', source, 'zip', require_sandbox=False, timeout=0.001)
-    assert killed == [True]
+        # More than a pipe buffer: timeout must work while the child ignores stdin.
+        run_file_operation('scan', source, 'zip', manifest=['x' * (files.MAX_IPC_BYTES // 2)],
+                           require_sandbox=False, timeout=0.1)
+    assert processes[0].poll() is not None
 
 
 def test_required_sandbox_fails_closed_when_unavailable(monkeypatch, tmp_path):
@@ -325,3 +324,31 @@ def test_zip_digest_is_computed_during_write_without_full_zip_readback(tmp_path,
     with zipfile.ZipFile(destination) as packed:
         assert packed.testzip() is None
         assert packed.namelist() == ['0001.png', '0002.png']
+
+
+@pytest.mark.parametrize('kind', ['zip', 'pdf'])
+def test_parser_reserves_growth_before_writing_and_preserves_output(tmp_path, kind):
+    import random
+    if kind == 'pdf':
+        pytest.importorskip('pypdfium2')
+    source = tmp_path / ('source.' + kind)
+    with Image.frombytes('RGB', (768, 768), random.Random(7).randbytes(768 * 768 * 3)) as image:
+        if kind == 'pdf':
+            image.save(source, 'PDF')
+        else:
+            buffer = BytesIO()
+            image.save(buffer, 'PNG')
+            archive(source, [('1.png', buffer.getvalue()), ('2.png', buffer.getvalue())])
+    directory, requested = tmp_path / 'pages', []
+    def reserve(amount):
+        # The child cannot write the next chunk before this callback grants it.
+        actual = source.stat().st_size + sum(p.stat().st_size for p in directory.iterdir() if p.is_file())
+        assert actual <= amount
+        requested.append(amount)
+    rows = run_file_operation('normalize', source, kind, directory,
+                              require_sandbox=False, reserve_spool=reserve)
+    expected = list(normalize_pages(source, kind, tmp_path / 'expected'))
+    assert len(requested) >= 2
+    assert [{k: v for k, v in row.items() if k != 'path'} for row in rows] == [
+        {k: v for k, v in row.items() if k != 'path'} for row in expected]
+    assert all(left['path'].read_bytes() == right['path'].read_bytes() for left, right in zip(rows, expected))

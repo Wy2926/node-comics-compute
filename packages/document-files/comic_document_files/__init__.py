@@ -13,13 +13,12 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
-from threading import Event, Thread
+from threading import Thread
 import time
 import unicodedata
 import zipfile
@@ -207,12 +206,14 @@ def scan_source(path, source_type, *, limits=None):
 
 
 class _BoundedWriter:
-    def __init__(self, stream, maximum):
-        self.stream, self.maximum = stream, maximum
+    def __init__(self, stream, maximum, reserve=None):
+        self.stream, self.maximum, self.reserve = stream, maximum, reserve
 
     def write(self, value):
         if self.stream.tell() + len(value) > self.maximum:
             raise DocumentFileError('DOCUMENT_SPOOL_BUDGET')
+        if self.reserve:
+            self.reserve(self.stream.tell() + len(value))
         return self.stream.write(value)
 
     def __getattr__(self, name):
@@ -234,7 +235,7 @@ class _ZipWriter(_BoundedWriter):
         return written
 
 
-def _save_png(image, path, limits, *, remaining):
+def _save_png(image, path, limits, *, remaining, reserve=None):
     from PIL import Image, ImageCms, ImageOps
     _dimensions(*image.size, limits)
     if getattr(image, 'n_frames', 1) != 1:
@@ -252,7 +253,7 @@ def _save_png(image, path, limits, *, remaining):
         try:
             normalized.info.clear()
             with path.open('xb') as output:
-                normalized.save(_BoundedWriter(output, min(limits.max_page_bytes, remaining)), format='PNG', compress_level=3)
+                normalized.save(_BoundedWriter(output, min(limits.max_page_bytes, remaining), reserve), format='PNG', compress_level=3)
             width, height = normalized.size
         finally:
             normalized.close()
@@ -264,7 +265,8 @@ def _save_png(image, path, limits, *, remaining):
             'mime': 'image/png', 'width': width, 'height': height}
 
 
-def normalize_pages(path, source_type, directory, *, manifest=None, limits=None, check_cancelled=None):
+def normalize_pages(path, source_type, directory, *, manifest=None, limits=None, check_cancelled=None,
+                    reserve_spool=None):
     from PIL import Image, UnidentifiedImageError
     limits = limits or FileLimits()
     path, kind = _source(path, source_type)
@@ -279,7 +281,8 @@ def normalize_pages(path, source_type, directory, *, manifest=None, limits=None,
         nonlocal used
         _check(check_cancelled)
         target = directory / f"{page['page_index']:04}.png"
-        result = _save_png(image, target, limits, remaining=limits.max_spool_bytes - used - temporary_bytes)
+        result = _save_png(image, target, limits, remaining=limits.max_spool_bytes - used - temporary_bytes,
+            reserve=(lambda size: reserve_spool(used + temporary_bytes + size)) if reserve_spool else None)
         used += result['byte_size']
         if used > limits.max_spool_bytes:
             target.unlink(missing_ok=True)
@@ -300,6 +303,8 @@ def normalize_pages(path, source_type, directory, *, manifest=None, limits=None,
                                 written += len(chunk)
                                 if written > page['locator']['byte_size'] or used + written > limits.max_spool_bytes:
                                     raise DocumentFileError('DOCUMENT_ARCHIVE_BUDGET')
+                                if reserve_spool:
+                                    reserve_spool(used + written)
                                 spool.write(chunk)
                         if written != page['locator']['byte_size']:
                             raise DocumentFileError('DOCUMENT_INVALID_ARCHIVE')
@@ -308,6 +313,8 @@ def normalize_pages(path, source_type, directory, *, manifest=None, limits=None,
                             if image.format not in {'PNG', 'JPEG', 'WEBP', 'GIF'}:
                                 raise DocumentFileError('DOCUMENT_UNSUPPORTED_ENTRY')
                             yield finish(page, image, temporary_bytes=written)
+                    if reserve_spool:
+                        reserve_spool(used)
         else:
             with _pdf(path) as document:
                 for entry in actual:
@@ -323,6 +330,8 @@ def normalize_pages(path, source_type, directory, *, manifest=None, limits=None,
                                 image.close()
                         finally:
                             bitmap.close()
+                    if reserve_spool:
+                        reserve_spool(used)
     except DocumentFileError:
         raise
     except (UnidentifiedImageError, Image.DecompressionBombError, zipfile.BadZipFile, OSError, ValueError):
@@ -441,11 +450,12 @@ def check_parser_sandbox(spool_path=None, *, require_sandbox=True):
 
 
 def run_file_operation(action, source, source_type, directory=None, manifest=None, *, limits=None,
-                       timeout=None, check_cancelled=None, require_sandbox=True):
+                       timeout=None, check_cancelled=None, require_sandbox=True, reserve_spool=None):
     """Bounded child result (<=200 descriptors); decoded pixels never cross IPC.
 
     normalize saves all pages under max_spool_bytes in the caller's private
-    workspace. The caller owns their durable checkpoints and eventual cleanup.
+    workspace. reserve_spool, when provided, grants total source + output +
+    temporary bytes before writes. The caller settles remaining files on exit.
     """
     if action not in {'scan', 'normalize'}:
         raise ValueError('Unknown document file operation')
@@ -458,37 +468,50 @@ def run_file_operation(action, source, source_type, directory=None, manifest=Non
         output = Path(directory).resolve() if directory else Path(temporary)
         output.mkdir(parents=True, exist_ok=True)
         payload = {'action': action, 'source': str(source), 'source_type': source_type,
-                   'directory': str(output), 'manifest': manifest, 'limits': asdict(limits)}
+                   'directory': str(output), 'manifest': manifest, 'limits': asdict(limits),
+                   'reserve_spool': reserve_spool is not None}
         environment = _child_environment(output)
-        command = _parser_command()
-        sandboxed = sys.platform.startswith('linux') and require_sandbox
-        if require_sandbox and not sys.platform.startswith('linux'):
-            raise DocumentFileError('DOCUMENT_SANDBOX_UNAVAILABLE')
-        if sandboxed:
-            command = _sandbox_command(source, output)
+        command = _sandbox_command(source, output) if require_sandbox else _parser_command()
         data = json.dumps(payload, ensure_ascii=False).encode()
         if len(data) > MAX_IPC_BYTES:
             raise DocumentFileError('DOCUMENT_MANIFEST_TOO_LARGE')
-        request_file = tempfile.TemporaryFile(dir=temporary)
-        request_file.write(data)
-        request_file.seek(0)
         try:
             process = subprocess.Popen(command, cwd=Path(__file__).resolve().parent.parent, env=environment,
-                stdin=request_file, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         except OSError:
-            request_file.close()
             raise DocumentFileError('DOCUMENT_PARSE_FAILED') from None
         result = bytearray()
-        overflow = Event()
+        failures = []
 
         def read_result():
-            while chunk := process.stdout.read(65536):
-                if len(result) + len(chunk) > MAX_IPC_BYTES:
-                    overflow.set()
-                    process.kill()
-                    return
-                result.extend(chunk)
+            try:
+                # A child that stops consuming stdin still remains subject to
+                # the parent's timeout and cancellation checks.
+                process.stdin.write(data + b'\n')
+                process.stdin.flush()
+                control_bytes = 0
+                while chunk := process.stdout.readline(MAX_IPC_BYTES + 1):
+                    if len(chunk) > MAX_IPC_BYTES:
+                        raise DocumentFileError('DOCUMENT_PARSE_FAILED')
+                    message = json.loads(chunk)
+                    if isinstance(message, dict) and set(message) == {'spool'}:
+                        amount = message['spool']
+                        control_bytes += len(chunk)
+                        if (reserve_spool is None or type(amount) is not int or not 0 <= amount <= limits.max_spool_bytes
+                                or control_bytes > MAX_IPC_BYTES or result):
+                            raise DocumentFileError('DOCUMENT_PARSE_FAILED')
+                        reserve_spool(amount)
+                        process.stdin.write(b'1\n')
+                        process.stdin.flush()
+                    else:
+                        if result:
+                            raise DocumentFileError('DOCUMENT_PARSE_FAILED')
+                        result.extend(chunk)
+            except Exception as error:
+                failures.append(error if isinstance(error, DocumentFileError) or getattr(error, 'code', None)
+                                else DocumentFileError('DOCUMENT_PARSE_FAILED'))
+                process.kill()
 
         reader = Thread(target=read_result, daemon=True)
         reader.start()
@@ -500,10 +523,10 @@ def run_file_operation(action, source, source_type, directory=None, manifest=Non
                     raise DocumentFileError('DOCUMENT_PARSE_TIMEOUT')
                 time.sleep(0.05)
             reader.join()
-            if overflow.is_set():
-                raise DocumentFileError('DOCUMENT_PARSE_FAILED')
+            if failures:
+                raise failures[0]
             if process.returncode != 0:
-                raise DocumentFileError('DOCUMENT_SANDBOX_UNAVAILABLE' if sandboxed and not result else 'DOCUMENT_PARSE_FAILED')
+                raise DocumentFileError('DOCUMENT_SANDBOX_UNAVAILABLE' if require_sandbox and not result else 'DOCUMENT_PARSE_FAILED')
             try:
                 reply = json.loads(result)
             except (ValueError, UnicodeError):
@@ -540,7 +563,10 @@ def run_file_operation(action, source, source_type, directory=None, manifest=Non
                 process.kill()
             process.wait()
             reader.join()
-            request_file.close()
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass  # A killed child may leave buffered request bytes.
             if process.stdout:
                 process.stdout.close()
 
@@ -557,15 +583,27 @@ def _limit_child(limits):
 
 def _child(payload=None):
     if payload is None:
-        payload = json.loads(sys.stdin.buffer.read(MAX_IPC_BYTES + 1))
+        payload = json.loads(sys.stdin.buffer.readline(MAX_IPC_BYTES + 1))
         _limit_child(FileLimits(**payload['limits']))
     limits = FileLimits(**payload['limits'])
+    allocated = 0
+    def reserve(size):
+        nonlocal allocated
+        # Amortize small PNG writes; credit also covers the temporary ZIP entry.
+        amount = min(limits.max_spool_bytes, ((size + CHUNK_BYTES - 1) // CHUNK_BYTES) * CHUNK_BYTES)
+        if amount != allocated:
+            sys.stdout.buffer.write(json.dumps({'spool': amount}).encode() + b'\n')
+            sys.stdout.buffer.flush()
+            if sys.stdin.buffer.readline(3) != b'1\n':
+                raise DocumentFileError('DOCUMENT_PARSE_FAILED')
+            allocated = amount
     try:
         if payload['action'] == 'scan':
             result = scan_source(payload['source'], payload['source_type'], limits=limits)
         else:
             result = list(normalize_pages(payload['source'], payload['source_type'], payload['directory'],
-                                          manifest=payload['manifest'], limits=limits))
+                manifest=payload['manifest'], limits=limits,
+                reserve_spool=reserve if payload.get('reserve_spool') else None))
         reply = {'result': result}
     except DocumentFileError as error:
         reply = {'error': error.code}

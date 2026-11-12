@@ -32,6 +32,7 @@ class Page:
         self.masks = {}
         self.next_stop = 0
         self.data = self.metadata = self.rgb = self.cleaned = self.analysis = self.alpha = self.completion = None
+        self.rendered = None
         self.received_at = sent_at
         self.translations = lease.get('translations')
         self.update(lease, server_time, sent_at)
@@ -151,7 +152,8 @@ class Agent:
                 item = {'lease_id': key, 'lease_token': page.lease['lease_token'],
                         'translations_revision': page.translations['revision'] if page.translations else None}
                 if phases:
-                    item['phase'] = page.phase
+                    # v3 has no separate persistence phase on the wire.
+                    item['phase'] = 'render' if page.phase == 'persist' else page.phase
                 entries.append(item)
         return entries
 

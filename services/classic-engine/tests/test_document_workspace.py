@@ -7,6 +7,7 @@ from pathlib import Path
 import stat
 import struct
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 import zipfile
 
 import pytest
@@ -15,7 +16,7 @@ from PIL import Image
 from comic_document_files import DocumentFileError, FileLimits
 from classic_node import document_workspace as workspaces
 from classic_node.document_workspace import DocumentWorkspace, inventory
-from classic_node.protocol import digest
+from classic_node.protocol import NodeFailure, digest
 
 
 def png(color='white', size=(32, 48)):
@@ -289,21 +290,6 @@ def test_spool_budget_recounts_uncommitted_files_after_restart(tmp_path):
         second._atomic('source.bin', b'x' * 1000)
 
 
-def test_concurrent_workspaces_share_one_budget_admission(tmp_path):
-    limits = replace(FileLimits(), max_spool_bytes=1700)
-    first = DocumentWorkspace(tmp_path, 'first', 1, limits=limits, create=True)
-    second = DocumentWorkspace(tmp_path, 'second', 1, limits=limits, create=True)
-    def write(workspace):
-        try:
-            with workspace._spool.lock:
-                workspace._atomic('source.bin', b'x' * 1000)
-            return True
-        except DocumentFileError:
-            return False
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        assert sorted(pool.map(write, (first, second))) == [False, True]
-
-
 def test_prepare_parser_budget_subtracts_other_workspaces(tmp_path, monkeypatch):
     limits = replace(FileLimits(), max_spool_bytes=3 * 1024 * 1024)
     first = DocumentWorkspace(tmp_path, 'first', 1, limits=limits, require_sandbox=False, create=True)
@@ -317,6 +303,128 @@ def test_prepare_parser_budget_subtracts_other_workspaces(tmp_path, monkeypatch)
     data = source_bytes(1)
     second.prepare(ref(data), 'zip', download(data))
     assert captured[0] < limits.max_spool_bytes - 300_000
+
+
+@pytest.mark.parametrize('stage', ['download', 'normalize', 'package'])
+def test_slow_document_io_does_not_block_another_workspace(tmp_path, monkeypatch, stage):
+    first, rows = prepared(tmp_path, count=1, job_id='first')
+    second = DocumentWorkspace(tmp_path, 'second', 1, create=True, require_sandbox=False)
+    entered, release = Event(), Event()
+    def paused(operation):
+        def run(*args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return operation(*args, **kwargs)
+        return run
+    data = source_bytes(1)
+    if stage == 'download':
+        operation = lambda: second.prepare(ref(data), 'zip', paused(download(data)))
+    elif stage == 'normalize':
+        monkeypatch.setattr(workspaces, 'run_file_operation', paused(workspaces.run_file_operation))
+        operation = lambda: second.prepare(ref(data), 'zip', download(data))
+    else:
+        saved, _ = save_render(first, rows[0])
+        monkeypatch.setattr(workspaces, 'package_zip', paused(workspaces.package_zip))
+        operation = lambda: first.package([{'page_index': 1, 'output_ref': saved}])
+    with ThreadPoolExecutor(2) as pool:
+        pending = pool.submit(operation)
+        try:
+            assert entered.wait(3)
+            if stage == 'package':
+                pool.submit(second._atomic, 'progress.bin', b'progress').result(timeout=3)
+            else:
+                pool.submit(save_ocr, first, rows[0]).result(timeout=3)
+                assert pool.submit(first.input, 1).result(timeout=3)
+            assert not pending.done()
+        finally:
+            release.set()
+        pending.result(timeout=10)
+    assert first._spool.reserved == 0
+    assert first._spool.used == sum(workspaces._walk(tmp_path / 'documents').values())
+
+
+def test_same_workspace_instances_serialize_manifest_updates_and_cleanup(tmp_path, monkeypatch):
+    first, rows = prepared(tmp_path)
+    second = DocumentWorkspace(tmp_path, 'job-one', 1, owner_id='node-a')
+    assert first._lock is second._lock
+    entered, release, attempted = Event(), Event(), Event()
+    save = first._save
+    def blocked(manifest):
+        entered.set()
+        assert release.wait(5)
+        save(manifest)
+    monkeypatch.setattr(first, '_save', blocked)
+    def other():
+        attempted.set()
+        return save_ocr(second, rows[1])
+    with ThreadPoolExecutor(2) as pool:
+        one = pool.submit(save_ocr, first, rows[0])
+        try:
+            assert entered.wait(3)
+            two = pool.submit(other)
+            assert attempted.wait(3) and not two.done()
+        finally:
+            release.set()
+        one.result(timeout=5)
+        two.result(timeout=5)
+    assert all(first.checkpoint(index, 'doc_ocr') for index in (1, 2))
+    second.cleanup()
+    assert not first.path.exists() and first._spool.used == first._spool.reserved == 0
+
+
+def test_inflight_atomic_temporary_is_reserved_and_failure_returns_credit(tmp_path, monkeypatch):
+    limits = replace(FileLimits(), max_spool_bytes=1800)
+    first = DocumentWorkspace(tmp_path, 'first', 1, limits=limits, create=True)
+    second = DocumentWorkspace(tmp_path, 'second', 1, limits=limits, create=True)
+    entered, release = Event(), Event()
+    replace_file = workspaces.os.replace
+    def blocked(source, target):
+        if target == first.path / 'source.bin':
+            entered.set()
+            assert release.wait(5)
+            raise OSError('disk failure')
+        return replace_file(source, target)
+    monkeypatch.setattr(workspaces.os, 'replace', blocked)
+    with ThreadPoolExecutor(1) as pool:
+        pending = pool.submit(first._atomic, 'source.bin', b'x' * 1000)
+        try:
+            assert entered.wait(3) and first._spool.reserved == 1000
+            with pytest.raises(DocumentFileError, match='SPOOL_BUDGET'):
+                second._atomic('source.bin', b'x' * 1000)
+        finally:
+            release.set()
+        with pytest.raises(OSError, match='disk failure'):
+            pending.result(timeout=3)
+    assert first._spool.reserved == 0 and not (first.path / 'source.bin.part').exists()
+    second._atomic('source.bin', b'x' * 1000)
+    assert first._spool.used == sum(workspaces._walk(tmp_path / 'documents').values())
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_real_parser_growth_denial_and_cancellation_settle_partial_files(tmp_path, monkeypatch, cancel):
+    workspace = DocumentWorkspace(tmp_path, 'job', 1, create=True, require_sandbox=False)
+    data = source_bytes(1)
+    original = workspaces.run_file_operation
+    calls = []
+    def denied(*args, **kwargs):
+        reserve = kwargs['reserve_spool']
+        def demand(size):
+            calls.append(size)
+            if cancel:
+                reserve(size)
+                raise NodeFailure('LEASE_STOPPED')
+            reserve(workspace.limits.max_spool_bytes + 1)
+        return original(*args, **{**kwargs, 'reserve_spool': demand})
+    monkeypatch.setattr(workspaces, 'run_file_operation', denied)
+    with pytest.raises((NodeFailure, DocumentFileError), match='LEASE_STOPPED' if cancel else 'SPOOL_BUDGET'):
+        workspace.prepare(ref(data), 'zip', download(data))
+    assert calls and workspace._spool.reserved == 0
+    assert not list((workspace.path / 'pages').glob('*.png'))
+    assert workspace._spool.used == sum(workspaces._walk(tmp_path / 'documents').values())
+    assert not json.loads((workspace.path / 'manifest.json').read_bytes())['prepared']
+    monkeypatch.setattr(workspaces, 'run_file_operation', original)
+    assert len(workspace.prepare(ref(data), 'zip', download(data))) == 1
+    assert workspace._spool.reserved == 0
 
 
 def test_cleanup_is_exact_generation_and_never_a_page_receipt(tmp_path):
@@ -374,7 +482,9 @@ def test_hardlinks_are_rejected_before_reads_or_cleanup(tmp_path):
 
 def test_production_sandbox_is_required_and_never_falls_back(tmp_path, monkeypatch):
     import comic_document_files
-    monkeypatch.setattr(comic_document_files.shutil, 'which', lambda _: None)
+    def unavailable(*_):
+        raise DocumentFileError('DOCUMENT_SANDBOX_UNAVAILABLE')
+    monkeypatch.setattr(comic_document_files, '_sandbox_command', unavailable)
     workspace = DocumentWorkspace(tmp_path, 'job', 1, create=True)
     data = source_bytes(1)
     with pytest.raises(DocumentFileError, match='SANDBOX_UNAVAILABLE'):

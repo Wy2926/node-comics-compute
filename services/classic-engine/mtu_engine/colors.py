@@ -1,4 +1,5 @@
 """Adapt MTU color prediction and keep the rendered outline readable."""
+from contextlib import nullcontext
 from copy import copy
 from functools import partial
 from threading import Lock
@@ -208,7 +209,7 @@ class Colors:
                 return crop, self._encode(texts[index])
         return None, None
 
-    def apply(self, image, regions):
+    def apply(self, image, regions, *, capture_guard=None):
         from manga_translator.utils import chunks
         predicted = []
         skipped_lines = 0
@@ -249,7 +250,10 @@ class Colors:
                     model = self.predictor.color_model
                     predictor.color_model = SimpleNamespace(dictionary=model.dictionary,
                         infer_beam_batch_tensor=partial(model.infer_with_text, text_indices=tokens))
-                colors = predictor._estimate_colors_batch(crops)
+                # Native preprocessing includes GPU transfers; protect the whole
+                # batch call, but not CPU-only screening/cropping or region updates.
+                with capture_guard if capture_guard is not None else nullcontext():
+                    colors = predictor._estimate_colors_batch(crops)
                 for region, color in zip(owners, colors, strict=True):
                     # update_font_colors divides by the original OCR line count,
                     # which would darken a single representative prediction.

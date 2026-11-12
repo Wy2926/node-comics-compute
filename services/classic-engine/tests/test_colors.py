@@ -3,7 +3,7 @@ import json
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 
 import numpy as np
@@ -76,6 +76,44 @@ def test_color_model_returns_detached_cpu_tensors_without_changing_inference(col
                for args, kwargs in calls)
     assert proxy.model.infer_beam_batch_tensor is infer
     assert channels.requires_grad and flags.requires_grad
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_capture_guard_skips_gray_cpu_work_but_protects_model_batches(colors, plain_gate, fail):
+    adapter, native = colors
+    guard, cropped, called = Lock(), Event(), Event()
+    original = adapter._representative
+    def crop(*args):
+        value = original(*args)
+        assert guard.locked()
+        cropped.set()
+        return value
+    adapter._representative = crop
+    def predict(crops):
+        assert guard.locked()
+        called.set()
+        if fail:
+            raise RuntimeError('model failed')
+        return [(0, 0, 0, 255, 255, 255)] * len(crops)
+    native._estimate_colors_batch = predict
+    gray = region([plain_crop()])
+    colored = plain_crop()
+    colored[12:36, 30:70] = [180, 10, 20]
+    guard.acquire()
+    with ThreadPoolExecutor(2) as pool:
+        try:
+            pool.submit(adapter.apply, None, [gray], capture_guard=guard).result(timeout=3)
+            assert gray.bg_colors.tolist() == [255, 255, 255] and not called.is_set()
+            future = pool.submit(adapter.apply, None, [region([colored])], capture_guard=guard)
+            assert cropped.wait(3) and not future.done() and not called.is_set()
+        finally:
+            guard.release()
+        if fail:
+            with pytest.raises(RuntimeError, match='model failed'):
+                future.result(timeout=3)
+        else:
+            future.result(timeout=3)
+    assert called.is_set() and not guard.locked()
 
 
 def test_color_model_preserves_native_exception_for_upstream_fallback(colors, monkeypatch):

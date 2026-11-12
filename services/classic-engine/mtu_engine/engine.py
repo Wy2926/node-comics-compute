@@ -386,12 +386,15 @@ class Engine:
             # Original pixels and OCR remain untouched. Color selection does
             # not depend on bubbles; gray text goes straight to default colors.
             # Checkpoints retain colors; resume/render never predicts again.
-            with stage('analyze_colors'), self._capture_guard:
-                self.colors.apply(rgb, regions)
+            with stage('analyze_colors'):
+                self.colors.apply(rgb, regions, capture_guard=self._capture_guard)
             with stage('analyze_bubbles'), self._bubble_lock, self._capture_guard:
                 detected_bubbles = self.bubbles.detect(rgb, device=self.device)
-            with stage('analyze_bubble_mask'), self._capture_guard:
-                bubbles = build_bubble_mask_from_mangalens_result(detected_bubbles, rgb.shape[:2])
+            with stage('analyze_bubble_mask'):
+                # Native mask construction still reads GPU tensors. Association
+                # only consumes the resulting CPU mask and independent regions.
+                with self._capture_guard:
+                    bubbles = build_bubble_mask_from_mangalens_result(detected_bubbles, rgb.shape[:2])
                 associate_bubbles(regions, bubbles)
             with stage('analyze_refine'):
                 mask = await refine(regions, rgb, raw, dilation_offset=c.mask_dilation_offset,
