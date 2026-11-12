@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import stat
 import struct
+import subprocess
+import sys
 import zipfile
 
 import pytest
@@ -184,6 +186,24 @@ def test_unsandboxed_runtime_probe_checks_pdf_and_zip_in_current_source(tmp_path
         str(Path(shared.__file__).with_name('__main__.py'))]
     assert shared.check_parser_runtime(tmp_path, require_sandbox=False)
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='Requires macOS address-space accounting')
+def test_macos_parser_rejects_oversized_mapping():
+    import comic_document_files as shared
+    code = '''
+import mmap, sys
+sys.path.insert(0, sys.argv[1])
+from comic_document_files import FileLimits, _limit_child
+_limit_child(FileLimits(parser_memory_bytes=64 * 1024**2))
+try:
+    mmap.mmap(-1, 128 * 1024**2)
+except (OSError, MemoryError):
+    sys.exit(0)
+raise AssertionError('Parser memory growth was not bounded')
+'''
+    subprocess.run([sys.executable, '-I', '-c', code, str(Path(shared.__file__).resolve().parent.parent)],
+                   check=True, capture_output=True, text=True, timeout=15)
 
 
 @pytest.mark.parametrize('returncode, output', [(1, b''), (0, b'wrong-probe')])

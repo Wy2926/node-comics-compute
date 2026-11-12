@@ -226,9 +226,11 @@ def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, o
     from ballontranslator.utils.textblock import group_output
     from mtu_engine.engine import configuration
     from mtu_engine.ocr.paddle import Paddle
+    backend = os.environ.get('MTU_TEST_BACKEND', 'cuda')
+    device = 'mps' if backend == 'mps' else 'cuda'
     ModelWrapper._MODEL_DIR = str(models)
     detector = default.DefaultDetector()
-    asyncio.run(detector.load('cuda'))
+    asyncio.run(detector.load(device))
     native = default.det_rearrange_forward
     # This focused regression can run beside an existing service. It retains
     # native tile geometry, inference and merging, but limits GPU batch size.
@@ -249,10 +251,10 @@ def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, o
         rgb = np.array(image)
         config = configuration()
         lines, raw, _ = asyncio.run(detector.detect(rgb, 1280, .5, .7, 2.3))
-        torch.cuda.empty_cache()
+        getattr(torch, device).empty_cache()
         blocks = group_output([], [line.pts for line in lines], 720, 12930)
         assert len(lines) == 30 and sum(len(block.lines) for block in blocks) == 30
-        english = Paddle(models, 'en', 0, 2, backend=os.environ.get('MTU_TEST_BACKEND', 'cuda'))
+        english = Paddle(models, 'en', 0, 2, backend=backend)
         grouped = [Quadrilateral(np.asarray(line), '', 1) for block in blocks for line in block.lines]
         asyncio.run(english.recognize(rgb, grouped, config.ocr))
         assert [line.text for line in grouped] == [sentence] * 30
@@ -264,7 +266,7 @@ def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, o
             english.close()
         asyncio.run(detector.unload())
         default.MODEL = None
-        torch.cuda.empty_cache()
+        getattr(torch, device).empty_cache()
 
 
 def test_qt_worker_multilingual_text_and_region_fit_offline(assets, offline, monkeypatch):
