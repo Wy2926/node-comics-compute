@@ -361,8 +361,11 @@ class Engine:
         async def run():
             c = self.config
             with stage('analyze_detect'), waiting_for(self._detector_lock, 'detect_lock_wait'), self._capture_guard:
+                # Pack long-page stripes without shrinking below their source
+                # short side; native overlap/merging and detect_size still apply.
                 lines, raw, _ = await self.detector.detect(rgb, c.detector.detection_size,
-                    c.detector.text_threshold, c.detector.box_threshold, c.detector.unclip_ratio)
+                    c.detector.text_threshold, c.detector.box_threshold, c.detector.unclip_ratio,
+                    det_rearrange_min_effective_short_side=min(rgb.shape[:2]))
             # Retain the approved upstream paragraph grouping and reading
             # order, using DBNet lines without loading or running a CTD model.
             with stage('analyze_group'):

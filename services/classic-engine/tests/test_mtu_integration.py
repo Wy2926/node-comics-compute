@@ -173,14 +173,20 @@ def test_inpaint_crop_copy_cleanup_preserves_overlapping_window_order(assets):
             np.testing.assert_array_equal(a, b)
 
 
-@pytest.mark.parametrize('height,width', [(12930,720), (720,12930), (16000,320), (320,16000)])
-def test_native_rearrange_overlap_and_roundtrip(assets, height, width):
+@pytest.mark.parametrize('height,width', [(12930,720), (720,12930), (16000,320), (320,16000),
+                                        (11745,800), (800,11745), (10000,1536), (1536,10000)])
+def test_native_rearrange_preserves_resolution_overlap_and_roundtrip(assets, height, width):
     from mtu_engine.assets import activate
     activate(assets[0])
     from manga_translator.utils.generic import (build_det_rearrange_plan,
-        det_rearrange_patch_array, det_rearrange_patch_spans, det_unrearrange_patch_maps)
+        det_rearrange_patch_array, det_rearrange_patch_spans, det_unrearrange_patch_maps, square_pad_resize)
     source = np.zeros((height, width, 3), dtype=np.uint8)
-    plan = build_det_rearrange_plan(source, 1280)
+    plan = build_det_rearrange_plan(source, 1280, min(height, width))
+    packed = det_rearrange_patch_array(plan)
+    for patch in packed:
+        resized, scale, _, _ = square_pad_resize(patch, 1280)
+        assert resized.shape == (1280, 1280, 3)
+        assert scale == min(1, 1280 / min(height, width))
     spans = det_rearrange_patch_spans(plan)
     assert spans[0][0] == 0 and spans[-1][1] == max(height, width)
     assert all(left[1] - right[0] >= plan['patch_size'] // 5 for left, right in zip(spans, spans[1:]))
@@ -189,7 +195,7 @@ def test_native_rearrange_overlap_and_roundtrip(assets, height, width):
     view = np.broadcast_to(np.arange(plan['h'], dtype=np.float32)[:, None, None],
                            (plan['h'], plan['w'], 1))
     coordinate_image = np.swapaxes(view, 0, 1) if plan['transpose'] else view
-    coordinate_plan = build_det_rearrange_plan(coordinate_image, 1280)
+    coordinate_plan = build_det_rearrange_plan(coordinate_image, 1280, min(height, width))
     patches = det_rearrange_patch_array(coordinate_plan)
     restored = det_unrearrange_patch_maps(list(patches), coordinate_plan, data_format='hwc')
     np.testing.assert_allclose(restored, coordinate_image, atol=.002, rtol=0)

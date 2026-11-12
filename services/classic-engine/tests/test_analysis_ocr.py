@@ -23,7 +23,7 @@ def analysis(monkeypatch):
     def text_block(**kwargs):
         return SimpleNamespace(**kwargs, text=' '.join(kwargs['texts']), source_lang='en')
 
-    async def detect(*args):
+    async def detect(*args, **kwargs):
         return [SimpleNamespace(pts=quad) for quad in quads], np.ones(source.shape[:2]), None
 
     async def refine(regions, rgb, raw, **kwargs):
@@ -60,6 +60,24 @@ def analysis(monkeypatch):
     engine.colors = SimpleNamespace(apply=colors)
     engine.bubbles = SimpleNamespace(detect=lambda *args, **kwargs: calls.append(('bubbles', None)))
     return engine, source, quads, calls
+
+
+@pytest.mark.parametrize('shape', [(11745, 800), (800, 11745), (16000, 320), (320, 16000),
+                                  (10000, 1536), (1536, 10000), (512, 512)])
+def test_analysis_requests_source_short_side_for_native_detection(analysis, shape):
+    engine, _, _, _ = analysis
+    rgb = np.zeros((*shape, 3), dtype=np.uint8)
+    observed = []
+    async def detect(image, size, text_threshold, box_threshold, unclip_ratio, **kwargs):
+        assert image is rgb
+        observed.append((size, text_threshold, box_threshold, unclip_ratio, kwargs))
+        return [], None, None
+    async def recognize(*args):
+        return [SimpleNamespace(texts=[])]
+    engine.detector.detect = detect
+    engine.ocr.recognize = recognize
+    assert engine.analyze(rgb) == ([], None, None, None)
+    assert observed == [(1280, .5, .7, 2.3, {'det_rearrange_min_effective_short_side': min(shape)})]
 
 
 @pytest.mark.parametrize('backend,limit,fail_at,expected', [
@@ -294,9 +312,9 @@ def test_graph_capture_guard_covers_other_gpu_models_but_not_page_cpu_or_ocr_rep
     engine, source, _, calls = analysis
     engine._capture_guard = Lock()
     detect, colors, bubbles = engine.detector.detect, engine.colors.apply, engine.bubbles.detect
-    async def detect_guarded(*args):
+    async def detect_guarded(*args, **kwargs):
         assert engine._capture_guard.locked()
-        return await detect(*args)
+        return await detect(*args, **kwargs)
     async def recognize(rgb, lines, config):
         assert not engine._capture_guard.locked()
         for line in lines:
