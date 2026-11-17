@@ -182,19 +182,16 @@ def test_running_loop_retries_heartbeat_after_outage_without_restart(tmp_path):
     recovered = Event()
     def handler(request):
         reply = registration()
-        reply['config'].update(heartbeat_seconds=.03, poll_seconds=.03)
+        reply['config'].update(heartbeat_seconds=.03)
         if request.url.path.endswith('/heartbeat'):
             if not failed.is_set():
                 failed.set()
                 return httpx.Response(503)
             recovered.set()
             agent.stop.set()
-        elif request.url.path.endswith('/updates'):
-            # Bound this fixture's otherwise immediate long poll.
-            time.sleep(.02)
-            return httpx.Response(200, json={'revision': 1})
-        elif request.url.path.endswith('/claim'):
-            reply['request_id'] = json.loads(request.content)['request_id']
+        elif request.url.path.endswith('/channel'):
+            # A channel outage must not block the independent lease heartbeat.
+            return httpx.Response(503)
         return httpx.Response(200, json=reply)
     agent, transport, journal = make_agent(tmp_path, handler)
     worker = Thread(target=agent.run)

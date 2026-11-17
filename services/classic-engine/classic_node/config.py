@@ -89,7 +89,7 @@ def load(path):
     if type(value['claim_batch_size']) is not int or not 1 <= value['claim_batch_size'] <= 4:
         raise ValueError('claim_batch_size must be between 1 and the center limit of 4')
     if type(value['document_control_workers']) is not int or not 2 <= value['document_control_workers'] <= 3:
-        raise ValueError('document_control_workers must be 2 or 3 (claim, heartbeat, sync)')
+        raise ValueError('document_control_workers must be 2 or 3 (heartbeat, sync)')
     if type(value['document_require_sandbox']) is not bool:
         raise ValueError('document_require_sandbox must be a boolean')
     if type(value['resident_bytes']) is not int or value['resident_bytes'] < 512 * 1024 * 1024:

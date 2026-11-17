@@ -1,6 +1,6 @@
 # Node Comics Compute
 
-独立图像计算节点：OCR、抹字、嵌字、覆盖层输出，以及 PDF/ZIP 文件处理。通过 HTTPS 连接 `node-comics-backend`，无需后端或插件源码。
+独立图像计算节点：OCR、抹字、嵌字、覆盖层输出，以及 PDF/ZIP 文件处理。通过 WebSocket 接收 `node-comics-backend` 调度，输入、结果与租约心跳走 HTTPS，无需后端或插件源码。
 
 - [Windows 便携包](services/compute-node/README.md)：安装进度、双击升级
 - [Linux NVIDIA](services/compute-node/linux/README.md)

@@ -85,8 +85,9 @@ class SimulatedTransport:
         self.runtime, self.scenario, self.total, self.data = runtime, scenario, total, data
         self.control = SimpleNamespace(timeout=3)
         self.config = {'version': 1, 'enabled': True, 'execution_slots': 8,
-                       'request_seconds': 3, 'heartbeat_seconds': .1, 'poll_seconds': .02}
+                       'request_seconds': 3, 'heartbeat_seconds': .1}
         self.released = Event()
+        self.closed = Event()
         self.lock = Lock()
         self.leases, self.analyses, self.results, self.done, self.receipts = {}, {}, {}, {}, {}
         self.counts, self.active, self.peak = Counter(), Counter(), Counter()
@@ -99,6 +100,52 @@ class SimulatedTransport:
     def clock(self):
         now = datetime.now(timezone.utc)
         return now.isoformat(), (now + timedelta(seconds=300)).isoformat()
+
+    def close_channel(self):
+        self.closed.set()
+
+    def acknowledge(self, _request_id):
+        pass
+
+    def request_assignment(self, body):
+        with self.lock:
+            if body['request_id'] in self.receipts:
+                return self.receipts[body['request_id']]
+            if self.claimed < self.total:
+                server, expires = self.clock()
+                remaining = 8 - (len(self.leases) - len(self.done))
+                assert 1 <= body['count'] <= min(4, remaining)
+                leases = []
+                for _ in range(min(body['count'], self.total - self.claimed)):
+                    key = str(self.claimed)
+                    self.claimed += 1
+                    data = self.input_for(key)
+                    with Image.open(BytesIO(data)) as image:
+                        width, height = image.size
+                        mime = Image.MIME[image.format]
+                    lease = {'lease_id': key, 'lease_token': 'fixture-token-' + key,
+                        'workflow_kind': 'image', 'status': 'active', 'expires_at': expires, 'language': 'en',
+                        'config': {'engine': {'protocol_version': 3}, 'result_format': 'overlay-tiles-v1'},
+                        'input': {'sha256': hashlib.sha256(data).hexdigest(), 'byte_size': len(data),
+                                  'width': width, 'height': height, 'mime': mime,
+                                  'path': '/internal/compute/v3/leases/' + key + '/input',
+                                  'normalization_version': 1}}
+                    self.leases[key] = lease
+                    leases.append(lease)
+                self.peak_leases = max(self.peak_leases, len(self.leases) - len(self.done))
+                self.claim_batches.append(len(leases))
+                reply = {'type': 'assignment', 'request_id': body['request_id'], 'server_time': server, 'leases': leases}
+                self.receipts[body['request_id']] = reply
+                return reply
+        self.closed.wait()
+        from classic_node.protocol import ControlFailure
+        raise ControlFailure('CONTROL_UNAVAILABLE')
+
+    def listen(self, stop, updated):
+        while not stop.wait(.05):
+            with self.lock:
+                updated({'type': 'updates', 'leases': self.lease_updates(
+                    [{'lease_id': key} for key in self.leases])})
 
     def input_for(self, key):
         return self.data[int(key) % len(self.data)] if isinstance(self.data, list) else self.data
@@ -145,41 +192,6 @@ class SimulatedTransport:
         server, expires = self.clock()
         if path.endswith('/register'):
             return {'protocol_version': 3, 'config': self.config, 'leases': [], 'server_time': server}
-        if path.endswith('/updates'):
-            time.sleep(.05)
-            with self.lock:
-                remaining = 8 - (len(self.leases) - len(self.done))
-                return {'revision': body['revision'] + 1,
-                        'claim_ready': bool(body['can_claim'] and remaining and self.claimed < self.total),
-                        'leases': self.lease_updates(body['leases'])}
-        if path.endswith('/claim'):
-            with self.lock:
-                if body['request_id'] in self.receipts:
-                    return self.receipts[body['request_id']]
-                remaining = 8 - (len(self.leases) - len(self.done))
-                assert 1 <= body['count'] <= min(4, remaining)
-                leases = []
-                for _ in range(min(body['count'], self.total - self.claimed)):
-                    key = str(self.claimed)
-                    self.claimed += 1
-                    data = self.input_for(key)
-                    with Image.open(BytesIO(data)) as image:
-                        width, height = image.size
-                        mime = Image.MIME[image.format]
-                    lease = {'lease_id': key, 'lease_token': 'fixture-token-' + key,
-                        'status': 'active', 'expires_at': expires, 'language': 'en',
-                        'config': {'engine': {'protocol_version': 3}, 'result_format': 'overlay-tiles-v1'},
-                        'input': {'sha256': hashlib.sha256(data).hexdigest(), 'byte_size': len(data),
-                                  'width': width, 'height': height, 'mime': mime,
-                                  'path': '/internal/compute/v3/leases/' + key + '/input',
-                                  'normalization_version': 1}}
-                    self.leases[key] = lease
-                    leases.append(lease)
-                self.peak_leases = max(self.peak_leases, len(self.leases) - len(self.done))
-                self.claim_batches.append(len(leases))
-                reply = {'request_id': body['request_id'], 'server_time': server, 'leases': leases}
-                self.receipts[body['request_id']] = reply
-                return reply
         if path.endswith('/heartbeat'):
             with self.lock:
                 self.heartbeats += 1

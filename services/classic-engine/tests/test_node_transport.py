@@ -18,6 +18,53 @@ def config():
             'control_url': 'https://control.example.test'}
 
 
+@pytest.mark.parametrize('operation', ['ready', 'ack'])
+def test_channel_closed_during_send_is_a_retryable_control_failure(operation):
+    from types import SimpleNamespace
+    from httpx_ws import WebSocketSession
+    client = Transport(config())
+    client.channel = WebSocketSession(SimpleNamespace(write=lambda _: None, close=lambda: None))
+    client.channel.close()
+    try:
+        with pytest.raises(ControlFailure, match='CONTROL_UNAVAILABLE'):
+            if operation == 'ready':
+                client.request_assignment({'request_id': 'saved'})
+            else:
+                client.acknowledge('saved')
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('configured,limit', [(.1, 2), (30, 6.5), (None, 6.5)])
+def test_channel_handshake_bounds_stalls_and_preserves_shorter_control_timeouts(configured, limit):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Event, Thread
+    release = Event()
+    class StalledCenter(BaseHTTPRequestHandler):
+        def do_GET(self):
+            release.wait(8)
+            self.close_connection = True
+        def log_message(self, *_):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), StalledCenter)
+    thread = Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+    thread.start()
+    client = Transport(config() | {'control_url': f'http://127.0.0.1:{server.server_port}'})
+    client.control.timeout = configured
+    started = time.monotonic()
+    try:
+        with pytest.raises(ControlFailure, match='CONTROL_UNAVAILABLE'):
+            client.listen(Event(), lambda _: None)
+        assert time.monotonic() - started < limit
+        assert client.control.timeout == httpx.Timeout(configured)
+    finally:
+        release.set()
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
 @pytest.mark.parametrize('proxy', [None, 'http://user:secret@localhost:7890'])
 def test_control_document_and_preflight_clients_use_native_proxy_options(monkeypatch, tmp_path, proxy):
     from types import SimpleNamespace

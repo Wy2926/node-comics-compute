@@ -15,6 +15,12 @@
 
 Windows 便携包使用 `data/node.json`；Linux 挂载 `node.local.json`。模型和字体从固定清单准备，运行时不下载。
 
+## 中心连接与调度
+
+节点从 `control_url` 建立 WebSocket 控制通道，单图与文件共用一个容量上报入口；TLS、独立 CA 和代理策略复用 HTTPS 配置。代理须允许 WebSocket Upgrade，原图、结果与租约心跳走 HTTPS。
+
+服务端管理后台预设 `performance_weight`（1–1000，默认 1）和 `execution_slots`；权重越大越优先，执行位为硬上限。节点只上报实际能力与本地可用资源。流程与消息定义由后端仓库 `docs/ARCHITECTURE.md`、`docs/COMPUTE_PROTOCOL.md` 维护。
+
 ## 文件任务
 
 解析器在 `packages/document-files/`。默认 `document_require_sandbox=true`，要求 Linux Landlock ABI≥3 与 libseccomp；检查成功才声明 `document_protocol:2`。

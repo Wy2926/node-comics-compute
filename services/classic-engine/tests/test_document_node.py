@@ -287,6 +287,7 @@ def test_stream_download_never_overwrites_existing_source_and_cancel_cleans_part
 
 def test_document_claim_receipt_replays_before_new_admission(agent):
     agent.config['document_slots'] = 1
+    agent.journal.put('document-claim', {'request_id': 'saved', 'config_version': 1, 'count': 1})
     calls = []
     def post(_, body):
         calls.append(dict(body))
@@ -296,9 +297,9 @@ def test_document_claim_receipt_replays_before_new_admission(agent):
         return {'request_id': body['request_id'], 'server_time': server, 'leases': []}
     agent.transport.document_post = post
     with pytest.raises(ControlFailure):
-        agent.documents.claim()
+        agent.claim()
     agent.config['enabled'] = False
-    assert not agent.documents.claim()
+    assert not agent.claim()
     assert calls[0] == calls[1] and calls[0]['count'] == 1
     assert agent.journal.get('document-claim') is None
 
@@ -359,39 +360,37 @@ def document_control(agent):
 
 
 @pytest.mark.parametrize('document', [False, True])
-def test_shared_claim_gate_blocks_other_future_but_not_heartbeat_or_updates(agent, document):
+def test_one_claim_future_keeps_heartbeats_and_updates_independent(agent, document):
     document_control(agent)
     if document:
-        agent.next_claim = float('inf')  # Ordinary polling has already returned empty.
-        agent.documents.poll_control()
-    else:
-        agent.poll_control()
+        agent.journal.put('document-claim', {'request_id': 'saved', 'config_version': 1, 'count': 1})
+    agent.poll_control()
     agent.poll_control()
     agent.documents.poll_control()
-    assert len(agent.claim_pool.calls) == (0 if document else 1)
-    assert len(agent.documents.control.calls) == (1 if document else 0)
-    assert agent.heartbeat_future is not None and agent.notice_future is not None
-    # Do not spin readiness subscriptions while another claim owns the gate.
-    assert agent.notice_pool.calls[-1][2][1]['can_claim'] is False
+    assert len(agent.claim_pool.calls) == 1 and not agent.documents.control.calls
+    assert agent.heartbeat_future is not None and agent.channel_future is not None
+    assert len(agent.channel_pool.calls) == 1
 
 
-@pytest.mark.parametrize('ordinary_due', [False, True])
-def test_document_claim_refill_respects_due_ordinary_poll(agent, ordinary_due):
+def test_new_document_capacity_uses_shared_channel_offer(agent):
     document_control(agent)
-    agent.next_claim = float('inf')
-    agent.documents.poll_control()
-    agent.documents.control.finish(response=True)
-    if ordinary_due:
-        agent.next_claim = 0  # Ordinary readiness arrived during the document request.
+    lease = add_document(agent).lease
+    del agent.documents.pages[lease['lease_id']]
+    requests = []
+    def assignment(body):
+        requests.append(body)
+        server, _ = clock()
+        return {'request_id': body['request_id'], 'server_time': server,
+                'leases': [{**lease, 'workflow_kind': 'document'}]}
+    agent.transport.request_assignment = assignment
     agent.poll_control()
     agent.documents.poll_control()
-    if not ordinary_due:
-        assert len(agent.documents.control.calls) == 2 and not agent.claim_future
-        return
-    assert len(agent.documents.control.calls) == 1 and not agent.claim_future
-    agent.poll_control()
+    assert len(agent.claim_pool.calls) == 1 and not agent.documents.control.calls
+    agent.claim_pool.finish()
     agent.documents.poll_control()
-    assert len(agent.claim_pool.calls) == len(agent.documents.control.calls) == 1
+    assert len(requests) == 1 and requests[0]['document_count'] == 1 and requests[0]['count'] > 0
+    assert [operation for _, operation, _ in agent.documents.control.calls] == [agent.documents.heartbeat]
+    assert lease['lease_id'] in agent.documents.pages and not agent.pages
 
 
 @pytest.mark.parametrize('document', [False, True])
@@ -399,30 +398,28 @@ def test_ambiguous_claim_blocks_new_ids_until_original_receipt_replayed(agent, d
     document_control(agent)
     agent.config['execution_slots'], agent.local['max_leases'] = 8, 2
     requests = []
-    runner = agent.documents if document else agent
     key = 'document-claim' if document else 'claim'
+    if document:
+        agent.journal.put(key, {'request_id': 'saved', 'config_version': 1, 'count': 1})
     def post(_, body):
         requests.append(dict(body))
         if len(requests) == 1:
             raise ControlFailure('CONTROL_UNAVAILABLE')
         server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server, 'leases': []}
+        return {'request_id': body['request_id'], 'server_time': server,
+                'leases': [{'lease_id': 'resolved', 'status': 'terminal'}]}
     agent.transport.post = agent.transport.document_post = post
     with pytest.raises(ControlFailure):
-        runner.claim()
+        agent.claim()
     # The HTTP future can already be gone, with a lease held only on the server.
-    assert not agent.claim_available(document=not document)
-    assert not agent.claim_available(new_only=True)
     assert agent.journal.get(key) == requests[0]
-    runner.next_claim = 0
+    agent.next_claim = 0
     agent.config.update(enabled=False, document_slots=0, version=2)
     agent.poll_control()
     agent.documents.poll_control()
-    pool = agent.documents.control if document else agent.claim_pool
-    pool.finish()
+    agent.claim_pool.finish()
     assert requests == [requests[0], requests[0]] and agent.journal.get(key) is None
-    assert len(agent.claim_pool.calls) == (0 if document else 1)
-    assert len(agent.documents.control.calls) == (1 if document else 0)
+    assert len(agent.claim_pool.calls) == 1 and not agent.documents.control.calls
 
 
 def test_restart_replays_both_old_claims_before_any_new_id(agent):
@@ -446,13 +443,13 @@ def test_restart_replays_both_old_claims_before_any_new_id(agent):
         agent.config.update(enabled=False, document_slots=0, version=2)
         agent.poll_control()
         agent.documents.poll_control()
-        assert not agent.documents.claim_future
+        assert len(agent.claim_pool.calls) == 1 and not agent.documents.control.calls
         agent.claim_pool.finish()
         agent.poll_control()
         agent.documents.poll_control()
-        assert agent.documents.claim_future and len(agent.claim_pool.calls) == 1
-        agent.documents.control.finish()
-        agent.documents.poll_control()
+        assert agent.claim_future and len(agent.claim_pool.calls) == 2
+        agent.claim_pool.finish()
+        agent.poll_control()
         assert requests == [pending, document_pending]
         assert agent.journal.get('claim') is agent.journal.get('document-claim') is None
     finally:
@@ -469,8 +466,48 @@ def test_claim_replay_does_not_replace_a_document_already_restored_by_sync(agent
     server, _ = clock()
     agent.transport.document_post = lambda *_: {'request_id': pending['request_id'], 'server_time': server, 'leases': [page.lease]}
     agent.config.update(document_slots=0, enabled=False)
-    assert agent.documents.claim()
+    assert agent.claim()
     assert agent.documents.pages['document'] is page and page.future is existing_future
+
+
+def test_legacy_document_replay_keeps_workspace_error_recovery(agent, caplog):
+    document_control(agent)
+    pending = {'request_id': 'saved', 'config_version': 1, 'count': 1}
+    agent.journal.put('document-claim', pending)
+    def failed(*_):
+        raise OSError('private workspace path')
+    agent.transport.document_post = failed
+    agent.poll_control()
+    agent.claim_pool.finish()
+    agent.poll_control()
+    assert agent.journal.get('document-claim') == pending
+    assert agent.claim_future is None and agent.next_claim > time.monotonic()
+    assert 'DOCUMENT_WORKSPACE_UNAVAILABLE' in caplog.text and 'private workspace path' not in caplog.text
+
+
+def test_legacy_document_receipt_does_not_mask_unexpected_image_claim_error(agent):
+    agent.journal.put('claim', {'request_id': 'image', 'config_version': 1, 'count': 1})
+    agent.journal.put('document-claim', {'request_id': 'document', 'config_version': 1, 'count': 1})
+    def failed(*_):
+        raise OSError('image claim failure')
+    agent.transport.post = failed
+    agent.poll_control()
+    agent.claim_pool.finish()
+    with pytest.raises(OSError, match='image claim failure'):
+        agent.poll_control()
+    assert agent.journal.get('claim') and agent.journal.get('document-claim')
+
+
+@pytest.mark.parametrize('document', [False, True])
+def test_config_conflict_resolves_only_the_rejected_claim(agent, document):
+    key = 'document-claim' if document else 'claim'
+    agent.journal.put(key, {'request_id': 'stale', 'config_version': 1, 'count': 1})
+    def conflict(*_):
+        raise ControlFailure('NODE_CONFIG_CONFLICT', 409)
+    agent.transport.post = agent.transport.document_post = conflict
+    with pytest.raises(ControlFailure, match='NODE_CONFIG_CONFLICT'):
+        agent.claim()
+    assert agent.journal.get(key) is None and agent.last_heartbeat == 0
 
 
 def test_completed_document_future_is_advanced_before_shared_slot_dispatch(agent):

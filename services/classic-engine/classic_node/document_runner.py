@@ -7,7 +7,6 @@ from pathlib import Path
 from threading import RLock
 import re
 import time
-from uuid import uuid4
 
 from .object_transfer import ObjectTransfer
 from .operations import report_page_failure
@@ -43,8 +42,8 @@ class DocumentRunner:
         self.adoption_lock = RLock()
         self.control = ThreadPoolExecutor(agent.local.get('document_control_workers',
             LOCAL_DEFAULTS['document_control_workers']), thread_name_prefix='document-control')
-        self.claim_future = self.heartbeat_future = self.sync_future = None
-        self.next_claim = self.next_heartbeat = self.next_sync = 0
+        self.heartbeat_future = self.sync_future = None
+        self.next_heartbeat = self.next_sync = 0
         self.objects = ObjectTransfer(agent.local)
         self.state_dir = Path(agent.local.get('state_dir') or agent.journal.root)
         self._protocol = False  # Probed once at registration, not on the hot path.
@@ -225,30 +224,6 @@ class DocumentRunner:
                 self.agent.pipeline.resize_reservation(page, MAX_CHECKPOINT_BYTES * 2)
             self.pages[key] = page
 
-    def claim(self):
-        pending = self.agent.journal.get('document-claim')
-        if not pending:
-            if not self.capacity():
-                return False
-            pending = {'request_id': 'doc_' + uuid4().hex, 'config_version': self.agent.config['version'], 'count': 1}
-            self.agent.journal.put('document-claim', pending)
-        sent = time.monotonic()
-        try:
-            reply = self.post(f'/nodes/{self.agent.local["node_id"]}/claim', pending)
-        except ControlFailure as error:
-            if error.code == 'NODE_CONFIG_CONFLICT':
-                self.agent.journal.remove('document-claim')
-                self.agent.last_heartbeat = 0
-                return False
-            raise
-        if reply.get('request_id') != pending['request_id']:
-            raise NodeFailure('CONTROL_INVALID_RESPONSE')
-        self.agent.apply_config(reply.get('config'))
-        for lease in reply['leases']:
-            self.adopt(lease, reply['server_time'], sent)
-        self.agent.journal.remove('document-claim')
-        return bool(reply['leases'])
-
     def heartbeat(self):
         sent = time.monotonic()
         reply = self.post(f'/nodes/{self.agent.local["node_id"]}/heartbeat', {'leases': [
@@ -262,14 +237,12 @@ class DocumentRunner:
         if self._protocol is None:
             return
         at = time.monotonic()
-        for name in ('claim', 'heartbeat', 'sync'):
+        for name in ('heartbeat', 'sync'):
             future = getattr(self, name + '_future')
             if future and future.done():
                 try:
-                    result = future.result()
+                    future.result()
                     self.agent.network_log.succeeded('document-' + name)
-                    if name == 'claim':
-                        self.next_claim = at + (0 if result else self.agent.config['poll_seconds'])
                 except Exception as error:
                     failure = error if isinstance(error, NodeFailure) else NodeFailure('DOCUMENT_WORKSPACE_UNAVAILABLE')
                     self.agent.network_log.failed('document-' + name, failure)
@@ -280,13 +253,9 @@ class DocumentRunner:
             self.heartbeat_future = self.control.submit(self.heartbeat)
             self.heartbeat_future.add_done_callback(lambda _: self.agent.wake.set())
         if self.sync_future is None and at >= self.next_sync and not self.agent.stop.is_set():
-            self.next_sync = at + max(30, self.agent.config['poll_seconds'])
+            self.next_sync = at + 30
             self.sync_future = self.control.submit(self.sync)
             self.sync_future.add_done_callback(lambda _: self.agent.wake.set())
-        if (not self.agent.stop.is_set() and at >= self.next_claim and self.agent.claim_available(document=True)
-                and (self.agent.journal.get('document-claim') or self.capacity())):
-            self.claim_future = self.control.submit(self.claim)
-            self.claim_future.add_done_callback(lambda _: self.agent.wake.set())
 
     def download(self, page):
         page.check()
@@ -475,7 +444,6 @@ class DocumentRunner:
                 pipeline.release(page)
                 self.agent.journal.remove(PREFIX + key)
                 del self.pages[key]
-                self.next_claim = 0
                 self.agent.request_claim()
                 continue
             if page.stopped:

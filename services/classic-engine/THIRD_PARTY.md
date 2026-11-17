@@ -1,5 +1,9 @@
 # Third-party sources
 
+## WebSocket control transport
+
+`httpx-ws==0.10.0` (MIT) and its `wsproto` dependency implement the node's bounded WebSocket control channel. Locked wheels and original license metadata are included by the existing packaging flow; HTTPX retains the configured TLS and proxy policy.
+
 ## Hayai OCR v2.5 Nova
 
 [prepare_hayai.py](tools/prepare_hayai.py) prepares

@@ -48,7 +48,7 @@ def verify(release, work):
             self.rfile.read(int(self.headers.get('Content-Length', 0)))
             if (self.headers.get('Authorization') != 'Bearer isolated-fixture-token'
                     or self.headers.get('X-Node-Id') != 'isolated-release-node'
-                    or not self.path.endswith(('/register', '/heartbeat', '/updates'))):
+                    or not self.path.endswith(('/register', '/heartbeat'))):
                 self.send_error(403)
                 return
             registration = self.path.endswith('/register')
@@ -60,14 +60,15 @@ def verify(release, work):
             response = {'protocol_version': 3, 'leases': [], 'server_time': datetime.now(timezone.utc).isoformat(),
                         'revision': 1, 'config': {'version': 1, 'request_seconds': 5, 'execution_slots': 1,
                             'enabled': False, 'heartbeat_seconds': 1, 'poll_seconds': 1}}
-            if self.path.endswith('/updates'):
-                time.sleep(.25)
             payload = json.dumps(response if not failed else {'error': {'code': 'ISOLATED_OUTAGE'}}).encode()
             self.send_response(503 if failed else 200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+        def do_GET(self):
+            # Exercise packaged channel retry while heartbeat recovery remains independent.
+            self.send_error(503 if self.path.endswith('/channel') else 404)
     server = ThreadingHTTPServer(('127.0.0.1', 0), Controller)
     server.daemon_threads = True
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

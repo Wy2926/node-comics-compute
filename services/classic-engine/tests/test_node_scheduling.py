@@ -47,7 +47,9 @@ def lease(key, *, pixels=100):
 def agent(tmp_path):
     local = {'node_id': 'fixture', 'resource_id': 'fixture', 'engine': {'gpu': 0},
              'max_leases': 8, 'local_pages': 2, 'download_workers': 4, 'delivery_workers': 4}
-    transport = SimpleNamespace(control=SimpleNamespace(timeout=30), post=lambda *_: None)
+    transport = SimpleNamespace(control=SimpleNamespace(timeout=30), post=lambda *_: None,
+        close_channel=lambda: None, acknowledge=lambda _: None, listen=lambda *_: None)
+    transport.request_assignment = lambda body: transport.post('/channel', body)
     journal = Journal(tmp_path)
     def cache_bytes(analysis, translated, masks):
         return 100 * sum(isinstance(text, str) and bool(text.strip())
@@ -56,7 +58,7 @@ def agent(tmp_path):
                   render_cache_bytes=cache_bytes), transport, journal)
     value.apply_config({'version': 1, 'execution_slots': 8, 'enabled': True,
                         'request_seconds': 30, 'heartbeat_seconds': 10, 'poll_seconds': 20})
-    for name in ('heartbeat_pool', 'claim_pool', 'notice_pool'):
+    for name in ('heartbeat_pool', 'claim_pool', 'channel_pool'):
         getattr(value, name).shutdown(wait=True)
         setattr(value, name, PendingPool())
     yield value
@@ -88,7 +90,7 @@ def test_configured_network_pools_are_independent(tmp_path):
         assert value.pipeline.download._max_workers == 5
         assert value.pipeline.control._max_workers == 2
         assert value.pipeline.delivery._max_workers == value.documents.control._max_workers == 3
-        assert value.heartbeat_pool._max_workers == value.claim_pool._max_workers == value.notice_pool._max_workers == 1
+        assert value.heartbeat_pool._max_workers == value.claim_pool._max_workers == value.channel_pool._max_workers == 1
     finally:
         value.close()
         journal.close()
@@ -179,64 +181,83 @@ def test_old_heartbeat_does_not_shorten_newer_renewal_or_override_stop(agent, st
     assert (page.stopped or page.terminal) and page.deadline == deadline
 
 
-def test_three_channels_stay_independent_and_updates_do_not_force_heartbeat(agent):
+def test_channel_updates_stay_independent_and_do_not_force_heartbeat(agent):
     page = add_page(agent)
     page.step = 'text'
     agent.poll_control()
-    assert len(agent.heartbeat_pool.calls) == len(agent.claim_pool.calls) == len(agent.notice_pool.calls) == 1
+    assert len(agent.heartbeat_pool.calls) == len(agent.claim_pool.calls) == len(agent.channel_pool.calls) == 1
     heartbeat_at = agent.last_heartbeat
     deadline = page.deadline
     translated = {'revision': 'ready', 'translations': {'0': 'hello'}}
-    agent.notice_pool.finish(response={'revision': 2, 'claim_ready': False,
-                                      'leases': [{'lease_id': '0', 'status': 'active', 'translations': translated}]})
+    agent.updates.put({'leases': [{'lease_id': '0', 'status': 'active', 'translations': translated}]})
     agent.poll_control()
     assert page.translations == translated and page.deadline == deadline
     assert agent.last_heartbeat == heartbeat_at
-    # Neither a blocked heartbeat nor a blocked claim prevents notice handling.
+    # Neither a blocked heartbeat nor a blocked claim prevents channel updates.
     assert not agent.heartbeat_future.done() and not agent.claim_future.done()
     assert len(agent.heartbeat_pool.calls) == len(agent.claim_pool.calls) == 1
 
 
-def test_empty_claim_waits_and_stale_notice_cannot_restart_it(agent):
-    agent.poll_control()
-    # This notice predates the current claim's admission generation.
-    agent.notice_claim_generation = agent.claim_generation - 1
-    agent.claim_pool.finish(response=False)
-    agent.notice_pool.finish(response={'revision': 2, 'claim_ready': True, 'leases': []})
+def test_pending_capacity_offer_does_not_repeat_or_open_new_connections(agent):
     agent.poll_control()
     for _ in range(20):
         agent.poll_control()
-    assert len(agent.claim_pool.calls) == 1
-    assert agent.next_claim > time.monotonic()
+    assert len(agent.claim_pool.calls) == len(agent.channel_pool.calls) == 1
+    assert not agent.claim_future.done()
 
 
-def test_slow_empty_claim_starts_fresh_backoff_after_dispatch_deadline_elapsed(agent):
+def test_repeated_channel_outage_bounds_retry_delay_and_resets_after_reconnection(agent, monkeypatch):
+    now = [100.]
+    monkeypatch.setattr(time, 'monotonic', lambda: now[0])
     agent.poll_control()
-    agent.next_claim = time.monotonic() - 1
-    agent.claim_pool.finish(response=False)
+    for _ in range(7):
+        agent.channel_future.set_exception(ControlFailure('CONTROL_UNAVAILABLE'))
+        agent.poll_control()
+        scheduled = len(agent.channel_pool.calls)
+        assert 1 <= agent.next_channel - now[0] <= 5
+        now[0] = agent.next_channel - .01
+        agent.poll_control()
+        assert len(agent.channel_pool.calls) == scheduled
+        now[0] += .01
+        agent.poll_control()
+        assert len(agent.channel_pool.calls) == scheduled + 1
+    agent.transport.listen = lambda stop, updated: updated({'type': 'updates'})
+    agent.channel_pool.finish()
     agent.poll_control()
-    assert len(agent.claim_pool.calls) == 1 and agent.next_claim > time.monotonic()
+    assert agent.next_channel - now[0] == 1
+
+
+def test_empty_http_receipt_switches_to_one_waiting_channel_offer(agent):
+    pending = {'request_id': 'saved', 'config_version': 1, 'count': 4}
+    agent.journal.put('claim', pending)
+    requests = []
+    def post(_, body):
+        requests.append(body)
+        server, _ = clock()
+        return {'request_id': body['request_id'], 'server_time': server, 'leases': [], 'retry_after_seconds': .3}
+    agent.transport.post = post
+    agent.poll_control()
+    agent.claim_pool.finish()
+    agent.poll_control()
+    for _ in range(20):
+        agent.poll_control()
+    assert requests == [pending] and agent.journal.get('claim') is None
+    assert len(agent.claim_pool.calls) == 2 and not agent.claim_future.done()
 
 
 @pytest.mark.parametrize('change', ['config', 'memory'])
-def test_empty_claim_completion_preserves_newer_admission_wake(agent, change):
+def test_assignment_completion_uses_current_admission_limits(agent, change):
     page = add_page(agent)
     page.step = 'text'
     agent.pipeline.resize_reservation(page, 1024)
     agent.poll_control()
-    assert agent.next_claim > time.monotonic()
     if change == 'config':
-        agent.apply_config({**agent.config, 'version': 2})
+        agent.apply_config({**agent.config, 'version': 2, 'execution_slots': 1})
     else:
-        agent.pipeline.resize_reservation(page, 512)
-    assert agent.next_claim == 0
-    agent.claim_pool.finish(response=False)
+        agent.pipeline.limit = 1024
+    agent.claim_pool.finish(response=True)
     agent.poll_control()
-    assert len(agent.claim_pool.calls) == 2
-    # The wake is consumed by that dispatch; another empty response must wait.
-    agent.claim_pool.finish(response=False)
-    agent.poll_control()
-    assert len(agent.claim_pool.calls) == 2 and agent.next_claim > time.monotonic()
+    assert len(agent.claim_pool.calls) == 1 and agent.claim_future is None
 
 
 def test_successful_batch_continues_when_download_capacity_is_available(agent):
@@ -251,13 +272,11 @@ def test_successful_batch_continues_when_download_capacity_is_available(agent):
     assert len(agent.heartbeat_pool.calls) == 1
 
 
-def test_fresh_ready_notice_and_resource_release_refill_immediately(agent):
+def test_config_change_and_resource_release_refill_immediately(agent):
     agent.last_heartbeat = time.monotonic()
     agent.next_claim = time.monotonic() + 20
     agent.poll_control()
-    request = agent.notice_pool.calls[-1][2][1]
-    assert request['can_claim'] and request['config_version'] == 1
-    agent.notice_pool.finish(response={'revision': 1, 'claim_ready': True, 'leases': []})
+    agent.updates.put({'config': {**agent.config, 'version': 2}})
     agent.poll_control()
     assert len(agent.claim_pool.calls) == 1
     agent.claim_pool.finish(response=False)
@@ -277,14 +296,14 @@ def test_claim_is_small_and_retry_retains_durable_request_id(agent):
         if len(requests) == 1:
             raise ControlFailure('CONTROL_UNAVAILABLE')
         server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server, 'leases': []}
+        return {'request_id': body['request_id'], 'server_time': server, 'leases': [lease('assigned')]}
 
     agent.transport.post = post
     with pytest.raises(ControlFailure):
         agent.claim()
     assert requests[0]['count'] == 4
     agent.config['enabled'] = False
-    assert agent.claim() is False
+    assert agent.claim() is True
     assert requests[0] == requests[1]
     assert agent.journal.get('claim') is None
 
@@ -305,43 +324,40 @@ def test_pre_upgrade_pending_claim_replays_original_count_and_identity(agent):
     assert requests == [pending] and agent.journal.get('claim') is None
 
 
-@pytest.mark.parametrize('hint', [.1, .237, .3])
-def test_empty_competing_claim_hint_retries_boundedly_then_returns_to_normal_wait(agent, monkeypatch, hint):
-    current = [100.0]
-    monkeypatch.setattr('classic_node.agent.time.monotonic', lambda: current[0])
-    replies = [{'retry_after_seconds': hint}, {}]
-
+@pytest.mark.parametrize('invalid', ['empty', 'wrong-id', 'missing-id'])
+def test_invalid_channel_assignment_preserves_pending_receipt(agent, invalid):
     def post(_, body):
         server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server, 'leases': [], **replies.pop(0)}
+        response = {'request_id': 'wrong' if invalid == 'wrong-id' else body['request_id'], 'server_time': server,
+                    'leases': [] if invalid == 'empty' else [lease('assigned')]}
+        if invalid == 'missing-id':
+            del response['request_id']
+        return response
 
     agent.transport.post = post
-    agent.poll_control()
-    agent.claim_pool.finish()
-    agent.poll_control()
-    assert agent.next_claim == 100 + hint and len(agent.claim_pool.calls) == 1
-    # A hint cannot bypass the node's local admission gate.
-    agent.config['enabled'] = False
-    current[0] = 100.4
-    agent.poll_control()
-    assert len(agent.claim_pool.calls) == 1
-    agent.config['enabled'] = True
-    agent.poll_control()
-    agent.claim_pool.finish()
-    agent.poll_control()
-    assert len(agent.claim_pool.calls) == 2 and agent.next_claim == 120.4
-
-
-@pytest.mark.parametrize('hint', [0, 21, '0.1', float('nan')])
-def test_invalid_claim_retry_hint_preserves_pending_receipt(agent, hint):
-    def post(_, body):
-        server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server, 'leases': [], 'retry_after_seconds': hint}
-
-    agent.transport.post = post
-    with pytest.raises(ControlFailure, match='CONTROL_INVALID_RESPONSE'):
+    with pytest.raises(NodeFailure, match='CONTROL_INVALID_RESPONSE'):
         agent.claim()
     assert agent.journal.get('claim') is not None
+
+
+def test_failed_ack_replays_after_durable_adoption_without_replacing_the_page(agent):
+    acknowledgements = []
+    def post(_, body):
+        server, _ = clock()
+        return {'request_id': body['request_id'], 'server_time': server, 'leases': [lease('assigned')]}
+    def ack(request_id):
+        assert agent.journal.get('lease:assigned')['lease']['lease_id'] == 'assigned'
+        assert agent.journal.get('claim')['request_id'] == request_id
+        acknowledgements.append(request_id)
+        if len(acknowledgements) == 1:
+            raise ControlFailure('CONTROL_UNAVAILABLE')
+    agent.transport.post, agent.transport.acknowledge = post, ack
+    with pytest.raises(ControlFailure):
+        agent.claim()
+    page = agent.pages['assigned']
+    assert agent.claim()
+    assert agent.pages['assigned'] is page and agent.journal.get('claim') is None
+    assert acknowledgements[0] == acknowledgements[1]
 
 
 def test_accepted_downloads_bound_admission_and_count_pending_memory(agent):
@@ -511,11 +527,11 @@ def test_slow_persistence_dispatches_other_compute_and_drains_before_cleanup(age
     try:
         agent.pipeline.tick()
         assert began.wait(3)
-        assert agent.lease_entries(phases=True)[0]['phase'] == 'render'
+        assert agent.lease_entries()[0]['phase'] == 'render'
         if status != 'active':
             page.update({'status': status})
         other.step = 'inpaint'
-        agent.poll_control()  # Real claim-gate journal reads, while its DB lock is held.
+        agent.poll_control()  # Read committed admission state while its DB lock is held.
         agent.pipeline.tick()
         assert computed.wait(3) and page.future and not page.future.done()
         assert page.rgb is sentinel and page.reserved == initial and page.completion is None
