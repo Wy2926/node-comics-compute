@@ -40,7 +40,7 @@ Mac 实际模型回归（资产目录需包含经典 OCR 模型）：
 MTU_TEST_BACKEND=mps MTU_TEST_ASSETS=/absolute/path/assets \
   uv run --project environments/macos --locked python -m pytest -q \
   tests/test_render_glyph_cache.py tests/test_mtu_integration.py \
-  -k 'outline or native_rearrange or long_page_cross_seam'
+  -k 'outline or native_rearrange or streamed_detection or long_page_cross_seam'
 ```
 
 ## 验证

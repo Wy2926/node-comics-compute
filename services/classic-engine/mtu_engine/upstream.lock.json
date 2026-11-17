@@ -20,6 +20,22 @@
         {
           "before": "    ph_num = int(np.ceil(h / ph))\n",
           "after": "    # Node Comics: preserve at least 20% overlap before native feathered merging.\n    stride = max(1, ph - ph // 5)\n    ph_num = max(1, int(np.ceil((h - ph) / stride)) + 1)\n"
+        },
+        {
+          "before": "    def _patch2batches(patch_arr: np.ndarray):\n        batches = [[]]\n        batch_pad_sizes = [[]]\n        for ii, patch in enumerate(patch_arr):\n\n            if len(batches[-1]) >= max_batch_size:\n                batches.append([])\n                batch_pad_sizes.append([])\n            p, _down_scale_ratio, pad_h, pad_w = square_pad_resize(patch, tgt_size=tgt_size)\n\n            batches[-1].append(p)\n            batch_pad_sizes[-1].append((pad_h, pad_w))\n",
+          "after": "    def _patch2batches(patch_arr: np.ndarray):\n        # Node Comics: materialize only one padded batch at a time.\n        batch, pad_sizes = [], []\n        for ii, patch in enumerate(patch_arr):\n            if len(batch) >= max_batch_size:\n                yield batch, pad_sizes\n                batch, pad_sizes = [], []\n            p, _down_scale_ratio, pad_h, pad_w = square_pad_resize(patch, tgt_size=tgt_size)\n            batch.append(p)\n            pad_sizes.append((pad_h, pad_w))\n"
+        },
+        {
+          "before": "        return batches, batch_pad_sizes\n",
+          "after": "        if batch:\n            yield batch, pad_sizes\n"
+        },
+        {
+          "before": "    batches, batch_pad_sizes = _patch2batches(patch_arr)\n\n    db_lst, mask_lst = [], []\n    for batch, pad_sizes in zip(batches, batch_pad_sizes):\n",
+          "after": "    batches = _patch2batches(patch_arr)\n\n    db_lst, mask_lst = [], []\n    for batch, pad_sizes in batches:\n"
+        },
+        {
+          "before": "            db_lst.append(d)\n            mask_lst.append(m)\n",
+          "after": "            # Node Comics: cropped views must not retain full padded predictions.\n            db_lst.append(d.copy())\n            mask_lst.append(m.copy())\n"
         }
       ],
       "manga_translator/rendering/__init__.py": [

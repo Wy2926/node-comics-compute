@@ -202,6 +202,111 @@ def test_native_rearrange_preserves_resolution_overlap_and_roundtrip(assets, hei
     assert build_det_rearrange_plan(source[:400,:400],1280) is None
 
 
+@pytest.mark.parametrize('shape', [(2801, 93), (93, 2801), (1700, 32), (32, 1700),
+                                 (1000, 153), (200, 100)])
+@pytest.mark.parametrize('batch_size', [1, 2, 4])
+def test_streamed_detection_preserves_inputs_and_maps_with_bounded_padding(assets, monkeypatch, shape, batch_size):
+    import hashlib
+    import inspect
+    import weakref
+    from mtu_engine.assets import LOCK, activate
+    activate(assets[0])
+    from manga_translator.utils import generic
+    source = inspect.getsource(generic.det_rearrange_forward)
+    for patch in reversed(LOCK['source']['patches']['manga_translator/utils/generic.py'][1:]):
+        assert source.count(patch['after']) == 1
+        source = source.replace(patch['after'], patch['before'])
+    scope = dict(vars(generic))
+    exec(source, scope)
+    image = np.random.default_rng(43).integers(0, 256, (*shape, 3), dtype=np.uint8)
+    image.flags.writeable = False
+    inputs, outputs, padded = [], [], []
+    pad, merge = generic.square_pad_resize, generic.det_unrearrange_patch_maps
+
+    def bounded_pad(*args, **kwargs):
+        result = pad(*args, **kwargs)
+        padded.append(weakref.ref(result[0]))
+        assert sum(ref() is not None for ref in padded) <= batch_size + 1
+        return result
+
+    def compact_merge(maps, *args, **kwargs):
+        assert all(array.base is None and array.flags.c_contiguous for array in maps)
+        return merge(maps, *args, **kwargs)
+
+    original = image.tobytes()
+    for fn in (scope['det_rearrange_forward'], generic.det_rearrange_forward):
+        seen = []
+        def forward(batch, device):
+            assert device == 'cpu' and batch.shape[1:] == (128, 128, 3)
+            seen.append((batch.shape, hashlib.sha256(batch.tobytes()).hexdigest()))
+            # Different output resolutions/channels exercise both crop calculations.
+            return (batch[:, ::2, ::2, :2].transpose(0, 3, 1, 2).astype(np.float32),
+                    batch[:, ::4, ::4, 2:3].transpose(0, 3, 1, 2).astype(np.float32))
+        outputs.append(fn(image, forward, 128, batch_size, device='cpu',
+                          min_effective_short_side=min(shape)))
+        inputs.append(seen)
+        assert image.tobytes() == original
+        monkeypatch.setattr(generic, 'square_pad_resize', bounded_pad)
+        monkeypatch.setattr(generic, 'det_unrearrange_patch_maps', compact_merge)
+    assert inputs[0] == inputs[1]
+    for old, new in zip(*outputs, strict=True):
+        np.testing.assert_array_equal(old, new)
+    assert all(ref() is None for ref in padded)
+    plan = generic.build_det_rearrange_plan(image, 128, min(shape))
+    if plan is None:
+        assert inputs == [[], []] and outputs == [(None, None), (None, None)]
+    else:
+        assert len(padded) == plan['p_num']
+        assert [shape[0] for shape, _ in inputs[1]] == [
+            min(batch_size, plan['p_num'] - i) for i in range(0, plan['p_num'], batch_size)]
+        if min(shape) == 32:
+            assert plan['pw_num'] > 1 and plan['pad_num'] > 0
+
+
+@pytest.mark.parametrize('failure_type', ['cancel', 'model'])
+def test_streamed_detection_releases_batches_after_failure_and_can_resume(assets, monkeypatch, failure_type):
+    import gc
+    import weakref
+    from classic_node.protocol import NodeFailure
+    from mtu_engine.assets import activate
+    from mtu_engine.backend import cancellation, check_cancelled
+    activate(assets[0])
+    from manga_translator.utils import generic
+    refs, calls = [], []
+    pad = generic.square_pad_resize
+    def tracked_pad(*args, **kwargs):
+        result = pad(*args, **kwargs)
+        refs.append(weakref.ref(result[0]))
+        return result
+    monkeypatch.setattr(generic, 'square_pad_resize', tracked_pad)
+    def forward(batch, **kwargs):
+        check_cancelled()
+        if calls and failure_type == 'model':
+            raise RuntimeError('model failed')
+        calls.append(len(batch))
+        maps = batch[:, ::2, ::2, :1].transpose(0, 3, 1, 2).astype(np.float32)
+        refs.extend((weakref.ref(batch), weakref.ref(maps)))
+        return maps, maps
+    def check():
+        if calls and failure_type == 'cancel':
+            raise NodeFailure('LEASE_STOPPED')
+    image = np.zeros((2801, 93, 3), np.uint8)
+    def run():
+        return generic.det_rearrange_forward(image, forward, 128, 2, min_effective_short_side=93)
+    with pytest.raises(NodeFailure if failure_type == 'cancel' else RuntimeError) as failure:
+        with cancellation(check):
+            run()
+    assert calls == [2] and len(refs) == 6
+    del failure  # Release pytest's retained traceback before checking buffer ownership.
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+    failure_type = None
+    db, mask = run()
+    assert db.shape == mask.shape == (1, 1, 1416, 47)
+    assert not db.any() and not mask.any()
+    assert all(ref() is None for ref in refs)
+
+
 @pytest.fixture
 def offline(monkeypatch):
     connect = socket.socket.connect
