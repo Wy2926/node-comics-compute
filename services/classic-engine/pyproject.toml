@@ -18,7 +18,7 @@ dependencies = [
     "PySide6-Essentials==6.9.2", "mahotas==1.4.18",
     "manga-ocr==0.1.16", "transformers==4.57.6", "huggingface-hub==0.36.0",
     "scikit-image==0.25.2", "pyclipper==1.3.0.post6", "py3langid==0.2.2",
-    "pydantic==2.11.7", "omegaconf==2.3.0", "colorama==0.4.6", "pydensecrf==1.0",
+    "pydantic==2.11.7", "omegaconf==2.3.0", "colorama==0.4.6",
     "python-dotenv==1.2.2", "regex", "tqdm==4.67.1",
     "requests>=2.32", "psutil>=7", "portalocker>=3", "httpx[socks]==0.28.1",
     "pillow-jxl-plugin==1.3.8", "natsort==8.4.0", "ordered-set==4.1.0",
@@ -49,10 +49,6 @@ explicit = true
 comic-document-files = { path = "../../packages/document-files" }
 torch = { index = "pytorch-cu126" }
 torchvision = { index = "pytorch-cu126" }
-pydensecrf = [
-    { url = "https://github.com/hgmzhn/manga-translator-ui/releases/download/v1.7.6/pydensecrf-1.0-cp312-cp312-win_amd64.whl", marker = "sys_platform == 'win32'" },
-    { url = "https://github.com/hgmzhn/pydensecrf/releases/download/v1.0.0/pydensecrf-1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
-]
 
 [tool.uv]
 environments = ["sys_platform == 'win32'", "sys_platform == 'linux' and platform_machine == 'x86_64'"]

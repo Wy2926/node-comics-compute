@@ -14,6 +14,8 @@ uv run pytest -q
 
 AMD 使用 `uv sync --project environments/amd --locked --group test`。各环境独立，显式选择 `engine.backend`，不自动降级或混装。
 
+长图检测保留文字尺度，使用有界批量的对齐长矩形及概率图羽化合并；掩膜细化复用固定版本 CTD。参数、31 张实测和已知画质问题见[技术汇总](docs/TECHNICAL_SUMMARY_2026-11-17.md)。
+
 ## Apple Silicon Mac
 
 原生 arm64、macOS 14 或更新版本。在本目录执行：
@@ -40,7 +42,7 @@ Mac 实际模型回归（资产目录需包含经典 OCR 模型）：
 MTU_TEST_BACKEND=mps MTU_TEST_ASSETS=/absolute/path/assets \
   uv run --project environments/macos --locked python -m pytest -q \
   tests/test_render_glyph_cache.py tests/test_mtu_integration.py \
-  -k 'outline or native_rearrange or streamed_detection or long_page_cross_seam'
+  -k 'outline or native_rearrange or streamed_detection or rectangular_detection or detection_candidate or long_page_cross_seam or ctd_'
 ```
 
 ## 验证

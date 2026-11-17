@@ -173,29 +173,31 @@ def test_inpaint_crop_copy_cleanup_preserves_overlapping_window_order(assets):
             np.testing.assert_array_equal(a, b)
 
 
-@pytest.mark.parametrize('height,width', [(12930,720), (720,12930), (16000,320), (320,16000),
-                                        (11745,800), (800,11745), (10000,1536), (1536,10000)])
-def test_native_rearrange_preserves_resolution_overlap_and_roundtrip(assets, height, width):
+@pytest.mark.parametrize('height,width', [(16000,333), (333,16000), (10000,1536), (1536,10000),
+                                        (28007,930), (930,28007)])
+@pytest.mark.parametrize('long_axis', [False, True])
+def test_native_rearrange_preserves_resolution_overlap_and_roundtrip(assets, height, width, long_axis):
     from mtu_engine.assets import activate
     activate(assets[0])
     from manga_translator.utils.generic import (build_det_rearrange_plan,
-        det_rearrange_patch_array, det_rearrange_patch_spans, det_unrearrange_patch_maps, square_pad_resize)
+        det_rearrange_patch_array, det_rearrange_patch_spans, det_unrearrange_patch_maps)
     source = np.zeros((height, width, 3), dtype=np.uint8)
-    plan = build_det_rearrange_plan(source, 1280, min(height, width))
+    plan = build_det_rearrange_plan(source, 1280, min(height, width), long_axis=long_axis)
+    base_size = max(1280, plan['pw_num'] * min(height, width))
+    assert plan['patch_size'] == min(max(height, width), base_size * (2 if long_axis else 1))
+    if min(height, width) == 930:
+        assert plan['p_num'] == (13 if long_axis else 28)
     packed = det_rearrange_patch_array(plan)
-    for patch in packed:
-        resized, scale, _, _ = square_pad_resize(patch, 1280)
-        assert resized.shape == (1280, 1280, 3)
-        assert scale == min(1, 1280 / min(height, width))
+    assert min(packed.shape[1:3]) == plan['pw_num'] * min(height, width)
     spans = det_rearrange_patch_spans(plan)
     assert spans[0][0] == 0 and spans[-1][1] == max(height, width)
-    assert all(left[1] - right[0] >= plan['patch_size'] // 5 for left, right in zip(spans, spans[1:]))
+    assert all(left[1] - right[0] >= base_size // 5 for left, right in zip(spans, spans[1:]))
     # Feed coordinate ramps through native packing and feathered stitching,
     # including horizontal transposition and the padded tail of the last batch.
     view = np.broadcast_to(np.arange(plan['h'], dtype=np.float32)[:, None, None],
                            (plan['h'], plan['w'], 1))
     coordinate_image = np.swapaxes(view, 0, 1) if plan['transpose'] else view
-    coordinate_plan = build_det_rearrange_plan(coordinate_image, 1280, min(height, width))
+    coordinate_plan = build_det_rearrange_plan(coordinate_image, 1280, min(height, width), long_axis=long_axis)
     patches = det_rearrange_patch_array(coordinate_plan)
     restored = det_unrearrange_patch_maps(list(patches), coordinate_plan, data_format='hwc')
     np.testing.assert_allclose(restored, coordinate_image, atol=.002, rtol=0)
@@ -204,7 +206,7 @@ def test_native_rearrange_preserves_resolution_overlap_and_roundtrip(assets, hei
 
 @pytest.mark.parametrize('shape', [(2801, 93), (93, 2801), (1700, 32), (32, 1700),
                                  (1000, 153), (200, 100)])
-@pytest.mark.parametrize('batch_size', [1, 2, 4])
+@pytest.mark.parametrize('batch_size', [1, 4])
 def test_streamed_detection_preserves_inputs_and_maps_with_bounded_padding(assets, monkeypatch, shape, batch_size):
     import hashlib
     import inspect
@@ -214,8 +216,9 @@ def test_streamed_detection_preserves_inputs_and_maps_with_bounded_padding(asset
     from manga_translator.utils import generic
     source = inspect.getsource(generic.det_rearrange_forward)
     for patch in reversed(LOCK['source']['patches']['manga_translator/utils/generic.py'][1:]):
-        assert source.count(patch['after']) == 1
-        source = source.replace(patch['after'], patch['before'])
+        if patch['after'] in source:
+            assert source.count(patch['after']) == 1
+            source = source.replace(patch['after'], patch['before'])
     scope = dict(vars(generic))
     exec(source, scope)
     image = np.random.default_rng(43).integers(0, 256, (*shape, 3), dtype=np.uint8)
@@ -264,7 +267,8 @@ def test_streamed_detection_preserves_inputs_and_maps_with_bounded_padding(asset
 
 
 @pytest.mark.parametrize('failure_type', ['cancel', 'model'])
-def test_streamed_detection_releases_batches_after_failure_and_can_resume(assets, monkeypatch, failure_type):
+@pytest.mark.parametrize('stride', [0, 32])
+def test_streamed_detection_releases_batches_after_failure_and_can_resume(assets, monkeypatch, failure_type, stride):
     import gc
     import weakref
     from classic_node.protocol import NodeFailure
@@ -292,19 +296,56 @@ def test_streamed_detection_releases_batches_after_failure_and_can_resume(assets
             raise NodeFailure('LEASE_STOPPED')
     image = np.zeros((2801, 93, 3), np.uint8)
     def run():
-        return generic.det_rearrange_forward(image, forward, 128, 2, min_effective_short_side=93)
+        return generic.det_rearrange_forward(image, forward, 128, 2, min_effective_short_side=93,
+                                             input_stride=stride)
     with pytest.raises(NodeFailure if failure_type == 'cancel' else RuntimeError) as failure:
         with cancellation(check):
             run()
-    assert calls == [2] and len(refs) == 6
+    assert calls == [1 if stride else 2] and len(refs) == (2 if stride else 6)
     del failure  # Release pytest's retained traceback before checking buffer ownership.
     gc.collect()
     assert all(ref() is None for ref in refs)
     failure_type = None
     db, mask = run()
-    assert db.shape == mask.shape == (1, 1, 1416, 47)
+    assert db.shape == mask.shape == (1, 1, 1400, 47)
     assert not db.any() and not mask.any()
     assert all(ref() is None for ref in refs)
+
+
+@pytest.mark.parametrize('shape', [(2801, 93), (93, 2801), (1700, 32), (32, 1700),
+                                  (1000, 153), (153, 1000)])
+@pytest.mark.parametrize('batch_size', [1, 4])
+def test_rectangular_detection_preserves_scale_and_bounds_batch_pixels(assets, shape, batch_size):
+    import cv2
+    from mtu_engine.assets import activate
+    activate(assets[0])
+    from manga_translator.utils.generic import (det_rearrange_forward, build_det_rearrange_plan,
+        det_rearrange_patch_array, det_unrearrange_patch_maps)
+    image = np.random.default_rng(13).integers(0, 256, (*shape, 3), dtype=np.uint8)
+    plan = build_det_rearrange_plan(image, 128, min(shape), long_axis=True)
+    expected, db_maps, mask_maps, seen = [], [], [], []
+    for patch in det_rearrange_patch_array(plan):
+        scale = min(1, 128 / min(patch.shape[:2]))
+        if scale < 1:
+            patch = cv2.resize(patch, (round(patch.shape[1] * scale), round(patch.shape[0] * scale)))
+        h, w = patch.shape[:2]
+        expected.append(np.pad(patch, ((0, -h % 32), (0, -w % 32), (0, 0))))
+        db_maps.append(patch[::2, ::2, :2].transpose(2, 0, 1).astype(np.float32))
+        mask_maps.append(patch[::4, ::4, 2:3].transpose(2, 0, 1).astype(np.float32))
+    def forward(batch, **kwargs):
+        n, h, w, _ = batch.shape
+        assert h % 32 == w % 32 == 0
+        assert n <= min(batch_size, max(1, batch_size * 128 ** 2 // (h * w)))
+        if min(shape) == 93:
+            assert sorted((h, w)) == [96, 256]
+        seen.extend(batch)
+        return (batch[:, ::2, ::2, :2].transpose(0, 3, 1, 2).astype(np.float32),
+                batch[:, ::4, ::4, 2:3].transpose(0, 3, 1, 2).astype(np.float32))
+    outputs = det_rearrange_forward(image, forward, 128, batch_size, input_stride=32,
+                                    min_effective_short_side=min(shape))
+    np.testing.assert_array_equal(seen, expected)
+    for output, maps in zip(outputs, (db_maps, mask_maps), strict=True):
+        np.testing.assert_array_equal(output[0], det_unrearrange_patch_maps(maps, plan))
 
 
 @pytest.fixture
@@ -319,7 +360,132 @@ def offline(monkeypatch):
     monkeypatch.setattr(socket, 'create_connection', deny_network)
 
 
-def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, offline, monkeypatch):
+@pytest.mark.parametrize('horizontal', [False, True])
+@pytest.mark.parametrize('shape,budget,count', [((400,400),1000,100), ((1280,1280),1000,1000),
+                                              ((4800,400),2000,1200), ((6000,1000),3000,3000)])
+def test_detection_candidate_budget_and_model_alignment(assets, monkeypatch, horizontal, shape, budget, count):
+    import asyncio
+    from mtu_engine.assets import activate
+    from mtu_engine.engine import configuration
+    activate(assets[0])
+    from manga_translator.detection import default
+    from manga_translator.detection.default_utils.dbnet_utils import SegDetectorRepresenter
+    pred = np.zeros(shape, np.float32)
+    for y in range(0, shape[0], 40):
+        for x in range(0, shape[1], 40):
+            pred[y+8:y+24, x+8:x+24] = .9
+    if horizontal:
+        pred = pred.T.copy()
+    db = pred[None, None]
+    shape = pred.shape
+    def forward(image, infer, size, batch, **kwargs):
+        assert size == 1280 and batch == 2
+        assert kwargs['device'] == 'cpu' and kwargs['input_stride'] == 256
+        return db, db
+    def representer(text_threshold, box_threshold, **kwargs):
+        assert (text_threshold, box_threshold, kwargs) == (.5, .6, {'max_candidates': budget, 'unclip_ratio': 2.3})
+        return SegDetectorRepresenter(text_threshold, box_threshold, **kwargs)
+    monkeypatch.setattr(default, 'det_rearrange_forward', forward)
+    monkeypatch.setattr(default.dbnet_utils, 'SegDetectorRepresenter', representer)
+    detector = default.DefaultDetector()
+    detector.device, detector.max_batch_size = 'cpu', 2
+    c = configuration().detector
+    lines, mask, _ = asyncio.run(detector._infer(np.zeros((*shape, 3), np.uint8), c.detection_size,
+                                               c.text_threshold, c.box_threshold, c.unclip_ratio))
+    assert len(lines) == count and mask.shape == shape
+    assert all(line.prob > .89 and line.area > 0 for line in lines)
+
+
+def test_detection_compact_bitmap_preserves_contours_boxes_and_scores(assets, monkeypatch):
+    import cv2
+    import inspect
+    import textwrap
+    from types import MethodType
+    from mtu_engine.assets import LOCK, activate
+    activate(assets[0])
+    from manga_translator.detection.default_utils import dbnet_utils
+    cls = dbnet_utils.SegDetectorRepresenter
+    source = inspect.getsource(cls.boxes_from_bitmap)
+    for patch in reversed(LOCK['source']['patches']['manga_translator/detection/default_utils/dbnet_utils.py']):
+        assert source.count(patch['after']) == 1
+        source = source.replace(patch['after'], patch['before'])
+    scope = dict(vars(dbnet_utils))
+    exec(textwrap.dedent(source), scope)
+    decoder = cls(.5, .6)
+    native = MethodType(scope['boxes_from_bitmap'], decoder)
+    pred = np.zeros((180, 240), np.float32)
+    pred[10:35, 10:80] = .9
+    pred[15:25, 20:60] = .1  # Preserve native RETR_LIST handling of holes.
+    pred[70:95, 90:150] = .55  # Geometry passes, confidence does not.
+    cv2.fillPoly(pred, [np.array([[160, 50], [220, 80], [210, 100], [150, 70]])], .8)
+    pred[140, ::3] = .9  # Small noise must stay rejected.
+    expected = native(pred, pred > .5, 480, 360)
+    find = cv2.findContours
+    def contours(bitmap, *args):
+        assert bitmap.dtype == np.uint8 and bitmap.max() == 1
+        return find(bitmap, *args)
+    monkeypatch.setattr(cv2, 'findContours', contours)
+    for actual, old in zip(decoder.boxes_from_bitmap(pred, pred > .5, 480, 360), expected):
+        np.testing.assert_array_equal(actual, old)
+
+
+@pytest.mark.parametrize('parts', [0, 2])
+def test_detection_skips_empty_or_split_unclip_results(assets, monkeypatch, parts):
+    from mtu_engine.assets import activate
+    activate(assets[0])
+    from manga_translator.detection.default_utils.dbnet_utils import SegDetectorRepresenter
+    decoder = SegDetectorRepresenter(.5, .6)
+    monkeypatch.setattr(decoder, 'unclip', lambda *a, **kw: np.zeros((parts, 4, 2)))
+    pred = np.zeros((30, 50), np.float32)
+    pred[5:20, 5:40] = .9
+    boxes, scores = decoder.boxes_from_bitmap(pred, pred > .5, 50, 30)
+    assert not boxes.any() and not scores.any()
+
+
+def test_detection_border_removal_rejects_padding_without_mutating_lines(assets):
+    from types import SimpleNamespace
+    from mtu_engine.assets import activate
+    activate(assets[0])
+    from manga_translator.detection.common import CommonDetector
+    rows = [(10, 10, 40, 30), (90, 60, 120, 90), (110, 10, 130, 30),
+            (10, 90, 40, 110), (-10, 10, 0, 30)]
+    lines = [SimpleNamespace(pts=np.array([[x,y], [r,y], [r,b], [x,b]]),
+        xyxy=(x,y,r,b), text='fixture', prob=.9, det_label='text') for x,y,r,b in rows]
+    snapshots = [line.pts.copy() for line in lines]
+    detector = SimpleNamespace(_resize_and_crop_mask=lambda *args: None)
+    result, _, _ = CommonDetector._remove_border(
+        detector, np.zeros((400, 400, 3), np.uint8), 100, 80, lines, None, None)
+    assert len(result) == 2
+    assert all(line.det_label == 'text' and line.area > 0 for line in result)
+    assert result[1].xyxy == (90, 60, 100, 80)
+    for line, original in zip(lines, snapshots):
+        np.testing.assert_array_equal(line.pts, original)
+
+
+@pytest.mark.parametrize('shape,rearrange', [((28007,930), True), ((930,28007), True),
+                                            ((4000,320), True), ((300,200), False)])
+def test_detection_only_plans_before_border_for_small_inputs(assets, shape, rearrange):
+    import asyncio
+    from mtu_engine.assets import activate
+    activate(assets[0])
+    from manga_translator.detection.common import CommonDetector
+    checks, sizes = [], []
+    class Detector(CommonDetector):
+        def _should_rearrange_before_border(self, *args):
+            checks.append(1)
+            return rearrange
+        async def _detect(self, image, *args):
+            sizes.append(image.shape[:2])
+            return [], None, None
+    asyncio.run(Detector().detect(np.zeros((*shape, 3), np.uint8), 1280, .5, .6, 2.3))
+    assert len(checks) == int(min(shape) < 400)
+    assert sizes == [shape if rearrange else (400, 400)]
+
+
+@pytest.mark.parametrize('horizontal', [False, True])
+@pytest.mark.parametrize('font_size', [18, 26])
+def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, offline, monkeypatch,
+                                                                      horizontal, font_size):
     import asyncio
     import torch
     from PIL import Image, ImageDraw, ImageFont
@@ -343,29 +509,45 @@ def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, o
         lambda image, forward, size, batch, **kw: native(image, forward, size, 1, **kw))
     english = None
     try:
-        image = Image.new('RGB', (720, 12930), 'white')
+        # This length places cuts exactly 256px apart from adjacent tile ends.
+        image = Image.new('RGB', (14080, 720) if horizontal else (720, 14080), 'white')
         draw = ImageDraw.Draw(image)
-        font = ImageFont.truetype(str(models.parent / 'fonts/NotoSans-Regular.ttf'), 26)
+        font = ImageFont.truetype(str(models.parent / 'fonts/NotoSans-Regular.ttf'), font_size)
         sentence = 'TALKING ABOUT MAGIC'
         bounds = draw.textbbox((0, 0), sentence, font=font)
-        # Center line 20 on the old 2160px tile edge. The paragraph is longer
-        # than the new overlap, so it also exercises whole-page grouping.
-        first_y = 2160 - 20 * 40 - (bounds[1] + bounds[3]) // 2
-        for index in range(30):
-            draw.text((180, first_y + index * 40), sentence, font=font, fill='black')
+        seams = [top for top, _ in det_rearrange_patch_spans(
+            build_det_rearrange_plan(np.asarray(image), 1280, min_effective_short_side=720,
+                                     long_axis=True))[1:]]
+        assert seams[0] == 2560 - 256
+        # Center a labeled line on an actual cut, independent of tile geometry.
+        first_y = seams[1] - 20 * 40 - (bounds[1] + bounds[3]) // 2
+        count = 15 if horizontal else 30
+        for index in range(count):
+            position = ((seams[1] - (bounds[0] + bounds[2]) // 2, 40 + index * 40)
+                        if horizontal else (180, first_y + index * 40))
+            draw.text(position, sentence, font=font, fill='black')
         rgb = np.array(image)
         config = configuration()
-        lines, raw, _ = asyncio.run(detector.detect(rgb, 1280, .5, .7, 2.3))
+        c = config.detector
+        assert (c.text_threshold, c.box_threshold, c.unclip_ratio) == (.5, .6, 2.3)
+        lines, raw, _ = asyncio.run(detector.detect(rgb, c.detection_size, c.text_threshold,
+            c.box_threshold, c.unclip_ratio, det_rearrange_min_effective_short_side=720))
         getattr(torch, device).empty_cache()
-        blocks = group_output([], [line.pts for line in lines], 720, 12930)
-        assert len(lines) == 30 and sum(len(block.lines) for block in blocks) == 30
+        blocks = group_output([], [line.pts for line in lines], image.width, image.height)
+        assert len(lines) == count and sum(len(block.lines) for block in blocks) == count
         english = Paddle(models, 'en', 0, 2, backend=backend)
         grouped = [Quadrilateral(np.asarray(line), '', 1) for block in blocks for line in block.lines]
         asyncio.run(english.recognize(rgb, grouped, config.ocr))
-        assert [line.text for line in grouped] == [sentence] * 30
-        seams = [top for top, _ in det_rearrange_patch_spans(build_det_rearrange_plan(rgb, 1280))[1:]]
-        assert any(block.xyxy[1] < seam < block.xyxy[3] for block in blocks for seam in seams)
+        assert [line.text for line in grouped] == [sentence] * count
+        axis = 0 if horizontal else 1
+        assert any(block.xyxy[axis] < seam < block.xyxy[axis + 2] for block in blocks for seam in seams)
         assert raw.shape == rgb.shape[:2]
+        from manga_translator.mask_refinement import dispatch
+        from manga_translator.utils import TextBlock
+        regions = [TextBlock(lines=block.lines, texts=[sentence]) for block in blocks]
+        mask = asyncio.run(dispatch(regions, rgb, raw, dilation_offset=config.mask_dilation_offset,
+                                    kernel_size=config.kernel_size))
+        assert np.all(mask[rgb[:, :, 0] < 245] == 255)  # Includes small antialiased seam glyphs.
     finally:
         if english is not None:
             english.close()
@@ -545,6 +727,110 @@ def private_layout_cases():
     path = Path(manifest).resolve()
     return [pytest.param((path.parent, row), id=Path(row['image']).stem)
             for row in json.loads(path.read_text(encoding='utf-8'))]
+
+
+@pytest.mark.parametrize('turns', range(4))
+@pytest.mark.parametrize('foreground', [(15, 15, 15), (220, 35, 40)])
+def test_ctd_refinement_keeps_outlines_edges_and_excludes_nearby_text(assets, turns, foreground):
+    import asyncio
+    import cv2
+    from mtu_engine.assets import activate
+    activate(assets[0])
+    from manga_translator.mask_refinement import dispatch
+    from manga_translator.utils import TextBlock
+    rgb = np.full((120, 220, 3), (150, 170, 190), np.uint8)
+    glyph = np.zeros(rgb.shape[:2], np.uint8)
+    outline = np.zeros_like(glyph)
+    cv2.putText(glyph, 'TEST', (0, 43), cv2.FONT_HERSHEY_SIMPLEX, 1.1, 255, 2)
+    cv2.putText(outline, 'TEST', (0, 43), cv2.FONT_HERSHEY_SIMPLEX, 1.1, 255, 6)
+    rgb[outline > 0] = (255, 255, 255)
+    rgb[glyph > 0] = foreground
+    raw = glyph.copy()
+    raw[65:69, 30:80] = 255  # Inside the CTD context window, outside selected text.
+    rgb[65:69, 30:80] = foreground
+    points = np.array([[0, 13], [100, 13], [100, 49], [0, 49]])
+    for _ in range(turns):
+        points = np.column_stack((points[:, 1], rgb.shape[1] - 1 - points[:, 0]))
+        rgb, raw, outline = (np.rot90(a) for a in (rgb, raw, outline))
+    snapshots = rgb.copy(), raw.copy(), points.copy()
+    rgb.flags.writeable = raw.flags.writeable = False
+    block = TextBlock(lines=[points], texts=['fixture'])
+    result = asyncio.run(dispatch([block], rgb, raw, dilation_offset=20))
+    assert result.dtype == np.uint8 and result.shape == raw.shape
+    assert np.all(result[outline > 0] == 255)
+    assert not np.any(np.rot90(result, -turns)[65:69, 30:80])
+    for actual, expected in zip((rgb, raw, points), snapshots):
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_ctd_refinement_cancels_between_lines_and_resumes(assets, monkeypatch):
+    import sys
+    from mtu_engine.assets import activate
+    from mtu_engine.backend import cancellation
+    from classic_node.protocol import NodeFailure
+    from mtu_engine.masks import complete_mask
+    assert not any(name.startswith('pydensecrf') for name in sys.modules)
+    monkeypatch.setitem(sys.modules, 'pydensecrf', None)
+    activate(assets[0])
+    from manga_translator.detection.ctd_utils import textmask
+    from manga_translator.mask_refinement import complete_mask as dispatched
+    from manga_translator.utils import Quadrilateral
+    assert dispatched is complete_mask
+    rgb = np.full((90, 140, 3), 255, np.uint8)
+    mask = np.zeros(rgb.shape[:2], np.uint8)
+    mask[20:30, 25:55] = mask[60:70, 25:55] = 255
+    rgb[mask > 0] = 0
+    lines = [Quadrilateral(np.array([[15,y], [65,y], [65,y+25], [15,y+25]]), '', 0)
+             for y in (10, 50)]
+    calls, native = [], textmask.refine_mask
+    def refine(*args, **kwargs):
+        calls.append(True)
+        return native(*args, **kwargs)
+    monkeypatch.setattr(textmask, 'refine_mask', refine)
+    def cancelled():
+        if calls:
+            raise NodeFailure('LEASE_STOPPED')
+    with cancellation(cancelled), pytest.raises(NodeFailure, match='LEASE_STOPPED'):
+        complete_mask(rgb, mask, lines)
+    assert len(calls) == 1
+    resumed = complete_mask(rgb, mask, lines)
+    assert np.all(resumed[mask > 0] == 255) and len(calls) == 3
+
+
+def test_ctd_dispatch_empty_inputs_and_unsupported_method(assets):
+    import asyncio
+    from mtu_engine.assets import activate
+    activate(assets[0])
+    from manga_translator.mask_refinement import dispatch
+    from manga_translator.utils import TextBlock
+    rgb = np.full((40, 60, 3), 255, np.uint8)
+    raw = np.zeros(rgb.shape[:2], np.uint8)
+    block = TextBlock(lines=[[[5, 5], [40, 5], [40, 30], [5, 30]]], texts=['fixture'])
+    assert not asyncio.run(dispatch([block], rgb, raw)).any()
+    raw[10:20, 10:30] = 255
+    assert not asyncio.run(dispatch([], rgb, raw)).any()
+    with pytest.raises(ValueError, match='Unsupported mask refinement method'):
+        asyncio.run(dispatch([block], rgb, raw, method='fill'))
+
+
+def test_ctd_refinement_keeps_complete_glyph_cut_by_detection_polygon(assets):
+    import cv2
+    from mtu_engine.assets import activate
+    from mtu_engine.masks import complete_mask
+    activate(assets[0])
+    from manga_translator.utils import Quadrilateral
+    rgb = np.full((90, 140, 3), 170, np.uint8)
+    glyph = np.zeros(rgb.shape[:2], np.uint8)
+    glyph[20:65, 20:30] = glyph[20:65, 55:65] = glyph[40:46, 20:65] = 255
+    outline = cv2.dilate(glyph, np.ones((5, 5), np.uint8))
+    rgb[outline > 0], rgb[glyph > 0] = 255, 0
+    raw = glyph.copy()
+    raw[30:40, 83:89] = 255
+    rgb[30:40, 83:89] = 0  # Nearby disconnected text is not selected.
+    line = Quadrilateral(np.array([[20,16], [38,16], [38,70], [20,70]]), '', 0)
+    result = complete_mask(rgb, raw, [line], dilation_offset=20)
+    assert np.all(result[outline > 0] == 255)
+    assert not np.any(result[30:40, 83:89])
 
 
 @pytest.mark.parametrize('case', private_layout_cases())

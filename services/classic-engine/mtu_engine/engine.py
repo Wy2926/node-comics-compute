@@ -27,7 +27,8 @@ LANGUAGES = {'zh-Hans': 'CHS', 'zh-Hant': 'CHT', 'ja': 'JPN', 'ko': 'KOR', 'en':
 def configuration(detect_size=1280, inpainting_size=512):
     from manga_translator.config import Config
     return Config.model_validate({
-        'detector': {'detector': 'default', 'detection_size': detect_size},
+        'detector': {'detector': 'default', 'detection_size': detect_size,
+                     'text_threshold': 0.5, 'box_threshold': 0.6, 'unclip_ratio': 2.3},
         'ocr': {'ocr': 'paddleocr', 'prob': 0.50, 'limit_mask_dilation_to_bubble_mask': True},
         'inpainter': {'inpainter': 'lama_large', 'inpainting_size': inpainting_size,
                       'inpainting_precision': 'fp32', 'force_use_torch_inpainting': True,

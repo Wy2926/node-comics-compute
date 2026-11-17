@@ -44,7 +44,7 @@ def analysis(monkeypatch):
     engine.backend, engine.device = 'cuda', 'cuda:0'
     engine.ocr = ClassicOCR.__new__(ClassicOCR)
     engine.config = SimpleNamespace(
-        detector=SimpleNamespace(detection_size=1280, text_threshold=0.5, box_threshold=0.7, unclip_ratio=2.3),
+        detector=SimpleNamespace(detection_size=1280, text_threshold=0.5, box_threshold=0.6, unclip_ratio=2.3),
         render=SimpleNamespace(stroke_width=0.1),
         ocr=SimpleNamespace(prob=0.5, min_text_length=1), mask_dilation_offset=0, kernel_size=3)
     engine._detector_lock, engine._bubble_lock = Lock(), Lock()
@@ -77,7 +77,7 @@ def test_analysis_requests_source_short_side_for_native_detection(analysis, shap
     engine.detector.detect = detect
     engine.ocr.recognize = recognize
     assert engine.analyze(rgb) == ([], None, None, None)
-    assert observed == [(1280, .5, .7, 2.3, {'det_rearrange_min_effective_short_side': min(shape)})]
+    assert observed == [(1280, .5, .6, 2.3, {'det_rearrange_min_effective_short_side': min(shape)})]
 
 
 @pytest.mark.parametrize('backend,limit,fail_at,expected', [
