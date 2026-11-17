@@ -2,10 +2,12 @@
 import hashlib
 import json
 import re
+import socket
 import ssl
 from threading import Condition
 from time import monotonic
 import httpx
+from httpx_ws import WebSocketSession
 from wsproto.utilities import LocalProtocolError
 from .protocol import ControlFailure, MAX_RESULT_BYTES, NodeFailure
 
@@ -15,6 +17,18 @@ INPUT_PROGRESS_SECONDS = 10
 INPUT_MIN_BYTES_PER_SECOND = 1024
 # The center permits a 128 MiB document text response plus JSON escaping/framing.
 MAX_CONTROL_BYTES = 256 * 1024 * 1024 + 64 * 1024
+
+
+class ControlChannel(WebSocketSession):
+    def close(self, code=1000, reason=None):
+        # Wake blocked readers before close can recycle their socket descriptor.
+        connection = self.stream.get_extra_info('socket')
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        super().close(code, reason)
 
 
 def control_client(config, *, headers=None, transport=None, timeout=30):
@@ -53,7 +67,7 @@ class Transport:
             setattr(timeout, phase, min(seconds, 5) if seconds is not None else 5)
         try:
             with connect_ws(f'{PREFIX}/nodes/{self.node_id}/channel', self.control,
-                    subprotocols=['compute.v3'], max_message_size_bytes=MAX_CONTROL_BYTES,
+                    subprotocols=['compute.v3'], session_class=ControlChannel, max_message_size_bytes=MAX_CONTROL_BYTES,
                     queue_size=1, keepalive_ping_interval_seconds=10,
                     keepalive_ping_timeout_seconds=10, timeout=timeout) as channel:
                 with self.channel_condition:

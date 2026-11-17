@@ -35,6 +35,47 @@ def test_channel_closed_during_send_is_a_retryable_control_failure(operation):
         client.close()
 
 
+def test_channel_close_wakes_blocked_socket_reader_before_reconnect(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    import socket
+    from threading import Event
+    from httpcore._backends.sync import SyncStream
+    from httpx_ws import WebSocketSession
+    left, right = socket.socketpair()
+    entered, drained = Event(), Event()
+
+    @contextmanager
+    def connected(*args, **kwargs):
+        session = kwargs.get('session_class', WebSocketSession)(
+            SyncStream(left), keepalive_ping_interval_seconds=None)
+        read = session._read_stream
+        def observed(size):
+            entered.set()
+            try:
+                return read(size)
+            finally:
+                drained.set()
+        session._read_stream = observed
+        with session:
+            yield session
+
+    monkeypatch.setattr('httpx_ws.connect_ws', connected)
+    client = Transport(config())
+    with ThreadPoolExecutor(1) as pool:
+        listening = pool.submit(client.listen, Event(), lambda _: None)
+        try:
+            with client.channel_condition:
+                assert client.channel_condition.wait_for(lambda: client.channel is not None, 2)
+            assert entered.wait(2) and not drained.wait(.05)
+            client.close_channel()
+            listening.result(timeout=2)
+            assert drained.wait(1), 'Closed channel retained a reader on its old socket'
+        finally:
+            right.close()
+            client.close()
+
+
 @pytest.mark.parametrize('configured,limit', [(.1, 2), (30, 6.5), (None, 6.5)])
 def test_channel_handshake_bounds_stalls_and_preserves_shorter_control_timeouts(configured, limit):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
