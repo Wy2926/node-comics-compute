@@ -44,7 +44,7 @@ def analysis(monkeypatch):
     engine.backend, engine.device = 'cuda', 'cuda:0'
     engine.ocr = ClassicOCR.__new__(ClassicOCR)
     engine.config = SimpleNamespace(
-        detector=SimpleNamespace(detection_size=1280, text_threshold=0.5, box_threshold=0.7, unclip_ratio=2.3),
+        detector=SimpleNamespace(detection_size=1280, text_threshold=0.5, box_threshold=0.6, unclip_ratio=2.3),
         render=SimpleNamespace(stroke_width=0.1),
         ocr=SimpleNamespace(prob=0.5, min_text_length=1), mask_dilation_offset=0, kernel_size=3)
     engine._detector_lock, engine._bubble_lock = Lock(), Lock()
@@ -77,7 +77,7 @@ def test_analysis_requests_source_short_side_for_native_detection(analysis, shap
     engine.detector.detect = detect
     engine.ocr.recognize = recognize
     assert engine.analyze(rgb) == ([], None, None, None)
-    assert observed == [(1280, .5, .7, 2.3, {'det_rearrange_min_effective_short_side': min(shape)})]
+    assert observed == [(1280, .5, .6, 2.3, {'det_rearrange_min_effective_short_side': min(shape)})]
 
 
 @pytest.mark.parametrize('backend,limit,fail_at,expected', [
@@ -344,27 +344,40 @@ def test_graph_capture_guard_covers_other_gpu_models_but_not_page_cpu_or_ocr_rep
     assert [name for name, _ in calls] == ['colors', 'bubbles', 'refine']
 
 
-def test_inpaint_gpu_calls_share_capture_guard_but_cpu_preparation_does_not(analysis, monkeypatch):
+@pytest.mark.parametrize('cancel', [False, True])
+def test_inpaint_guards_model_blocks_and_drains_cancellation(analysis, monkeypatch, cancel):
+    from classic_node.protocol import NodeFailure
+    from mtu_engine.backend import cancellation
     engine, source, _, _ = analysis
     engine._capture_guard = Lock()
     engine.config.inpainter = SimpleNamespace(inpainting_size=512)
     engine.config.ocr.model_bubble_overlap_threshold = .5
+    calls = []
     monkeypatch.setattr(sys.modules['manga_translator.utils'], 'erode_bubble_mask', lambda mask, _: mask, raising=False)
     def fill(rgb, mask, *args, **kwargs):
         assert not engine._capture_guard.locked()
         return rgb, mask, None
     async def blocks(rgb, mask, callback):
         assert not engine._capture_guard.locked()
-        return await callback(rgb, mask), None
+        for _ in range(3):
+            rgb = await callback(rgb, mask)
+        return rgb, 3
     async def inpaint(rgb, mask, *args):
         assert engine._capture_guard.locked()
+        calls.append(1)
         return rgb.copy()
     monkeypatch.setitem(sys.modules, 'manga_translator.inpainting.ballon_fill', SimpleNamespace(
         MODEL_BUBBLE_SHRINK_RATIO=.02, solid_fill_pure_bubbles=fill, inpaint_regions_per_block=blocks))
     engine.inpainter = SimpleNamespace(inpaint=inpaint)
     mask = np.zeros(source.shape[:2], dtype=np.uint8)
+    def check():
+        if cancel and calls:
+            raise NodeFailure('LEASE_STOPPED')
+    with cancellation(check), pytest.raises(NodeFailure, match='LEASE_STOPPED') if cancel else nullcontext():
+        np.testing.assert_array_equal(engine.inpaint(source, mask, mask, mask, []), source)
+    assert len(calls) == (1 if cancel else 3) and not engine._capture_guard.locked()
     np.testing.assert_array_equal(engine.inpaint(source, mask, mask, mask, []), source)
-    assert not engine._capture_guard.locked()
+    assert len(calls) == (4 if cancel else 6) and not engine._capture_guard.locked()
 
 
 def test_analysis_failure_releases_locks_without_new_timing_keys(analysis):

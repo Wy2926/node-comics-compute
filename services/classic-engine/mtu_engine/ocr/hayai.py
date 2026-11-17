@@ -7,7 +7,7 @@ from threading import Lock
 from PIL import Image
 
 from classic_node.timing import record, stage, waiting_for
-from mtu_engine.backend import device_context
+from mtu_engine.backend import check_cancelled, device_context
 from . import Reading
 from .crops import paragraph_box
 from .models import verify_hayai
@@ -78,6 +78,7 @@ class HayaiOCR:
         record('ocr_paragraphs', len(indices))
         with stage('analyze_ocr'):
             for offset in range(0, len(indices), self.batch_size):
+                check_cancelled()
                 owners = indices[offset:offset + self.batch_size]
                 with stage('ocr_crop'):
                     crops = [Image.fromarray(image[t:b, l:r]) for l, t, r, b in (boxes[i] for i in owners)]
@@ -95,6 +96,7 @@ class HayaiOCR:
             inputs = self.processor(images=images, max_num_patches=MAX_PATCHES, return_tensors='pt')
         with device_context(self.backend, self.gpu), waiting_for(
                 self._lock, 'ocr_lock_wait', 'ocr_model_lock_wait'), torch.inference_mode():
+            check_cancelled()
             with stage('ocr_transfer'):
                 # Native FastEngine derives the mask from CPU spatial_shapes.
                 # Moving that metadata to GPU only makes run() copy it back.

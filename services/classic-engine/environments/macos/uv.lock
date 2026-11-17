@@ -10,7 +10,6 @@ supported-markers = [
 
 [manifest]
 overrides = [
-    { name = "pydensecrf", url = "https://github.com/hgmzhn/pydensecrf/releases/download/v1.0.0/pydensecrf-1.0-cp312-cp312-macosx_10_13_universal2.whl" },
     { name = "torch", url = "https://files.pythonhosted.org/packages/4b/3c/379349820e9a6e713826de3d0b88f07728541bdcabe2a3afd128871cdc4b/torch-2.14.1-cp312-cp312-macosx_14_0_arm64.whl" },
     { name = "torchvision", url = "https://files.pythonhosted.org/packages/f3/f8/855c7b326ed17a8dac4a03e8e6fec33ef6728e4baa00d816cf1227bb6681/torchvision-0.29.1-cp312-cp312-macosx_14_0_arm64.whl" },
 ]
@@ -582,7 +581,6 @@ dependencies = [
     { name = "py3langid" },
     { name = "pyclipper" },
     { name = "pydantic" },
-    { name = "pydensecrf" },
     { name = "pyhyphen" },
     { name = "pyqt6" },
     { name = "pyside6-essentials" },
@@ -630,9 +628,6 @@ requires-dist = [
     { name = "py3langid", specifier = "==0.2.2" },
     { name = "pyclipper", specifier = "==1.3.0.post6" },
     { name = "pydantic", specifier = "==2.11.7" },
-    { name = "pydensecrf", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'linux' and sys_platform != 'win32')", specifier = "==1.0" },
-    { name = "pydensecrf", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", url = "https://github.com/hgmzhn/pydensecrf/releases/download/v1.0.0/pydensecrf-1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
-    { name = "pydensecrf", marker = "sys_platform == 'win32'", url = "https://github.com/hgmzhn/manga-translator-ui/releases/download/v1.7.6/pydensecrf-1.0-cp312-cp312-win_amd64.whl" },
     { name = "pyhyphen", specifier = "==4.0.4" },
     { name = "pyqt6", specifier = "==6.9.1" },
     { name = "pyside6-essentials", specifier = "==6.9.2" },
@@ -906,14 +901,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ad/88/5f2260bdfae97aabf98f1778d43f69574390ad787afb646292a638c923d4/pydantic_core-2.33.2.tar.gz", hash = "sha256:7cb8bc3605c29176e1b105350d2e6474142d7c1bd1d9327c4a9bdb46bf827acc", size = 435195, upload-time = "2025-04-23T18:33:52.104Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a1/02/6224312aacb3c8ecbaa959897af57181fb6cf3a3d7917fd44d0f2917e6f2/pydantic_core-2.33.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:3c6db6e52c6d70aa0d00d45cdb9b40f0433b96380071ea80b09277dba021ddf7", size = 1847996, upload-time = "2025-04-23T18:31:27.341Z" },
-]
-
-[[package]]
-name = "pydensecrf"
-version = "1.0"
-source = { url = "https://github.com/hgmzhn/pydensecrf/releases/download/v1.0.0/pydensecrf-1.0-cp312-cp312-macosx_10_13_universal2.whl" }
-wheels = [
-    { url = "https://github.com/hgmzhn/pydensecrf/releases/download/v1.0.0/pydensecrf-1.0-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:2fe0f91b6afa3db900efc455db2f96fcd50c39c074a93f9ef6df00e2ce933fb3" },
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from classic_node.timing import record, stage, waiting_for
+from .backend import check_cancelled
 from .page_cache import bgr, crop as cached_crop
 
 
@@ -228,6 +229,7 @@ class Colors:
         # crops, preprocessing and per-character aggregation stay intact. Only
         # one line contributes colors; full OCR/erasure/layout geometry is retained.
         for batch in chunks(predicted, self.batch_size):
+            check_cancelled()
             crops, owners, tokens = [], [], []
             for region in batch:
                 crop, text_indices = self._representative(image, region)

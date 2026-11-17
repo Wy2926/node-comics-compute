@@ -13,7 +13,7 @@ import numpy as np
 from classic_node.timing import record, stage, waiting_for
 
 from .assets import activate
-from .backend import device_context, validate_backend
+from .backend import check_cancelled, device_context, validate_backend
 from .colors import ensure_stroke_contrast
 from .fonts import FONT_CHOICES, font_filename
 from .layout import associate_bubbles, fit_bubbles
@@ -27,7 +27,8 @@ LANGUAGES = {'zh-Hans': 'CHS', 'zh-Hant': 'CHT', 'ja': 'JPN', 'ko': 'KOR', 'en':
 def configuration(detect_size=1280, inpainting_size=512):
     from manga_translator.config import Config
     return Config.model_validate({
-        'detector': {'detector': 'default', 'detection_size': detect_size},
+        'detector': {'detector': 'default', 'detection_size': detect_size,
+                     'text_threshold': 0.5, 'box_threshold': 0.6, 'unclip_ratio': 2.3},
         'ocr': {'ocr': 'paddleocr', 'prob': 0.50, 'limit_mask_dilation_to_bubble_mask': True},
         'inpainter': {'inpainter': 'lama_large', 'inpainting_size': inpainting_size,
                       'inpainting_precision': 'fp32', 'force_use_torch_inpainting': True,
@@ -301,6 +302,7 @@ class Engine:
                     asyncio.run(model.load(device, force_torch=True))
                 else:
                     asyncio.run(model.load(device))
+            self.detector.model.register_forward_pre_hook(check_cancelled)
             self.colors = Colors(self.color_model, color_batch_size)
             options = {'batch_size': ocr_batch_size, 'min_batch_size': ocr_min_batch_size,
                        'arena_extend_strategy': ocr_arena_extend_strategy, 'arena_shrinkage': ocr_arena_shrinkage}
@@ -359,6 +361,7 @@ class Engine:
         from manga_translator.utils import (
             TextBlock, build_bubble_mask_from_mangalens_result, is_valuable_text)
         async def run():
+            check_cancelled()
             c = self.config
             with stage('analyze_detect'), waiting_for(self._detector_lock, 'detect_lock_wait'), self._capture_guard:
                 # Pack long-page stripes without shrinking below their source
@@ -366,11 +369,13 @@ class Engine:
                 lines, raw, _ = await self.detector.detect(rgb, c.detector.detection_size,
                     c.detector.text_threshold, c.detector.box_threshold, c.detector.unclip_ratio,
                     det_rearrange_min_effective_short_side=min(rgb.shape[:2]))
+            check_cancelled()
             # Retain the approved upstream paragraph grouping and reading
             # order, using DBNet lines without loading or running a CTD model.
             with stage('analyze_group'):
                 blocks = group_output([], [line.pts for line in lines], rgb.shape[1], rgb.shape[0])
             readings = await self.ocr.recognize(rgb, blocks, c.ocr)
+            check_cancelled()
             regions = []
             for block, reading in zip(blocks, readings, strict=True):
                 if not reading.texts:
@@ -392,6 +397,7 @@ class Engine:
             with stage('analyze_colors'):
                 self.colors.apply(rgb, regions, capture_guard=self._capture_guard)
             with stage('analyze_bubbles'), self._bubble_lock, self._capture_guard:
+                check_cancelled()
                 detected_bubbles = self.bubbles.detect(rgb, device=self.device)
             with stage('analyze_bubble_mask'):
                 # Native mask construction still reads GPU tensors. Association
@@ -400,6 +406,7 @@ class Engine:
                     bubbles = build_bubble_mask_from_mangalens_result(detected_bubbles, rgb.shape[:2])
                 associate_bubbles(regions, bubbles)
             with stage('analyze_refine'):
+                check_cancelled()
                 mask = await refine(regions, rgb, raw, dilation_offset=c.mask_dilation_offset,
                                     kernel_size=c.kernel_size, limit_mask_dilation_to_bubble_mask=True,
                                     bubble_mask=bubbles)
@@ -408,6 +415,7 @@ class Engine:
             return asyncio.run(run())
 
     def inpaint(self, rgb, mask, raw_mask, bubble_mask, regions, *, cache=None):
+        check_cancelled()
         import cv2
         from manga_translator.utils import TextBlock, erode_bubble_mask
         from manga_translator.inpainting.ballon_fill import (
@@ -434,19 +442,23 @@ class Engine:
                     labels.flags.writeable = stats.flags.writeable = False
                     cache['bubble_labels'], cache['bubble_stats'] = components
         with stage('inpaint_solid_fill'):
+            check_cancelled()
             filled, remaining, solid_regions = solid_fill_pure_bubbles(rgb, mask, blocks, tight,
                 inset, self.config.ocr.model_bubble_overlap_threshold, components=components)
             record('inpaint_solid_regions', solid_regions)
         async def inpaint(crop, local_mask):
+            check_cancelled()
             # The loaded FP32 LaMa eval path only reads model state; its input
             # tensors and padding are per-call. The compute pool bounds readers.
             started = perf_counter()
             with self._capture_guard:
+                check_cancelled()
                 record('inpaint_lock_wait', perf_counter() - started)
                 with stage('inpaint_model'):
                     return await self.inpainter.inpaint(crop, local_mask, self.config.inpainter,
                                                         self.config.inpainter.inpainting_size)
         with stage('inpaint_lama'), device_context(self.backend, self.gpu):
+            check_cancelled()
             # solid_fill returns an owned mask; the native block loop may clear it.
             result, count = asyncio.run(inpaint_regions_per_block(filled, remaining, inpaint))
             record('inpaint_blocks', count)

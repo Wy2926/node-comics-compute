@@ -170,7 +170,7 @@ def archive_release(destination, manifest_name='release.json'):
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info._compresslevel = 1
                 info.create_system = 3
-                info.external_attr = 0o100644 << 16
+                info.external_attr = (0o100644 | (source.stat().st_mode & 0o111)) << 16
                 with source.open('rb') as src, package.open(info, 'w', force_zip64=True) as dst:
                     shutil.copyfileobj(src, dst, 1024 * 1024)
     temporary.rename(archive)

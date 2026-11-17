@@ -44,7 +44,8 @@ def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cach
         entries = {prefix + name + '/__init__.py': '' for name in modules}
         entries[prefix + 'LICENSE'] = 'retained source license'
         if 'patches' in source:
-            entries.update({prefix + name: ''.join(patch['before'] for patch in patches)
+            entries.update({prefix + name: '# Upstream license retained\n'
+                            + ''.join(patch['before'] for patch in patches) + '# Other source retained\n'
                             for name, patches in source['patches'].items()})
         archives[source['url']] = entries
     archives[LOCK['hyphenation']['url']] = {
@@ -64,6 +65,13 @@ def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cach
     monkeypatch.setattr(prepare_mtu, 'download', download)
     manifest = prepare_mtu.prepare(output, cache, ocr_backend)
     assert verify(output / 'models', ocr_backend) == manifest
+    for relative, patches in LOCK['source']['patches'].items():
+        expected = '# Upstream license retained\n' + ''.join(p['before'] for p in patches) + '# Other source retained\n'
+        for patch in patches:
+            expected = expected.replace(patch['before'], patch['after'])
+        assert (output / 'upstream' / relative).read_text(encoding='utf-8') == expected
+    with pytest.raises(ValueError, match='target changed'):
+        prepare_mtu.apply_source_patches(output / 'upstream')
     assert all(not (output / name).exists() for name in stale)
     assert {path.name for path in (output / 'fonts').iterdir()} == {'Test.ttf'}
     assert sample.read_bytes() == b'private user sample'
@@ -85,3 +93,30 @@ def test_prepare_rejects_node_state_before_removing_generated_files(tmp_path, ma
     with pytest.raises(ValueError, match='configured node state'):
         prepare_mtu.prepare(tmp_path, tmp_path / 'cache')
     assert original.read_bytes() == b'untouched'
+
+
+@pytest.mark.parametrize('anchor_count', [0, 2])
+def test_preparation_rejects_missing_or_ambiguous_anchor_without_partial_write(tmp_path, monkeypatch, anchor_count):
+    relative = 'manga_translator/rendering/__init__.py'
+    patches = LOCK['source']['patches'][relative]
+    source = ''.join(patch['before'] for patch in patches[:-1]) + patches[-1]['before'] * anchor_count
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text(source, encoding='utf-8')
+    monkeypatch.setitem(LOCK['source'], 'patches', {relative: patches})
+    with pytest.raises(ValueError, match='target changed'):
+        prepare_mtu.apply_source_patches(tmp_path)
+    assert target.read_text(encoding='utf-8') == source
+
+
+def test_preparation_rejects_patch_outside_bundle(tmp_path, monkeypatch):
+    monkeypatch.setitem(LOCK['source'], 'patches', {'../outside.py': []})
+    with pytest.raises(ValueError, match='Unsafe upstream patch'):
+        prepare_mtu.apply_source_patches(tmp_path)
+
+
+def test_previous_asset_lock_is_rejected_before_model_loading(tmp_path):
+    manifest = {'upstream': LOCK['source']['revision'], 'lock_sha256': 'previous-unpatched-lock'}
+    (tmp_path / 'mtu-assets.json').write_text(json.dumps(manifest), encoding='utf-8')
+    with pytest.raises(ValueError, match='do not match'):
+        verify(tmp_path / 'models')

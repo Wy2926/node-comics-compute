@@ -5,6 +5,7 @@ from threading import Lock
 from PIL import Image
 
 from classic_node.timing import waiting_for
+from ..backend import check_cancelled
 from .crops import paragraph_box
 
 
@@ -28,6 +29,7 @@ class Japanese:
     def recognize(self, image, blocks, groups):
         height, width = image.shape[:2]
         for block, lines in zip(blocks, groups, strict=True):
+            check_cancelled()
             for line in lines:
                 line.text, line.prob = '', 0.  # Manga OCR exposes no confidence.
             left, top, right, bottom = paragraph_box(block.xyxy, width, height)
@@ -36,6 +38,7 @@ class Japanese:
                 # Keep all original polygons for masking and checkpointing.
                 crop = Image.fromarray(image[top:bottom, left:right])
                 with waiting_for(self._lock, 'ocr_lock_wait'):
+                    check_cancelled()
                     text = self.model(crop)
                 lines[0].text = text
 

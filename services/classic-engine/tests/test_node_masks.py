@@ -189,3 +189,19 @@ def test_array_packing_does_not_convert_the_full_frame_to_pil(monkeypatch):
     monkeypatch.setattr(Image, 'fromarray', lambda *_a, **_k: pytest.fail('No full-frame PIL bridge'))
     packed = pack_result(rgb, rgb, None, 'fixture', analysis, translated(analysis))
     assert packed['output_bytes'] is None
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+@pytest.mark.parametrize('pixels', [100, 26_046_510, 64 * 1024**2 + 1])
+def test_reference_cache_caps_whole_masks_without_displacing_page_work(monkeypatch, prepared, pixels):
+    import sys
+    runtime = Runtime.__new__(Runtime)
+    analysis = {'width': pixels, 'height': 1, 'bubble_mask': 'fixture',
+                'segments': [{'id': str(i)} for i in range(16)], 'regions': [{}] * 16}
+    translated = {'translations': {str(i): 'text' for i in range(16)}}
+    masks = {'bubble_inset': object(), 'bubble_labels': object()} if prepared else {}
+    monkeypatch.setitem(sys.modules, 'manga_translator.utils.bubble',
+                        SimpleNamespace(reference_cache_bytes=lambda *args: pixels * 16))
+    expected = min(16, 64 * 1024**2 // pixels) * pixels
+    assert runtime.render_cache_bytes(analysis, translated, masks) == expected
+    assert runtime.render_cache_bytes(analysis, {}, masks) == 0

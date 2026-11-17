@@ -11,6 +11,25 @@ from classic_node.timing import collect
 from mtu_engine.ocr.hayai import HayaiOCR, MAX_PATCHES, MAX_TOKENS
 
 
+def test_cancelled_hayai_stops_before_next_crop_batch():
+    import asyncio
+    from classic_node.protocol import NodeFailure
+    from mtu_engine.backend import cancellation
+    ocr = HayaiOCR.__new__(HayaiOCR)
+    ocr.batch_size = 2
+    calls = []
+    ocr._recognize = lambda crops: calls.append(len(crops)) or ['read'] * len(crops)
+    blocks = [SimpleNamespace(xyxy=(0, 0, 20, 20), lines=[None]) for _ in range(5)]
+    def check():
+        if calls:
+            raise NodeFailure('LEASE_STOPPED')
+    with pytest.raises(NodeFailure, match='LEASE_STOPPED'), cancellation(check):
+        asyncio.run(ocr.recognize(np.zeros((24, 24, 3), np.uint8), blocks, None))
+    assert calls == [2]
+    assert len(asyncio.run(ocr.recognize(np.zeros((24, 24, 3), np.uint8), blocks, None))) == 5
+    assert calls == [2, 2, 2, 1]
+
+
 @pytest.mark.parametrize('fail_first', [False, True])
 @pytest.mark.parametrize('backend,graph_failed', [('amd', False), ('amd', True), ('cuda', False)])
 def test_hayai_prepares_next_page_outside_model_lock_and_keeps_results_local(monkeypatch, fail_first,

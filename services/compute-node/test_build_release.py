@@ -38,6 +38,7 @@ def test_archive_keeps_stable_name_and_excludes_private_and_generated_data(tmp_p
     release = tmp_path / 'NodeComicsNode'
     release.mkdir()
     (release / 'node.exe').write_bytes(b'release fixture')
+    (release / 'node.exe').chmod(0o755)
     for name in ('data/node.json', 'payload/runtime/python.exe', '.setup/downloads/large.bin'):
         path = release / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,6 +48,8 @@ def test_archive_keeps_stable_name_and_excludes_private_and_generated_data(tmp_p
     archive = tmp_path / (release.name + '.zip')
     with zipfile.ZipFile(archive) as package:
         assert package.namelist() == ['NodeComicsNode/node.exe', 'NodeComicsNode/portable.json']
+        assert package.getinfo('NodeComicsNode/node.exe').external_attr >> 16 & 0o111 == (
+            (release / 'node.exe').stat().st_mode & 0o111)
         assert package.testzip() is None
     assert archive.with_suffix('.zip.sha256').read_text() == sha256(archive) + '  ' + archive.name + '\n'
     with pytest.raises(ValueError, match='already exists'):

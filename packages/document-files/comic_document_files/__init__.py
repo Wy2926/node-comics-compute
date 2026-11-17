@@ -574,7 +574,12 @@ def run_file_operation(action, source, source_type, directory=None, manifest=Non
 def _limit_child(limits):
     if sys.platform != 'win32':
         import resource
-        resource.setrlimit(resource.RLIMIT_AS, (limits.parser_memory_bytes, limits.parser_memory_bytes))
+        memory = limits.parser_memory_bytes
+        if sys.platform == 'darwin':
+            # shortcut: cap growth beyond macOS shared mappings, use isolated Linux for an absolute cap.
+            memory += int(subprocess.check_output(
+                ['/bin/ps', '-o', 'vsz=', '-p', str(os.getpid())], text=True, timeout=5)) * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
         resource.setrlimit(resource.RLIMIT_CPU, (limits.parser_timeout_seconds, limits.parser_timeout_seconds + 1))
         resource.setrlimit(resource.RLIMIT_FSIZE, (limits.max_spool_bytes, limits.max_spool_bytes))
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))

@@ -455,8 +455,10 @@ def render_analysis(page, blocks=2):
 
 
 @pytest.mark.parametrize('workers', [1, 2])
-def test_render_has_independent_bounded_slots_and_keeps_memory(agent, workers):
+@pytest.mark.parametrize('backend,slots', [('mps', 1), ('cuda', 2), ('amd', 2)])
+def test_render_has_independent_bounded_slots_and_keeps_memory(agent, workers, backend, slots):
     isolate_pipeline_pools(agent)
+    agent.local['engine']['backend'] = backend
     agent.pipeline.render_workers = workers
     pages = [add_page(agent, i) for i in range(6)]
     for page in pages:
@@ -466,17 +468,17 @@ def test_render_has_independent_bounded_slots_and_keeps_memory(agent, workers):
         agent.pipeline.resize_reservation(page, 1024)
     agent.pipeline.tick()
     assert len(agent.pipeline.render.calls) == workers
-    assert len(agent.pipeline.compute.calls) == 2
-    assert sum(p.future is not None for p in pages) == workers + 2
+    assert len(agent.pipeline.compute.calls) == slots
+    assert sum(p.future is not None for p in pages) == workers + slots
     for _ in range(10):
         agent.pipeline.tick()
     assert len(agent.pipeline.render.calls) == workers  # No executor backlog.
-    assert len(agent.pipeline.compute.calls) == 2
+    assert len(agent.pipeline.compute.calls) == slots
     assert agent.pipeline.used == 6 * 1024 + workers * 100
     # Finish computation while the first render remains blocked.
     agent.pipeline.compute.finish(0, response=object())
     agent.pipeline.tick()
-    assert len(agent.pipeline.compute.calls) == 3
+    assert len(agent.pipeline.compute.calls) == slots + 1
     assert not agent.pipeline.render.calls[0][0].done()
 
 

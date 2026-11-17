@@ -39,7 +39,6 @@ rocm = { index = "amd" }
 rocm-sdk-core = { index = "amd" }
 rocm-sdk-libraries = { index = "amd" }
 rocm-sdk-device-gfx1030 = { index = "amd" }
-pydensecrf = { url = "https://github.com/hgmzhn/manga-translator-ui/releases/download/v1.7.6/pydensecrf-1.0-cp312-cp312-win_amd64.whl" }
 
 [[tool.uv.index]]
 name = "amd"
