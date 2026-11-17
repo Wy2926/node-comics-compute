@@ -14,7 +14,7 @@ uv run pytest -q
 
 AMD 使用 `uv sync --project environments/amd --locked --group test`。各环境独立，显式选择 `engine.backend`，不自动降级或混装。
 
-长图检测保留文字尺度，使用有界批量的对齐长矩形及概率图羽化合并；掩膜细化复用固定版本 CTD。参数、31 张实测和已知画质问题见[技术汇总](docs/TECHNICAL_SUMMARY_2026-11-17.md)。
+长图检测保留文字尺度，使用有界批量的对齐长矩形及概率图羽化合并；掩膜细化复用固定版本 CTD。参数、31 张实测和已知画质问题见[技术汇总](docs/TECHNICAL_SUMMARY.md)。
 
 ## Apple Silicon Mac
 
@@ -26,6 +26,8 @@ uv run --project environments/macos --locked python -m tools.prepare_mtu
 ```
 
 私有 `node.local.json` 设置 `engine.backend: "mps"`、`engine.gpu: 0`，模型和字体路径沿用示例。检测、取色、气泡和 LaMa 使用 MPS；经典 OCR 的日文模型使用 MPS，PP-OCR 使用 CPU ONNX。MPS 分析／抹字一次派发一页，多页并发仍可重叠下载、嵌字和交付；CPU 预算按逻辑核心数分配，长图编码可借用渲染池空闲额度。
+
+MPS 检测先在 FP32 下融合卷积／归一化，再以 FP16 推理，概率图恢复 FP32；LaMa 保持 FP32。直接将未融合检测器转为 FP16 会改变召回，不采用。
 
 ```sh
 uv run --project environments/macos --locked python -m classic_node check --config node.local.json
@@ -42,7 +44,7 @@ Mac 实际模型回归（资产目录需包含经典 OCR 模型）：
 MTU_TEST_BACKEND=mps MTU_TEST_ASSETS=/absolute/path/assets \
   uv run --project environments/macos --locked python -m pytest -q \
   tests/test_render_glyph_cache.py tests/test_mtu_integration.py \
-  -k 'outline or native_rearrange or streamed_detection or rectangular_detection or detection_candidate or long_page_cross_seam or ctd_'
+  -k 'outline or native_rearrange or streamed_detection or rectangular_detection or detection_candidate or detector_fusion or detector_inputs or long_page_cross_seam or ctd_'
 ```
 
 ## 验证

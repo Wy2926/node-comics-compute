@@ -8,6 +8,14 @@
     "patches": {
       "manga_translator/detection/default.py": [
         {
+          "before": "        self.model.eval()\n        self.device = device\n",
+          "after": "        self.model.eval()\n        if device == 'mps':\n            from mtu_engine.detection import fuse_detector\n            self.model = fuse_detector(self.model).half()\n        self.device = device\n"
+        },
+        {
+          "before": "    batch = torch.from_numpy(batch).to(device)\n    with torch.no_grad():\n        db, mask = MODEL(batch)\n        db = db.sigmoid().cpu().numpy()\n        mask = mask.cpu().numpy()\n",
+          "after": "    batch = torch.from_numpy(batch).to(device, dtype=next(MODEL.parameters()).dtype)\n    with torch.no_grad():\n        db, mask = MODEL(batch)\n        db = db.float().sigmoid().cpu().numpy()\n        mask = mask.float().cpu().numpy()\n"
+        },
+        {
           "before": "            detect_size,\n            4,\n            device=self.device,\n",
           "after": "            detect_size,\n            self.max_batch_size,\n            device=self.device,\n            input_stride=256,  # DBNet joins features downsampled through 1/256.\n"
         },

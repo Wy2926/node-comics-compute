@@ -509,6 +509,7 @@ def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, o
         lambda image, forward, size, batch, **kw: native(image, forward, size, 1, **kw))
     english = None
     try:
+        assert next(detector.model.parameters()).dtype == (torch.float16 if device == 'mps' else torch.float32)
         # This length places cuts exactly 256px apart from adjacent tile ends.
         image = Image.new('RGB', (14080, 720) if horizontal else (720, 14080), 'white')
         draw = ImageDraw.Draw(image)
@@ -554,6 +555,58 @@ def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, o
         asyncio.run(detector.unload())
         default.MODEL = None
         getattr(torch, device).empty_cache()
+
+
+def test_detector_fusion_preserves_fp32_predictions_and_rejects_unknown_normalization(assets, offline):
+    import asyncio
+    import torch
+    from mtu_engine.assets import activate
+    from mtu_engine.detection import fuse_detector
+    activate(assets[0])
+    from manga_translator.detection import default
+    from manga_translator.utils import ModelWrapper
+    ModelWrapper._MODEL_DIR = str(assets[0])
+    detector = default.DefaultDetector()
+    asyncio.run(detector.load('cpu'))
+    try:
+        assert sum(isinstance(m, torch.nn.BatchNorm2d) for m in detector.model.modules()) == 70
+        batch = np.random.default_rng(71).integers(0, 256, (1, 256, 256, 3), dtype=np.uint8)
+        expected = default.det_batch_forward_default(batch, 'cpu')
+        assert fuse_detector(detector.model) is detector.model
+        actual = default.det_batch_forward_default(batch, 'cpu')
+        assert not any(isinstance(m, torch.nn.BatchNorm2d) for m in detector.model.modules())
+        for left, right in zip(actual, expected, strict=True):
+            assert left.dtype == right.dtype == np.float32
+            np.testing.assert_allclose(left, right, atol=1e-3, rtol=1e-3)
+        with pytest.raises(ValueError, match='Unsupported detector normalization'):
+            fuse_detector(torch.nn.ModuleDict({'unsupported': torch.nn.BatchNorm2d(3)}).eval())
+    finally:
+        asyncio.run(detector.unload())
+        default.MODEL = None
+
+
+def test_detector_inputs_follow_fp16_model_and_predictions_remain_fp32(assets, monkeypatch):
+    import torch
+    from mtu_engine.assets import activate
+    activate(assets[0])
+    from manga_translator.detection import default
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16))
+
+        def forward(self, batch):
+            assert batch.dtype == torch.float16 and not torch.is_grad_enabled()
+            return batch[:, :2], batch[:, :1]
+
+    monkeypatch.setattr(default, 'MODEL', Model())
+    batch = np.random.default_rng(71).integers(0, 256, (2, 32, 64, 3), dtype=np.uint8)
+    db, mask = default.det_batch_forward_default(batch, 'cpu')
+    expected = torch.from_numpy((batch.astype(np.float32) / 127.5 - 1).transpose(0, 3, 1, 2)).half().float()
+    np.testing.assert_allclose(db, expected[:, :2].sigmoid().numpy(), atol=1e-7, rtol=0)
+    np.testing.assert_array_equal(mask, expected[:, :1].numpy())
+    assert db.dtype == mask.dtype == np.float32
 
 
 def test_qt_worker_multilingual_text_and_region_fit_offline(assets, offline, monkeypatch):
