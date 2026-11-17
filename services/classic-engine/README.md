@@ -23,7 +23,7 @@ uv sync --project environments/macos --locked --group test
 uv run --project environments/macos --locked python -m tools.prepare_mtu
 ```
 
-私有 `node.local.json` 设置 `engine.backend: "mps"`、`engine.gpu: 0`，模型和字体路径沿用示例。检测、取色、气泡和 LaMa 使用 MPS；经典 OCR 的日文模型使用 MPS，PP-OCR 使用 CPU ONNX。MPS 计算串行保护，多页并发仍可重叠下载、嵌字和交付。
+私有 `node.local.json` 设置 `engine.backend: "mps"`、`engine.gpu: 0`，模型和字体路径沿用示例。检测、取色、气泡和 LaMa 使用 MPS；经典 OCR 的日文模型使用 MPS，PP-OCR 使用 CPU ONNX。MPS 分析／抹字一次派发一页，多页并发仍可重叠下载、嵌字和交付；CPU 预算按逻辑核心数分配，长图编码可借用渲染池空闲额度。
 
 ```sh
 uv run --project environments/macos --locked python -m classic_node check --config node.local.json

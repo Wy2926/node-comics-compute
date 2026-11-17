@@ -1,6 +1,8 @@
 """Explicit device selection; no automatic GPU or CPU fallback."""
 import platform
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from threading import RLock
 
 
@@ -10,6 +12,23 @@ ORT_PACKAGES = {'cuda': 'onnxruntime-gpu', 'amd': 'onnxruntime-directml', 'mps':
 # when one worker copies tensors while another encodes an arange operation.
 # Protect the entire device scope, including transfers and model teardown.
 _MPS_LOCK = RLock()
+_cancel = ContextVar('page_cancel', default=None)
+
+
+def check_cancelled(*_):
+    """Also serves as a detector forward pre-hook, between completed batches."""
+    check = _cancel.get()
+    if check is not None:
+        check()
+
+
+@contextmanager
+def cancellation(check):
+    token = _cancel.set(check)
+    try:
+        yield
+    finally:
+        _cancel.reset(token)
 
 
 def device_context(backend, gpu):

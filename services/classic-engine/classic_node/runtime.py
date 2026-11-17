@@ -108,11 +108,14 @@ class Runtime:
                    analysis.get('regions', [])) if texts.get(str(segment['id']), '').strip()]
         if not regions or not analysis.get('bubble_mask'):
             return 0
+        pixels = analysis['width'] * analysis['height']
+        # Cap whole-page unions so optional reuse cannot displace another page or its IPC.
+        limit = 64 * 1024**2 // pixels * pixels
         if 'bubble_labels' in masks:
             from manga_translator.utils.bubble import reference_cache_bytes
             with stage('render_cache_plan'):
-                return reference_cache_bytes(regions, masks['bubble_inset'], masks['bubble_labels'])
-        return analysis['width'] * analysis['height'] * len(regions)
+                return min(limit, reference_cache_bytes(regions, masks['bubble_inset'], masks['bubble_labels']))
+        return min(limit, pixels * len(regions))
 
     def warn_render_fallback(self, reason):
         with self._render_warning_lock:

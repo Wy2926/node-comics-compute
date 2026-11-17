@@ -154,10 +154,10 @@ def detect_cpu_capacity(*, proc_root=Path('/proc')):
     affinity = _affinity()
     warnings = []
     limits = [logical] if logical else []
-    if affinity is None:
+    if affinity is None and (platform.system() != 'Darwin' or not logical):
         limits.append(1)
         warnings.append('Process CPU affinity is unavailable; automatic CPU budget is capped at one')
-    else:
+    elif affinity is not None:
         limits.append(len(affinity))
     quota, cpuset = None, None
     if platform.system() == 'Linux':

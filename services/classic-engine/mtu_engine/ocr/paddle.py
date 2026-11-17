@@ -12,6 +12,7 @@ from rapidocr.inference_engine.onnxruntime import OrtInferSession
 
 from classic_node.config import ENGINE_DEFAULTS
 from classic_node.timing import waiting_for, record, stage
+from ..backend import check_cancelled
 from ..page_cache import bgr, crop as cached_crop, normalized
 
 from .crops import OCR_IMAGE_SHAPE, OCR_MAX_WIDTH, valid_crop, short_crop
@@ -49,11 +50,13 @@ class _LockedSession:
         self._lock = Lock() if lock is None else lock
 
     def __call__(self, batch):
+        check_cancelled()
         record('ocr_batches', 1)
         record('ocr_batch_max', len(batch), maximum=True)
         record('ocr_width_max', batch.shape[-1], maximum=True)
         record('ocr_input_bytes_max', batch.nbytes, maximum=True)
         with waiting_for(self._lock, 'ocr_lock_wait'):
+            check_cancelled()
             with stage('ocr_infer'):
                 return self._session(batch)
 

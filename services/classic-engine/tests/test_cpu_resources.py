@@ -175,6 +175,20 @@ def test_windows_uses_process_affinity_without_linux_proc(cpu_host, monkeypatch,
 
 
 @pytest.mark.parametrize('logical', [None, 32])
+def test_macos_without_affinity_uses_known_capacity_and_bounds_render_budget(monkeypatch, logical):
+    monkeypatch.setattr(resources.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(resources, '_affinity', lambda: None)
+    monkeypatch.setattr(resources.psutil, 'cpu_count', lambda **kwargs: logical)
+    monkeypatch.setattr(resources.os, 'cpu_count', lambda: logical)
+    result = resources.resolve_cpu_resources(analysis_threads=2, render_workers=2, local_pages=2, max_leases=8)
+    assert result['budget_cpus'] == (logical or 1)
+    assert result['render_threads'] == (14 if logical else 1)
+    assert result['allocated_cpu_slots'] == (32 if logical else 6)
+    assert result['oversubscribed'] is (logical is None)
+    assert bool(result['warnings']) is (logical is None)
+
+
+@pytest.mark.parametrize('logical', [None, 32])
 def test_unavailable_affinity_and_cpu_count_have_bounded_fallback(cpu_host, monkeypatch, tmp_path, logical):
     monkeypatch.delattr(resources.os, 'sched_getaffinity')
     monkeypatch.setattr(resources.platform, 'system', lambda: 'Windows')

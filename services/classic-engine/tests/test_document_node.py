@@ -488,9 +488,11 @@ def test_completed_document_future_is_advanced_before_shared_slot_dispatch(agent
 
 
 @pytest.mark.parametrize('step', ['analyze', 'inpaint', 'render'])
-def test_shared_dispatch_drains_old_documents_amid_new_ordinary_work(agent, step):
+@pytest.mark.parametrize('backend,pages', [('cuda', 1), ('mps', 2)])
+def test_shared_dispatch_drains_old_documents_amid_new_ordinary_work(agent, step, backend, pages):
     pending_pools(agent)
-    agent.local['local_pages'] = 1
+    agent.local['engine']['backend'] = backend
+    agent.local['local_pages'] = pages
     ordinary = add_page(agent)
     ordinary.step, ordinary.ready_at = ('render' if step == 'render' else 'inpaint'), 3
     older_analysis = add_page(agent, 'older-analysis')
@@ -545,6 +547,28 @@ def test_document_gpu_work_cannot_bypass_interactive_compute_pool(agent):
     classic.future, classic.step = None, 'text'
     agent.pipeline.tick()
     assert page.future is agent.pipeline.compute.calls[0][0]
+
+
+@pytest.mark.parametrize('action', [None, 'doc_ocr', 'doc_render'])
+def test_shared_stage_cancellation_reaches_async_batches_and_resets_after_drain(agent, action):
+    import asyncio
+    from mtu_engine.backend import check_cancelled
+    page = add_document(agent, action=action) if action else add_page(agent)
+    page.step = 'analyze'
+    pool = PendingPool()
+    async def batches():
+        check_cancelled()
+        page.stopped = True
+        check_cancelled()
+        pytest.fail('Cancelled page submitted another batch')
+    agent.pipeline.submit(page, pool, 'analyze', lambda: asyncio.run(batches()))
+    pool.finish()
+    with pytest.raises(NodeFailure, match='LEASE_STOPPED'):
+        page.future.result()
+    check_cancelled()  # The same worker context must not retain a previous page.
+    assert page.future is not None
+    (agent.documents if action else agent.pipeline).advance(page)
+    assert page.future is None and page.stopped
 
 
 @pytest.mark.parametrize('slots,expected', [(None, 4), (2, 2)])

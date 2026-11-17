@@ -6,6 +6,8 @@ from threading import Lock
 import re
 import time
 
+from mtu_engine.backend import cancellation
+
 from .protocol import MAX_CHECKPOINT_BYTES, ControlFailure, NodeFailure, digest
 from .operations import LOG, report_page_failure
 from .timing import WIRE_FIELDS, collect
@@ -151,7 +153,7 @@ class Pipeline:
             page.check()
             start = time.monotonic()
             page.timings[name + '_queue'] = start - page.ready_at
-            with collect(LOCAL_TIMINGS) as details:
+            with cancellation(page.check), collect(LOCAL_TIMINGS) as details:
                 try:
                     return operation()
                 finally:
@@ -328,6 +330,9 @@ class Pipeline:
 
     def dispatch(self):
         pages = self.agent.active_pages()
+        # MPS serializes device scopes; keep waiting work here so ready inpaint can take priority.
+        compute_slots = (1 if self.agent.local.get('engine', {}).get('backend') == 'mps'
+                         else self.agent.local['local_pages'])
         inpaint_available = self.agent.local.get('inpaint_slots', self.agent.local['local_pages']) - sum(
             bool(p.future and p.step == 'inpaint') for p in pages)
         # Submit only available slots, not an unbounded executor backlog. A page
@@ -335,7 +340,7 @@ class Pipeline:
         # and resident-byte reservation. No lock spans either execution pool.
         # Advance prepared pages before admitting more analysis work, so a batch
         # of downloads cannot postpone the first result until all are analyzed.
-        for stages, pool, capacity in (({'analyze', 'inpaint'}, self.compute, self.agent.local['local_pages']),
+        for stages, pool, capacity in (({'analyze', 'inpaint'}, self.compute, compute_slots),
                                        ({'render'}, self.render, self.render_workers)):
             running = sum(bool(p.future and p.step in stages) for p in pages)
             eligible = [p for p in pages if not p.future and not p.pending_error
