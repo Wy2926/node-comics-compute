@@ -38,7 +38,7 @@ def clock():
 
 def lease(key, *, pixels=100):
     _, expires = clock()
-    return {'lease_id': str(key), 'lease_token': 'fixture-token', 'status': 'active',
+    return {'lease_id': str(key), 'lease_token': 'fixture-token', 'workflow_kind': 'image', 'status': 'active',
             'expires_at': expires, 'language': 'en', 'config': {'engine': {'protocol_version': 3}},
             'input': {'width': pixels, 'height': 1}}
 
@@ -48,8 +48,7 @@ def agent(tmp_path):
     local = {'node_id': 'fixture', 'resource_id': 'fixture', 'engine': {'gpu': 0},
              'max_leases': 8, 'local_pages': 2, 'download_workers': 4, 'delivery_workers': 4}
     transport = SimpleNamespace(control=SimpleNamespace(timeout=30), post=lambda *_: None,
-        close_channel=lambda: None, acknowledge=lambda _: None, listen=lambda *_: None)
-    transport.request_assignment = lambda body: transport.post('/channel', body)
+        close_channel=lambda: None, listen=lambda *_: None)
     journal = Journal(tmp_path)
     def cache_bytes(analysis, translated, masks):
         return 100 * sum(isinstance(text, str) and bool(text.strip())
@@ -198,11 +197,15 @@ def test_channel_updates_stay_independent_and_do_not_force_heartbeat(agent):
     assert len(agent.heartbeat_pool.calls) == len(agent.claim_pool.calls) == 1
 
 
-def test_pending_capacity_offer_does_not_repeat_or_open_new_connections(agent):
+def test_empty_pull_waits_for_hint_or_fallback_without_reconnecting(agent):
     agent.poll_control()
+    agent.claim_pool.finish(response=False)
     for _ in range(20):
         agent.poll_control()
     assert len(agent.claim_pool.calls) == len(agent.channel_pool.calls) == 1
+    agent.updates.put({'type': 'updates', 'available': True})
+    agent.poll_control()
+    assert len(agent.claim_pool.calls) == 2
     assert not agent.claim_future.done()
 
 
@@ -225,24 +228,6 @@ def test_repeated_channel_outage_bounds_retry_delay_and_resets_after_reconnectio
     agent.channel_pool.finish()
     agent.poll_control()
     assert agent.next_channel - now[0] == 1
-
-
-def test_empty_http_receipt_switches_to_one_waiting_channel_offer(agent):
-    pending = {'request_id': 'saved', 'config_version': 1, 'count': 4}
-    agent.journal.put('claim', pending)
-    requests = []
-    def post(_, body):
-        requests.append(body)
-        server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server, 'leases': [], 'retry_after_seconds': .3}
-    agent.transport.post = post
-    agent.poll_control()
-    agent.claim_pool.finish()
-    agent.poll_control()
-    for _ in range(20):
-        agent.poll_control()
-    assert requests == [pending] and agent.journal.get('claim') is None
-    assert len(agent.claim_pool.calls) == 2 and not agent.claim_future.done()
 
 
 @pytest.mark.parametrize('change', ['config', 'memory'])
@@ -291,14 +276,14 @@ def test_config_change_and_resource_release_refill_immediately(agent):
 def test_claim_is_small_and_retry_retains_durable_request_id(agent):
     requests = []
 
-    def post(_, body):
+    def assignment(body):
         requests.append(dict(body))
         if len(requests) == 1:
             raise ControlFailure('CONTROL_UNAVAILABLE')
         server, _ = clock()
         return {'request_id': body['request_id'], 'server_time': server, 'leases': [lease('assigned')]}
 
-    agent.transport.post = post
+    agent.transport.request_assignment = assignment
     with pytest.raises(ControlFailure):
         agent.claim()
     assert requests[0]['count'] == 4
@@ -308,56 +293,45 @@ def test_claim_is_small_and_retry_retains_durable_request_id(agent):
     assert agent.journal.get('claim') is None
 
 
-def test_pre_upgrade_pending_claim_replays_original_count_and_identity(agent):
-    pending = {'request_id': 'saved-before-upgrade', 'config_version': 1, 'count': 32}
-    agent.journal.put('claim', pending)
-    requests = []
-
-    def post(_, body):
-        requests.append(dict(body))
-        server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server, 'leases': []}
-
-    agent.transport.post = post
-    agent.config['enabled'] = False
-    assert agent.claim() is False
-    assert requests == [pending] and agent.journal.get('claim') is None
-
-
-@pytest.mark.parametrize('invalid', ['empty', 'wrong-id', 'missing-id'])
+@pytest.mark.parametrize('invalid', ['missing-leases', 'wrong-id', 'wrong-workflow'])
 def test_invalid_channel_assignment_preserves_pending_receipt(agent, invalid):
-    def post(_, body):
+    def assignment(body):
         server, _ = clock()
         response = {'request_id': 'wrong' if invalid == 'wrong-id' else body['request_id'], 'server_time': server,
-                    'leases': [] if invalid == 'empty' else [lease('assigned')]}
-        if invalid == 'missing-id':
-            del response['request_id']
+                     'leases': [lease('assigned')]}
+        if invalid == 'missing-leases':
+            del response['leases']
+        if invalid == 'wrong-workflow':
+            response['leases'][0]['workflow_kind'] = 'unknown'
         return response
 
-    agent.transport.post = post
+    agent.transport.request_assignment = assignment
     with pytest.raises(NodeFailure, match='CONTROL_INVALID_RESPONSE'):
         agent.claim()
     assert agent.journal.get('claim') is not None
 
 
-def test_failed_ack_replays_after_durable_adoption_without_replacing_the_page(agent):
-    acknowledgements = []
-    def post(_, body):
+def test_partial_local_adoption_replays_whole_batch_before_next_pull(agent, monkeypatch):
+    pulls = []
+    def assignment(body):
+        pulls.append(body)
         server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server, 'leases': [lease('assigned')]}
-    def ack(request_id):
-        assert agent.journal.get('lease:assigned')['lease']['lease_id'] == 'assigned'
-        assert agent.journal.get('claim')['request_id'] == request_id
-        acknowledgements.append(request_id)
-        if len(acknowledgements) == 1:
-            raise ControlFailure('CONTROL_UNAVAILABLE')
-    agent.transport.post, agent.transport.acknowledge = post, ack
-    with pytest.raises(ControlFailure):
-        agent.claim()
-    page = agent.pages['assigned']
+        return {'request_id': body['request_id'], 'server_time': server, 'leases': [lease('a'), lease('b')]}
+    agent.transport.request_assignment = assignment
+    put = agent.journal.put
+    def disk_full(key, value):
+        if key == 'lease:b':
+            raise OSError('disk full')
+        put(key, value)
+    with monkeypatch.context() as patch:
+        patch.setattr(agent.journal, 'put', disk_full)
+        with pytest.raises(OSError):
+            agent.claim()
+    page = agent.pages['a']
+    assert set(agent.journal.leases()) == {'a'} and agent.journal.get('claim') == pulls[0]
     assert agent.claim()
-    assert agent.pages['assigned'] is page and agent.journal.get('claim') is None
-    assert acknowledgements[0] == acknowledgements[1]
+    assert agent.pages['a'] is page and agent.journal.get('claim') is None
+    assert set(agent.journal.leases()) == {'a', 'b'} and pulls == [pulls[0], pulls[0]]
 
 
 def test_accepted_downloads_bound_admission_and_count_pending_memory(agent):

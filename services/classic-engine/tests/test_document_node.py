@@ -285,25 +285,6 @@ def test_stream_download_never_overwrites_existing_source_and_cancel_cleans_part
         objects.close()
 
 
-def test_document_claim_receipt_replays_before_new_admission(agent):
-    agent.config['document_slots'] = 1
-    agent.journal.put('document-claim', {'request_id': 'saved', 'config_version': 1, 'count': 1})
-    calls = []
-    def post(_, body):
-        calls.append(dict(body))
-        if len(calls) == 1:
-            raise ControlFailure('CONTROL_UNAVAILABLE')
-        server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server, 'leases': []}
-    agent.transport.document_post = post
-    with pytest.raises(ControlFailure):
-        agent.claim()
-    agent.config['enabled'] = False
-    assert not agent.claim()
-    assert calls[0] == calls[1] and calls[0]['count'] == 1
-    assert agent.journal.get('document-claim') is None
-
-
 def test_document_admission_and_json_residency_share_classic_budget(agent):
     agent.config.update(document_slots=1, execution_slots=2)
     add_page(agent).step = 'text'
@@ -359,20 +340,7 @@ def document_control(agent):
     agent.documents.next_sync = float('inf')
 
 
-@pytest.mark.parametrize('document', [False, True])
-def test_one_claim_future_keeps_heartbeats_and_updates_independent(agent, document):
-    document_control(agent)
-    if document:
-        agent.journal.put('document-claim', {'request_id': 'saved', 'config_version': 1, 'count': 1})
-    agent.poll_control()
-    agent.poll_control()
-    agent.documents.poll_control()
-    assert len(agent.claim_pool.calls) == 1 and not agent.documents.control.calls
-    assert agent.heartbeat_future is not None and agent.channel_future is not None
-    assert len(agent.channel_pool.calls) == 1
-
-
-def test_new_document_capacity_uses_shared_channel_offer(agent):
+def test_document_capacity_uses_shared_pull(agent):
     document_control(agent)
     lease = add_document(agent).lease
     del agent.documents.pages[lease['lease_id']]
@@ -393,121 +361,28 @@ def test_new_document_capacity_uses_shared_channel_offer(agent):
     assert lease['lease_id'] in agent.documents.pages and not agent.pages
 
 
-@pytest.mark.parametrize('document', [False, True])
-def test_ambiguous_claim_blocks_new_ids_until_original_receipt_replayed(agent, document):
-    document_control(agent)
-    agent.config['execution_slots'], agent.local['max_leases'] = 8, 2
-    requests = []
-    key = 'document-claim' if document else 'claim'
-    if document:
-        agent.journal.put(key, {'request_id': 'saved', 'config_version': 1, 'count': 1})
-    def post(_, body):
-        requests.append(dict(body))
-        if len(requests) == 1:
-            raise ControlFailure('CONTROL_UNAVAILABLE')
-        server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server,
-                'leases': [{'lease_id': 'resolved', 'status': 'terminal'}]}
-    agent.transport.post = agent.transport.document_post = post
-    with pytest.raises(ControlFailure):
-        agent.claim()
-    # The HTTP future can already be gone, with a lease held only on the server.
-    assert agent.journal.get(key) == requests[0]
-    agent.next_claim = 0
-    agent.config.update(enabled=False, document_slots=0, version=2)
-    agent.poll_control()
-    agent.documents.poll_control()
-    agent.claim_pool.finish()
-    assert requests == [requests[0], requests[0]] and agent.journal.get(key) is None
-    assert len(agent.claim_pool.calls) == 1 and not agent.documents.control.calls
-
-
-def test_restart_replays_both_old_claims_before_any_new_id(agent):
-    document_control(agent)
-    pending = {'request_id': 'ordinary-before-restart', 'config_version': 1, 'count': 4}
-    document_pending = {'request_id': 'doc_before-restart', 'config_version': 1, 'count': 1}
-    agent.journal.put('claim', pending)
-    agent.journal.put('document-claim', document_pending)
-    # Reopen the durable journal, as on process restart.
-    root = agent.journal.root
-    agent.journal.close()
-    from classic_node.journal import Journal
-    agent.journal = Journal(root)
-    requests = []
-    def post(_, body):
-        requests.append(dict(body))
-        server, _ = clock()
-        return {'request_id': body['request_id'], 'server_time': server, 'leases': []}
-    agent.transport.post = agent.transport.document_post = post
-    try:
-        agent.config.update(enabled=False, document_slots=0, version=2)
-        agent.poll_control()
-        agent.documents.poll_control()
-        assert len(agent.claim_pool.calls) == 1 and not agent.documents.control.calls
-        agent.claim_pool.finish()
-        agent.poll_control()
-        agent.documents.poll_control()
-        assert agent.claim_future and len(agent.claim_pool.calls) == 2
-        agent.claim_pool.finish()
-        agent.poll_control()
-        assert requests == [pending, document_pending]
-        assert agent.journal.get('claim') is agent.journal.get('document-claim') is None
-    finally:
-        # The shared fixture owns its original Journal instance.
-        agent.journal.close()
-
-
 def test_claim_replay_does_not_replace_a_document_already_restored_by_sync(agent):
     page = add_document(agent)
     page.step, page.future = 'analyze', Future()
     existing_future = page.future
-    pending = {'request_id': 'doc_saved', 'config_version': 1, 'count': 1}
-    agent.journal.put('document-claim', pending)
+    pending = {'request_id': 'doc_saved', 'config_version': 1, 'count': 0, 'document_count': 1}
+    agent.journal.put('claim', pending)
     server, _ = clock()
-    agent.transport.document_post = lambda *_: {'request_id': pending['request_id'], 'server_time': server, 'leases': [page.lease]}
+    agent.transport.request_assignment = lambda body: {'request_id': body['request_id'], 'server_time': server,
+        'leases': [{**page.lease, 'workflow_kind': 'document'}]}
     agent.config.update(document_slots=0, enabled=False)
     assert agent.claim()
     assert agent.documents.pages['document'] is page and page.future is existing_future
 
 
-def test_legacy_document_replay_keeps_workspace_error_recovery(agent, caplog):
-    document_control(agent)
-    pending = {'request_id': 'saved', 'config_version': 1, 'count': 1}
-    agent.journal.put('document-claim', pending)
-    def failed(*_):
-        raise OSError('private workspace path')
-    agent.transport.document_post = failed
-    agent.poll_control()
-    agent.claim_pool.finish()
-    agent.poll_control()
-    assert agent.journal.get('document-claim') == pending
-    assert agent.claim_future is None and agent.next_claim > time.monotonic()
-    assert 'DOCUMENT_WORKSPACE_UNAVAILABLE' in caplog.text and 'private workspace path' not in caplog.text
-
-
-def test_legacy_document_receipt_does_not_mask_unexpected_image_claim_error(agent):
-    agent.journal.put('claim', {'request_id': 'image', 'config_version': 1, 'count': 1})
-    agent.journal.put('document-claim', {'request_id': 'document', 'config_version': 1, 'count': 1})
-    def failed(*_):
-        raise OSError('image claim failure')
-    agent.transport.post = failed
-    agent.poll_control()
-    agent.claim_pool.finish()
-    with pytest.raises(OSError, match='image claim failure'):
-        agent.poll_control()
-    assert agent.journal.get('claim') and agent.journal.get('document-claim')
-
-
-@pytest.mark.parametrize('document', [False, True])
-def test_config_conflict_resolves_only_the_rejected_claim(agent, document):
-    key = 'document-claim' if document else 'claim'
-    agent.journal.put(key, {'request_id': 'stale', 'config_version': 1, 'count': 1})
+def test_config_conflict_clears_pending_pull_and_requests_sync(agent):
+    agent.journal.put('claim', {'request_id': 'stale', 'config_version': 1, 'count': 1, 'document_count': 1})
     def conflict(*_):
         raise ControlFailure('NODE_CONFIG_CONFLICT', 409)
-    agent.transport.post = agent.transport.document_post = conflict
+    agent.transport.request_assignment = conflict
     with pytest.raises(ControlFailure, match='NODE_CONFIG_CONFLICT'):
         agent.claim()
-    assert agent.journal.get(key) is None and agent.last_heartbeat == 0
+    assert agent.journal.get('claim') is None and agent.last_heartbeat == 0
 
 
 def test_completed_document_future_is_advanced_before_shared_slot_dispatch(agent):

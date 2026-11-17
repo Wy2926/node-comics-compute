@@ -24,14 +24,13 @@ class Journal:
         self.db.execute('CREATE TABLE IF NOT EXISTS journal (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         self.db.execute('CREATE TABLE IF NOT EXISTS outputs (key TEXT PRIMARY KEY, data BLOB NOT NULL)')
         self.db.commit()
-        # The scheduler checks these two small receipts on every tick. Reading
-        # their last committed JSON must not wait behind a large output write.
-        self.claims = {key: None for key in ('claim', 'document-claim')}
-        self.claims.update(self.db.execute('SELECT key,value FROM journal WHERE key IN (?,?)', tuple(self.claims)))
+        # Hot-path reads must not wait behind a large output write.
+        row = self.db.execute("SELECT value FROM journal WHERE key='claim'").fetchone()
+        self.pending_claim = row[0] if row else None
 
     def get(self, key, default=None):
-        if key in self.claims:
-            value = self.claims[key]
+        if key == 'claim':
+            value = self.pending_claim
             return json.loads(value) if value is not None else default
         with self.lock:
             row = self.db.execute('SELECT value FROM journal WHERE key=?', (key,)).fetchone()
@@ -42,16 +41,16 @@ class Journal:
         with self.lock:
             with self.db:
                 self.db.execute('INSERT OR REPLACE INTO journal VALUES (?,?)', (key, data))
-            if key in self.claims:
-                self.claims[key] = data
+            if key == 'claim':
+                self.pending_claim = data
 
     def remove(self, key):
         with self.lock:
             with self.db:
                 self.db.execute('DELETE FROM outputs WHERE key=?', (key,))
                 self.db.execute('DELETE FROM journal WHERE key=?', (key,))
-            if key in self.claims:
-                self.claims[key] = None
+            if key == 'claim':
+                self.pending_claim = None
 
     def freeze(self, key, value, output):
         """A durable completion and binary bytes are one SQLite transaction."""

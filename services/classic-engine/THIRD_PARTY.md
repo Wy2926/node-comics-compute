@@ -2,7 +2,7 @@
 
 ## WebSocket control transport
 
-`httpx-ws==0.10.0` (MIT) and its `wsproto` dependency implement the node's bounded WebSocket control channel. Locked wheels and original license metadata are included by the existing packaging flow; HTTPX retains the configured TLS and proxy policy.
+[websockets 17.4](https://pypi.org/project/websockets/17.4/) (BSD-3-Clause) implements the RFC 6455 client, keepalive, flow control and close handshake. [python-socks](https://pypi.org/project/python-socks/) (Apache-2.0) supports configured SOCKS proxies. Platform locks include wheel hashes; HTTP transfers remain on HTTPX.
 
 ## Hayai OCR v2.5 Nova
 

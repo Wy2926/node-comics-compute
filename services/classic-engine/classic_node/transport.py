@@ -2,13 +2,12 @@
 import hashlib
 import json
 import re
-import socket
 import ssl
 from threading import Condition
 from time import monotonic
 import httpx
-from httpx_ws import WebSocketSession
-from wsproto.utilities import LocalProtocolError
+from websockets.exceptions import WebSocketException
+from websockets.sync.client import reconnect
 from .protocol import ControlFailure, MAX_RESULT_BYTES, NodeFailure
 
 PREFIX = '/internal/compute/v3'
@@ -19,16 +18,12 @@ INPUT_MIN_BYTES_PER_SECOND = 1024
 MAX_CONTROL_BYTES = 256 * 1024 * 1024 + 64 * 1024
 
 
-class ControlChannel(WebSocketSession):
-    def close(self, code=1000, reason=None):
-        # Wake blocked readers before close can recycle their socket descriptor.
-        connection = self.stream.get_extra_info('socket')
-        if connection is not None:
-            try:
-                connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-        super().close(code, reason)
+SUBPROTOCOL = 'compute.pull.v1'
+
+
+class CenterConnection(reconnect):
+    def process_redirect(self, exc):
+        return exc  # Match HTTP's origin-pinned follow_redirects=False.
 
 
 def control_client(config, *, headers=None, transport=None, timeout=30):
@@ -41,6 +36,9 @@ def control_client(config, *, headers=None, transport=None, timeout=30):
 class Transport:
     def __init__(self, config, *, control_transport=None):
         self.node_id = config['node_id']
+        self.channel_url = config['control_url'].replace('http', 'ws', 1).rstrip('/') + f'{PREFIX}/nodes/{self.node_id}/channel'
+        self.proxy = config.get('proxy_url') or True
+        self.channel_tls = ssl.create_default_context(cafile=config['control_ca']) if config.get('control_ca') else None
         self.control = control_client(config, transport=control_transport,
             headers={'Authorization': 'Bearer ' + config['node_token'], 'X-Node-Id': self.node_id})
         self.channel_condition = Condition()
@@ -59,25 +57,23 @@ class Transport:
             channel.close()
 
     def listen(self, stop, updated):
-        from httpx_ws import connect_ws, HTTPXWSException
-        # A stalled handshake must not inherit the longer result-transfer timeout.
-        timeout = httpx.Timeout(self.control.timeout)
-        for phase in ('connect', 'read', 'write', 'pool'):
-            seconds = getattr(timeout, phase)
-            setattr(timeout, phase, min(seconds, 5) if seconds is not None else 5)
         try:
-            with connect_ws(f'{PREFIX}/nodes/{self.node_id}/channel', self.control,
-                    subprotocols=['compute.v3'], session_class=ControlChannel, max_message_size_bytes=MAX_CONTROL_BYTES,
-                    queue_size=1, keepalive_ping_interval_seconds=10,
-                    keepalive_ping_timeout_seconds=10, timeout=timeout) as channel:
+            with CenterConnection(self.channel_url, subprotocols=[SUBPROTOCOL], proxy=self.proxy,
+                    ssl=self.channel_tls, additional_headers={'Authorization': self.control.headers['Authorization']},
+                    max_size=MAX_CONTROL_BYTES, max_queue=1, compression=None,
+                    open_timeout=min(5, self.control.timeout.connect or 5), close_timeout=1,
+                    ping_interval=5, ping_timeout=5) as channel:
+                if channel.subprotocol != SUBPROTOCOL:
+                    raise ControlFailure('PROTOCOL_MISMATCH')
                 with self.channel_condition:
+                    if stop.is_set():
+                        return
                     self.channel = channel
                     self.channel_condition.notify_all()
-                while not stop.is_set() and self.channel is channel:
-                    try:
-                        value = channel.receive_json(timeout=.5)
-                    except TimeoutError:
-                        continue
+                for frame in channel:
+                    if stop.is_set():
+                        break
+                    value = json.loads(frame) if isinstance(frame, str) else None
                     if not isinstance(value, dict):
                         raise ControlFailure('CONTROL_INVALID_RESPONSE')
                     if value.get('type') in ('assignment', 'error'):
@@ -90,7 +86,7 @@ class Transport:
                         updated(value)
                     else:
                         raise ControlFailure('CONTROL_INVALID_RESPONSE')
-        except (httpx.HTTPError, HTTPXWSException, LocalProtocolError) as error:
+        except (OSError, WebSocketException) as error:
             if not stop.is_set():
                 raise self.network_error(error) from None
         except ValueError:
@@ -101,36 +97,27 @@ class Transport:
                 self.channel_condition.notify_all()
 
     def request_assignment(self, body):
-        from httpx_ws import HTTPXWSException
         with self.channel_condition:
             channel = self.channel
             if channel is None:
                 raise ControlFailure('CONTROL_UNAVAILABLE')
             self.assignment_id, self.assignment_reply = body['request_id'], None
-            try:
-                channel.send_json({'type': 'ready', **body})
-            except (httpx.HTTPError, HTTPXWSException, LocalProtocolError) as error:
-                raise self.network_error(error) from None
-            while self.assignment_reply is None and self.channel is channel:
-                self.channel_condition.wait()
+        try:
+            channel.send(json.dumps(body))
+        except (OSError, WebSocketException) as error:
+            raise self.network_error(error) from None
+        with self.channel_condition:
+            self.channel_condition.wait_for(lambda: self.assignment_reply is not None or self.channel is not channel,
+                timeout=self.control.timeout.read or 30)
             reply = self.assignment_reply
         if reply is None:
+            channel.close()  # Includes live TCP peers that stopped servicing pulls.
             raise ControlFailure('CONTROL_UNAVAILABLE')
         if reply['type'] == 'error':
             code = reply.get('code', '')
             raise ControlFailure(code if isinstance(code, str) and re.fullmatch(r'[A-Z_]{1,80}', code)
                                  else 'CONTROL_REJECTED', 409)
         return reply
-
-    def acknowledge(self, request_id):
-        from httpx_ws import HTTPXWSException
-        with self.channel_condition:
-            if self.channel is None:
-                raise ControlFailure('CONTROL_UNAVAILABLE')
-            try:
-                self.channel.send_json({'type': 'ack', 'request_id': request_id})
-            except (httpx.HTTPError, HTTPXWSException, LocalProtocolError) as error:
-                raise self.network_error(error) from None
 
     @staticmethod
     def checked(response):

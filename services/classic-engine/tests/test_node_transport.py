@@ -18,62 +18,70 @@ def config():
             'control_url': 'https://control.example.test'}
 
 
-@pytest.mark.parametrize('operation', ['ready', 'ack'])
-def test_channel_closed_during_send_is_a_retryable_control_failure(operation):
-    from types import SimpleNamespace
-    from httpx_ws import WebSocketSession
-    client = Transport(config())
-    client.channel = WebSocketSession(SimpleNamespace(write=lambda _: None, close=lambda: None))
-    client.channel.close()
-    try:
-        with pytest.raises(ControlFailure, match='CONTROL_UNAVAILABLE'):
-            if operation == 'ready':
-                client.request_assignment({'request_id': 'saved'})
-            else:
-                client.acknowledge('saved')
-    finally:
-        client.close()
-
-
-def test_channel_close_wakes_blocked_socket_reader_before_reconnect(monkeypatch):
+@pytest.mark.parametrize('shutdown', ['close', 'silent-application'])
+def test_close_or_missing_pull_response_wakes_both_workers(shutdown):
     from concurrent.futures import ThreadPoolExecutor
-    from contextlib import contextmanager
-    import socket
-    from threading import Event
-    from httpcore._backends.sync import SyncStream
-    from httpx_ws import WebSocketSession
-    left, right = socket.socketpair()
-    entered, drained = Event(), Event()
-
-    @contextmanager
-    def connected(*args, **kwargs):
-        session = kwargs.get('session_class', WebSocketSession)(
-            SyncStream(left), keepalive_ping_interval_seconds=None)
-        read = session._read_stream
-        def observed(size):
-            entered.set()
-            try:
-                return read(size)
-            finally:
-                drained.set()
-        session._read_stream = observed
-        with session:
-            yield session
-
-    monkeypatch.setattr('httpx_ws.connect_ws', connected)
-    client = Transport(config())
-    with ThreadPoolExecutor(1) as pool:
-        listening = pool.submit(client.listen, Event(), lambda _: None)
+    from threading import Event, Thread
+    from websockets.sync.server import serve
+    received, gone = Event(), Event()
+    def silent(channel):
         try:
-            with client.channel_condition:
-                assert client.channel_condition.wait_for(lambda: client.channel is not None, 2)
-            assert entered.wait(2) and not drained.wait(.05)
-            client.close_channel()
-            listening.result(timeout=2)
-            assert drained.wait(1), 'Closed channel retained a reader on its old socket'
+            assert channel.request.headers['Authorization'] == 'Bearer control-only-token'
+            assert 'X-Node-Id' not in channel.request.headers
+            channel.send('{"type":"updates"}')
+            assert json.loads(channel.recv()) == {'request_id': 'saved'}
+            received.set()
+            for _ in channel:
+                pytest.fail('unexpected second frame')
         finally:
-            right.close()
+            gone.set()
+    with serve(silent, '127.0.0.1', 0, subprotocols=['compute.pull.v1']) as server, ThreadPoolExecutor(2) as pool:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = Transport(config() | {'control_url': f'http://127.0.0.1:{server.socket.getsockname()[1]}'})
+        client.control.timeout = 2 if shutdown == 'close' else .5
+        opened = Event()
+        try:
+            listening = pool.submit(client.listen, Event(), lambda _: opened.set())
+            assert opened.wait(3)
+            pulling = pool.submit(client.request_assignment, {'request_id': 'saved'})
+            assert received.wait(2)
+            if shutdown == 'close':
+                client.close_channel()
+            with pytest.raises(ControlFailure, match='CONTROL_UNAVAILABLE'):
+                pulling.result(timeout=3)
+            listening.result(timeout=2)
+            assert client.channel is None and gone.wait(2)
+        finally:
             client.close()
+            server.shutdown()
+            thread.join(2)
+
+
+def test_ws_handshake_does_not_follow_redirect():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Event, Thread
+    requests = []
+    class Redirect(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(302)
+            self.send_header('Location', f'ws://127.0.0.1:{self.server.server_port}/other')
+            self.end_headers()
+        def log_message(self, *_):
+            pass
+    with ThreadingHTTPServer(('127.0.0.1', 0), Redirect) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = Transport(config() | {'control_url': f'http://127.0.0.1:{server.server_port}'})
+        try:
+            with pytest.raises(ControlFailure):
+                client.listen(Event(), lambda _: None)
+            assert requests == [f'{PREFIX}/nodes/node-test/channel']
+        finally:
+            client.close()
+            server.shutdown()
+            thread.join(2)
 
 
 @pytest.mark.parametrize('configured,limit', [(.1, 2), (30, 6.5), (None, 6.5)])
@@ -349,7 +357,7 @@ def test_download_is_bounded_no_redirect_and_errors_are_redacted(response, code)
 
 def test_journal_survives_reopen_freezes_binary_atomically_and_is_single_process(tmp_path):
     journal = Journal(tmp_path)
-    pending = {'request_id': 'same-request', 'config_version': 1, 'count': 4}
+    pending = {'request_id': 'same-request', 'config_version': 1, 'count': 4, 'document_count': 0}
     completion = {'completion': {'result': 'same-result'}}
     output = b'RIFF\x00\x01' * 100
     journal.put('claim', pending)
@@ -394,11 +402,11 @@ def test_binary_freeze_failure_rolls_back_completion_together_with_bytes(tmp_pat
         journal.close()
 
 
-@pytest.mark.parametrize('key', ['claim', 'document-claim'])
 @pytest.mark.parametrize('operation', ['put', 'remove'])
-def test_claim_gate_cache_publishes_only_committed_receipts(tmp_path, key, operation):
+def test_claim_gate_cache_publishes_only_committed_receipts(tmp_path, operation):
     import sqlite3
     journal = Journal(tmp_path)
+    key = 'claim'
     original, changed = {'request_id': 'old', 'count': 2}, {'request_id': 'new', 'count': 1}
     try:
         journal.put(key, original)

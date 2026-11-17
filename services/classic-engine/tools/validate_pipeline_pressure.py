@@ -85,7 +85,7 @@ class SimulatedTransport:
         self.runtime, self.scenario, self.total, self.data = runtime, scenario, total, data
         self.control = SimpleNamespace(timeout=3)
         self.config = {'version': 1, 'enabled': True, 'execution_slots': 8,
-                       'request_seconds': 3, 'heartbeat_seconds': .1}
+                       'request_seconds': 3, 'heartbeat_seconds': .1, 'poll_seconds': 20}
         self.released = Event()
         self.closed = Event()
         self.lock = Lock()
@@ -103,9 +103,6 @@ class SimulatedTransport:
 
     def close_channel(self):
         self.closed.set()
-
-    def acknowledge(self, _request_id):
-        pass
 
     def request_assignment(self, body):
         with self.lock:
@@ -137,9 +134,8 @@ class SimulatedTransport:
                 reply = {'type': 'assignment', 'request_id': body['request_id'], 'server_time': server, 'leases': leases}
                 self.receipts[body['request_id']] = reply
                 return reply
-        self.closed.wait()
-        from classic_node.protocol import ControlFailure
-        raise ControlFailure('CONTROL_UNAVAILABLE')
+        server, _ = self.clock()
+        return {'type': 'assignment', 'request_id': body['request_id'], 'server_time': server, 'leases': []}
 
     def listen(self, stop, updated):
         while not stop.wait(.05):

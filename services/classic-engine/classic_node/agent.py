@@ -51,8 +51,7 @@ class Page:
                     self.condition.notify_all()
                     return
                 if sent_at is not None and sent_at >= self.renewed_at:
-                    # Only registration/claim/heartbeat renew execution rights.
-                    # A channel update carries no expiry and never extends them.
+                    # Only a dated lease response sets the deadline; pushed updates never extend it.
                     self.deadline = sent_at + max(0, timestamp(reply['expires_at']) - timestamp(server_time) - 2)
                     self.lease['expires_at'] = reply['expires_at']
                     self.renewed_at = sent_at
@@ -82,7 +81,6 @@ class Agent:
         self.heartbeat_future = self.claim_future = self.channel_future = None
         self.updates = Queue(maxsize=4)
         self.channel_backoff = 1
-        self.server_clock_offset = 0
         self.next_channel = 0
         self.stop = stop if stop is not None else Event()
         self.operations = operations
@@ -165,7 +163,7 @@ class Agent:
 
     def register(self):
         sent_at = time.monotonic()
-        response = self.transport.post('/nodes/register', {'protocol_version': 3, 'control_channel': 'websocket',
+        response = self.transport.post('/nodes/register', {'protocol_version': 3,
             'engine_version': self.runtime.version, 'resource_id': self.local['resource_id'],
             'device': self.local['engine'].get('backend', 'cuda') + ':' + str(self.local['engine']['gpu']),
             'supported_languages': self.runtime.languages, 'ready': True, 'result_formats': ['overlay-v1', 'overlay-tiles-v1'],
@@ -174,7 +172,6 @@ class Agent:
         if response['protocol_version'] != 3:
             raise NodeFailure('PROTOCOL_MISMATCH')
         self.apply_config(response['config'])
-        self.server_clock_offset = sent_at - timestamp(response['server_time'])
         outstanding = {lease['lease_id'] for lease in response['leases']}
         # A completed/reclaimed lease absent from registration can be discarded.
         for key in self.journal.leases():
@@ -193,7 +190,6 @@ class Agent:
         response = self.transport.post(f'/nodes/{self.local["node_id"]}/heartbeat',
             {'config_version': self.config['version'], 'leases': entries})
         self.apply_config(response.get('config'))
-        self.server_clock_offset = sent_at - timestamp(response['server_time'])
         for item in response['leases']:
             page = self.pages.get(item['lease_id'])
             if page:
@@ -201,44 +197,32 @@ class Agent:
         self.connected('heartbeat')
 
     def claim(self):
-        key = 'claim' if self.journal.get('claim') else 'document-claim'
-        pending = self.journal.get(key)
+        pending = self.journal.get('claim')
         if not pending:
             count = self.claim_capacity()
             documents = int(self.documents.protocol() == 2 and bool(self.documents.capacity()))
             if not self.config['enabled'] or not (count or documents) or self.stop.is_set():
                 return False
-            key = 'claim'
             pending = {'request_id': uuid4().hex, 'config_version': self.config['version'],
                        'count': count, 'document_count': documents}
-            self.journal.put(key, pending)
-        channel = 'document_count' in pending
+            self.journal.put('claim', pending)
         sent_at = time.monotonic()
         try:
-            if channel:
-                response = self.transport.request_assignment(pending)
-            else:
-                post = self.transport.document_post if key == 'document-claim' else self.transport.post
-                response = post(f'/nodes/{self.local["node_id"]}/claim', pending)
+            response = self.transport.request_assignment(pending)
         except ControlFailure as error:
             if error.code == 'NODE_CONFIG_CONFLICT':
                 # The controller checks saved receipts before config conflicts.
-                self.journal.remove(key)
+                self.journal.remove('claim')
                 self.last_heartbeat = 0
             raise
-        if response.get('request_id') != pending['request_id'] or channel and not response['leases']:
+        if response.get('request_id') != pending['request_id'] or not isinstance(response.get('leases'), list):
             raise NodeFailure('CONTROL_INVALID_RESPONSE')
-        self.apply_config(response.get('config'))
-        if channel:
-            # Capacity can be offered long before dispatch. Calibrate pushed
-            # deadlines from the most recent request/heartbeat, never offer time.
-            sent_at = timestamp(response['server_time']) + self.server_clock_offset
         for lease in response['leases']:
-            adopter = self.documents.adopt if key == 'document-claim' or lease.get('workflow_kind') == 'document' else self.adopt
+            if not isinstance(lease, dict) or lease.get('workflow_kind') not in ('image', 'document'):
+                raise NodeFailure('CONTROL_INVALID_RESPONSE')
+            adopter = self.documents.adopt if lease['workflow_kind'] == 'document' else self.adopt
             adopter(lease, response['server_time'], sent_at)
-        if channel:
-            self.transport.acknowledge(pending['request_id'])
-        self.journal.remove(key)  # Only after every returned lease is durable.
+        self.journal.remove('claim')  # Only after every returned lease is durable.
         return bool(response['leases'])
 
     def retry(self, page, operation):
@@ -335,14 +319,11 @@ class Agent:
     def poll_control(self):
         if self.claim_future and self.claim_future.done():
             try:
-                self.claim_future.result()
+                granted = self.claim_future.result()
                 self.network_log.succeeded('claim')
-                self.next_claim = 0
-            except Exception as error:
-                if not isinstance(error, NodeFailure):
-                    if self.journal.get('claim') or not self.journal.get('document-claim'):
-                        raise
-                    error = NodeFailure('DOCUMENT_WORKSPACE_UNAVAILABLE')
+                if granted:
+                    self.next_claim = 0
+            except NodeFailure as error:
                 self.network_log.failed('claim', error)
                 self.next_claim = time.monotonic() + 1
             self.claim_future = None
@@ -359,6 +340,8 @@ class Agent:
             except Empty:
                 break
             self.apply_config(response.get('config'))
+            if response.get('available'):
+                self.request_claim()
             for item in response.get('leases', []):
                 page = self.pages.get(item['lease_id']) or self.documents.pages.get(item['lease_id'])
                 if page:
@@ -377,8 +360,10 @@ class Agent:
             self.heartbeat_future = self.heartbeat_pool.submit(self.heartbeat)
             self.heartbeat_future.add_done_callback(lambda _: self.wake.set())
         if (not self.stop.is_set() and time.monotonic() >= self.next_claim and self.claim_future is None
-                and (self.journal.get('claim') or self.journal.get('document-claim') or self.claim_capacity() or
+                and (self.journal.get('claim') or self.claim_capacity() or
                      self.documents.protocol() == 2 and self.documents.capacity())):
+            # Set the idle fallback before sending: a hint racing an empty reply isn't lost.
+            self.next_claim = time.monotonic() + self.config['poll_seconds']
             self.claim_future = self.claim_pool.submit(self.claim)
             self.claim_future.add_done_callback(lambda _: self.wake.set())
         if not self.channel_future and not self.stop.is_set() and time.monotonic() >= self.next_channel:
