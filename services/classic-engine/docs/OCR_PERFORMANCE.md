@@ -18,7 +18,7 @@
 
 `ocr_batches`、`ocr_paragraphs`、`ocr_output_tokens`、`ocr_truncated` 是计数；`ocr_batch_max` 是实际最大批量。嵌套耗时不能相加；并发页耗时之和不等于整批墙钟时间。新增明细仅用于本地诊断，中心使用原有字段。
 
-AMD Hayai 使用上游 HIP Graph 解码，缓存最多四组状态，捕获失败按上游逻辑回退 eager；`ocr_graph_batches` / `ocr_eager_batches` 记录成功批次。`ocr_capture_wait` / `ocr_capture` / `ocr_graph_captures` 分别记录捕获等待、耗时和次数，包含在 `ocr_infer` 中。捕获与其他 GPU 模型调用互斥，避免 HIP 的跨线程同步冲突。Graph 的静态填充可能改变识别标点或文字，不能视为逐字等价。CUDA/MPS 仍使用 eager。
+AMD Hayai 使用上游 HIP Graph 解码。加载模型时 GPU 可用显存至少 8 GiB，原生 LRU 最多保留 8 组状态，否则保留上游的 4 组；按需分配，批量及静态填充不变。捕获失败按上游逻辑回退 eager；`ocr_graph_batches` / `ocr_eager_batches` 记录成功批次。`ocr_capture_wait` / `ocr_capture` / `ocr_graph_captures` 分别记录捕获等待、耗时和次数，包含在 `ocr_infer` 中。捕获与其他 GPU 模型调用互斥，避免 HIP 的跨线程同步冲突。Graph 的静态填充可能改变识别标点或文字，不能视为逐字等价。CUDA/MPS 仍使用 eager。
 
 颜色的黑白筛查、代表行裁剪及气泡关联在捕获保护锁外执行；原生颜色批调用（含设备传输）和气泡掩膜中的 GPU 回传仍受保护。
 
@@ -34,3 +34,5 @@ python -m tools.benchmark_ocr --config node.local.json --input page1.jpg page2.j
 输出每页明细、阶段均值/P50/P95、整批吞吐、CPU 时间/平均占用核数、RSS 和 CUDA/HIP 的 PyTorch 显存峰值。计时前预热各页形状；内存受 `resident_bytes` 限制。Windows 工作目录需与模型同盘，避免上游气泡检测器的跨盘相对路径限制。
 
 默认只保存识别摘要；`--include-text` 才保存全文与区域。输出使用新文件，保留前次对比。测试期间保持节点空闲；输出差异会保留报告并报错，模拟测试不代表 GPU 性能或识别质量。
+
+实机缓存回归：设置 `MTU_TEST_BACKEND=amd` 和 `MTU_TEST_HAYAI=<已准备的模型目录>`，运行 `python -m pytest -q tests/test_hayai_concurrency.py`，验证批量形状淘汰、复用及识别结果。

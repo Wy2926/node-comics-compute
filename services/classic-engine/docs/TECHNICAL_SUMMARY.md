@@ -56,6 +56,20 @@ python -m tools.benchmark_pages --backend amd --models <assets>/models --hayai-m
 
 改用 `--detect-precision fp16` 或 `--concurrency 2 --render-workers 2` 并指定新报告名。报告记录实际检测 dtype、滤波路径、逐页耗时及 OCR/行框摘要。以上是本地暖机图像计算，不含真实中心、翻译或网络耗时。
 
+### Hayai 重复捕获与 GPU 利用率
+
+同一组 21 页，长图放在第 6 个任务。使用真实调度、模型、排版和持久化，中心与网络由 `tools.validate_pipeline_pressure` 本地模拟。按本机配置使用 FP32 检测、OCR 批量 4、2 路计算和 2 路渲染、各 4 个 CPU 线程、最多 4 个租约、4 GiB 页面预算。`c0a73ce` 与扩大原生图缓存分别启动两个独立进程（A/B/B/A），每个进程整组预热一次，再测三次。
+
+| 暖机后每批均值 | `c0a73ce` | 扩大图缓存 |
+| --- | ---: | ---: |
+| 21 个任务全部交付 | 9.67 s | **9.32 s** |
+| 41 个 OCR 批次中的再次捕获 | 7 次 | **0 次** |
+| OCR 推理累计时间（含捕获） | 5.74 s | **5.03 s** |
+| 进程 GPU 平均忙碌率（同上口径） | 52.9% | **54.6%** |
+| PyTorch 峰值已分配显存 | 2.57 GiB | 2.68 GiB |
+
+仅在 AMD Hayai 模型加载后可用显存至少 8 GiB 时，将原生 LRU 的上限从 4 提到 8。两版所有任务的分析摘要（不含版本号）与输出字节均一致。并发探测中，3 或 4 路计算没有优于 2 路；优化版单独将 OCR 批量提高到 8，三轮均值为 9.37 s。对这组输入，建议保留 2 路计算和 OCR 批量 4。
+
 ## Apple Silicon：31 张实图对照（2026-11-17）
 
 **条件：** Apple M6 Mac mini，12 CPU／12 GPU 核、24 GB，PyTorch 2.14.1；Hayai MPS FP16、LaMa MPS FP32，GPU 回退关闭。检测批量 1、OCR 批量 8、CPU 线程 2、渲染进程 2、页面预算 2 GiB。

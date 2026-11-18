@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+import os
 import sys
 from threading import Event, Lock
 from types import SimpleNamespace
@@ -138,3 +139,28 @@ def test_graph_capture_waits_for_other_gpu_stage_and_releases_on_failure(fail):
         else:
             assert future.result(timeout=5) == 'native graph'
     assert entered.is_set() and not lock.locked()
+
+
+@pytest.mark.skipif(os.environ.get('MTU_TEST_BACKEND') != 'amd' or not os.environ.get('MTU_TEST_HAYAI'),
+                    reason='Requires a prepared Hayai model and the AMD GPU environment')
+def test_hip_graph_lru_retains_fifth_batch_size_only_with_headroom(monkeypatch):
+    import torch
+    from PIL import Image, ImageDraw
+    free, total = torch.cuda.mem_get_info(0)
+    if free < 10 * 1024**3:
+        pytest.skip('Insufficient headroom to exercise both graph budgets')
+    image = Image.new('RGB', (160, 48), 'white')
+    ImageDraw.Draw(image).text((4, 4), 'HELLO WORLD', fill='black', font_size=22)
+    outputs = []
+    for available, captures in ((8 * 1024**3 - 1, 1), (8 * 1024**3, 0)):
+        monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda *_, n=available: (n, total))
+        ocr = HayaiOCR(os.environ['MTU_TEST_HAYAI'], backend='amd', batch_size=8)
+        try:
+            outputs.append([ocr._recognize([image] * n) for n in range(1, 6)])
+            with collect() as timings:
+                assert ocr._recognize([image]) == outputs[-1][0]
+            assert timings['ocr_graph_batches'] == 1
+            assert timings.get('ocr_graph_captures', 0) == captures
+        finally:
+            ocr.close()
+    assert outputs[0] == outputs[1]

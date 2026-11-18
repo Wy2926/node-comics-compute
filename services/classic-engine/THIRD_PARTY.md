@@ -26,8 +26,10 @@ algorithms. It checks EOS/pad tokens to reject truncated paragraphs and ignores 
 upstream training-only IDS head. Runtime settings and supported validation scope are
 specified in [the adapter](mtu_engine/ocr/hayai.py) and [its tests](tests/test_ocr_backends.py).
 
-On Windows AMD, the adapter enables the upstream HIP-compatible decoder graph path,
-including its four-state LRU and native eager fallback on capture failure. The shared
+On Windows AMD, the adapter enables the upstream HIP-compatible decoder graph path.
+It retains the native four-state LRU, raising its instance limit to eight when
+at least 8 GiB is free at model load. States are still allocated on demand, with
+native eviction and eager fallback on capture failure. The shared
 model lock also protects graph/KV state. CPU shape/mask metadata stays on CPU as expected
 by `_FastEngine`; only image patches are transferred. Graph decoding uses upstream static
 padding and may change predictions (including punctuation); it is not a bit-identical
