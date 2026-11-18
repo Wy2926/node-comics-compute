@@ -18,6 +18,9 @@ def prepare_detector(model, device, precision):
         precision = 'fp16' if device == 'mps' else 'fp32'
     if precision == 'fp16':
         model = fuse_detector(model).half()
+        if device == 'cuda' and torch.version.cuda:
+            # Keep cuDNN convolution weights in the layout of the incoming image batches.
+            model.to(memory_format=torch.channels_last)
     elif precision != 'fp32':
         raise ValueError('detect_precision must be auto, fp32 or fp16')
     # Both DB postprocessing and its debug view read only shrink logits (channel 0).

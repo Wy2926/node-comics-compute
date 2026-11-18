@@ -17,7 +17,7 @@
 - 下载、分析／抹字、渲染、落盘和交付分别有界。页面、原生掩膜和渲染进程传输缓冲共用 `resident_bytes`。可选参考掩膜每页最多 64 MiB；内存不足不增加并发。文件拆页及 ZIP 另受工作区磁盘预算约束。
 - CUDA／AMD 以 `local_pages` 限制计算并发；MPS 一次派发一项分析／抹字，I/O 和渲染可重叠。`engine.threads`、渲染进程与页面数要一起评估；并发提高吞吐不等于降低单页延迟。
 - Hayai 在 CUDA／AMD 上使用上游解码图。按模型加载时空闲显存：NVIDIA 不足 4 GiB 走 eager，4 至不足 8 GiB 最多保留 5 组图；AMD 不足 8 GiB 保留 4 组。两者达 8 GiB 都保留最多 8 组（OCR 批量为 8 时为 9 组）。捕获受跨模型锁保护，失败退回 eager；静态填充可能改变识别结果。
-- CUDA／AMD 取色复用有界的位置系数。FP32 LaMa 只在预热时为 64 至 512 的八种正方形建图，其他输入走 eager；NVIDIA 预热时空闲显存不足 4 GiB 跳过建图。缓存不跨页复用识别结果。
+- 三个后端的 48px 取色模型都复用有界的位置系数。CUDA／AMD 的 FP32 LaMa 只在预热时为 64 至 512 的八种正方形建图，其他输入走 eager；NVIDIA 预热时空闲显存不足 4 GiB 跳过建图。缓存不跨页复用识别结果。
 
 ## 调优依据
 
@@ -81,6 +81,23 @@ Hayai 的 8 张普通页和长图共 90 段，FP32 对照三轮文字及行框�
 - **长图输出：** 实际变化稀疏，原来的高条带在大片透明区域上编码。按最高 512 行分块并快速无损编码，超大网格保留粗分块，继续校验 alpha、摘要和大小上限。该页编码从 2.84 降至 0.69 s，实测覆盖层由 1.96 增至 1.99 MB。优化后长图主要耗时为 Qt 排版约 2.94 s、DBNet 检测约 2.80 s。
 - **效果：** 五轮 9 张输入、90 段的文字及行框均与上版 Hayai 相同。单独逐像素复测中所有修复／气泡掩膜一致，8 张成品逐像素相同，另 1 张仅 1 个像素的通道差 1/255。这不是对已移除的分语种 OCR 的准确率评估。
 
+### 检测精度复测与跨后端同步
+
+在 Hayai 单后端 `7cc668a` 上重测上面的 8 张普通页和 1 张长图。只切换 `engine.detect_precision`：DBNet 在 FP32 下融合卷积与 BatchNorm，再以 FP16 执行；后处理仍读 FP32 概率图。每个配置预热后测 3 轮，取中位数。
+
+| RTX 4060 Laptop，FP32 → 融合 FP16 | 检测耗时¹ | 整批墙钟 | 整卡忙碌率 | 节点 CPU 占整机 | 峰值已分配显存 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8 页双路 | 1.19 → 0.57 s | 5.85 → 5.01 s | 62.5% → 52.4% | 9.3% → 9.8% | 1.79 → 1.32 GiB |
+| `930×28007`，1 路 | 2.84 → 1.20 s | 11.29 → 10.60 s | 45.3% → 34.1% | 4.3% → 4.4% | 2.20 → 1.42 GiB |
+
+¹检测为同轮各页 `analyze_detect` 之和，墙钟另计。三轮中 90 段的文字及行框一致。另做逐像素复测：7 张普通页成品相同，另 1 张有 8,633 个像素不同（0.86%，最大通道差 94/255），长图有 121,688 个像素不同（0.47%，最大差 32/255）。两页的修复掩膜分别有 12、136 个像素不同；CUDA 仍默认 FP32。
+
+- **本进程长图编码：** 单渲染器使用自己已分配的 CPU 线程，最多 4 个；进程池因 IPC 空间不足而退回本地时仍串行。固定同一长图成品，1／2／4 线程交错 5 轮，编码 0.644／0.483／0.363 s，输出字节完全相同。FP32 整页另测 6 轮，1 → 4 线程：编码 0.65 → 0.37 s，墙钟 11.40 → 11.10 s；峰值已分配显存均为 2.20 GiB。
+- **CUDA 的 FP16 检测：** 融合后的卷积权重在加载时设为 `channels_last`，匹配现有图像输入。同进程、同精度交错 5 轮，8 张普通页串行检测 358 → 326 ms，长图 1.071 → 1.060 s；9 页的检测行框和原始掩膜一致。
+- **最终 FP16 配置：** 上述本地编码和权重布局均启用后，普通 8 页双路 4.81 s，长图 9.27 s；双计算槽、双渲染进程的模拟中心交付 8 页为 5.06 s，三轮均交付完成。三组的整卡忙碌率分别为 59.5%、34.8%、54.9%，节点 CPU 占整机 10.2%、4.6%、10.9%。
+- **设备差异：** AMD 的 FP32 LaMa 也按 uint8 搬运图像与掩膜；MPS 的取色也复用冻结的位置系数，仍使用单设备锁。以上改动没有本轮 AMD/MPS 实机测速；AMD 图重放同步、MPS eager 解码仍按各自后端执行。
+- **没有照搬的预热：** 显式 `inpainting_size=1024` 时，在 4060 上试了 AMD 的额外 576–1024 方块预热。预热多花 2.43 s，新计算线程首次处理这八种形状只省 0.08–0.60 s，热运行无明显变化，走完这些形状后分配器保留约 6.67 GiB；CUDA 不默认预热这些大块。
+
 ## 诊断与复测
 
 `state_dir/logs/node.log` 的 `event=page_stage` 和 `event=document_page_stage` 记录本地阶段秒数。先分清排队（`*_queue`）、等模型锁（`*_lock_wait`）和计算，再看以下字段。嵌套耗时不能相加，并发页耗时之和不等于墙钟时间。
@@ -99,6 +116,8 @@ python -m tools.benchmark_pages --backend amd --models <assets>/models --input <
 python -m tools.benchmark_pages --backend cuda --models <assets>/models --input <pages> --output cuda.json --threads 4 --concurrency 2 --render-workers 1 --detect-batch-size 1 --ocr-batch-size 4 --color-batch-size 4 --cache-mib 64 --repeats 3
 ```
 
-`benchmark_pages` 的 `warmup_seconds`、`first_pass` 与 `runs` 分别记录节点预热、首次处理和热运行，同时报告文字、坐标、像素及输出摘要。`--pipeline` 可验证真实调度与本地模拟中心；`tools.validate_render_output` 单独验证 CPU／Qt 输出。实机回归指定 `MTU_TEST_ASSETS`；测 NVIDIA 图重放再设 `MTU_TEST_BACKEND=cuda`。
+`benchmark_pages` 的 `warmup_seconds`、`first_pass` 与 `runs` 分别记录节点预热、首次处理和热运行，同时报告文字、坐标、像素及输出摘要。`--pipeline` 可验证真实调度与本地模拟中心；`tools.validate_render_output` 单独验证 CPU／Qt 输出。实机回归指定 `MTU_TEST_ASSETS` 和对应的 `MTU_TEST_BACKEND`（`cuda`、`amd` 或 `mps`）。
+
+`benchmark_pages --backend mps` 同样支持这些页面与调度对照。Metal 报告轮末张量分配量 `mps_current_allocated_bytes`，不是显存峰值；无整卡忙碌率读数。
 
 CUDA 下 `benchmark_pages` 和 `benchmark_ocr` 在每轮热测期间按设备 UUID 调用 `nvidia-smi`，每 200 ms 采样一次整卡忙碌率（含其他进程）。报告记录 `gpu_busy_percent` 均值与 `gpu_samples`；工具不可用或没有读数时分别为 `null`、`0`。`cpu_core_equivalents` 是节点及已启动子进程的 CPU 秒数除以墙钟秒数；`cpu_percent_of_host` 再按主机逻辑核数折算，不含其他程序。

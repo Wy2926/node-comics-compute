@@ -279,6 +279,7 @@ class Engine:
         from manga_translator.inpainting.inpainting_lama_mpe import LamaLargeInpainter
         from manga_translator.ocr.model_48px import Model48pxOCR
         from .colors import Colors
+        from .color_positions import prepare_color_positions
         from .ocr.hayai import HayaiOCR
         # Select only the upstream PyTorch checkpoint; do not fetch an unused CPU
         # ONNX model just to satisfy the upstream multi-backend download map.
@@ -307,9 +308,7 @@ class Engine:
             self.detector.model.register_forward_pre_hook(check_cancelled)
             self.detector_settings = {'dtype': str(next(self.detector.model.parameters()).dtype),
                                       'opencl_filter': self.detector.opencl_filter}
-            if backend in ('cuda', 'amd'):
-                from .color_positions import prepare_color_positions
-                prepare_color_positions(self.color_model.model)
+            prepare_color_positions(self.color_model.model)
             self.colors = Colors(self.color_model, color_batch_size)
             self.bubbles = MangaLensBubbleDetector(
                 model_path=self.models / 'detection/mangalens.pt', device=self.device,

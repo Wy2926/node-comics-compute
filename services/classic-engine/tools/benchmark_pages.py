@@ -21,6 +21,7 @@ from classic_node.protocol import digest
 from classic_node.runtime import Runtime
 from classic_node.timing import collect
 from classic_node.config import ENGINE_DEFAULTS
+from mtu_engine.backend import BACKENDS
 from tools.validate_render_output import measured, reconstruct
 
 
@@ -43,7 +44,8 @@ def run(args):
         args.threads, args.render_workers = resources['analysis_threads'], resources['render_workers']
     inference = {key: getattr(args, key, default) for key, default in ENGINE_DEFAULTS.items()
                  if key.endswith('_batch_size')}
-    config = {'engine': {**inference, 'backend': getattr(args, 'backend', 'cuda'),
+    backend = getattr(args, 'backend', 'cuda')
+    config = {'engine': {**inference, 'backend': backend,
                          'detect_precision': args.detect_precision,
                          'models': str(args.models.resolve()), 'threads': args.threads,
                          'font': [str(assets / 'fonts' / f['name']) for f in fonts]},
@@ -57,17 +59,33 @@ def run(args):
     # An isolated capacity experiment, not a driver/global memory limit. This
     # allocation belongs only to this benchmark and is freed with its process.
     reserve_mib = getattr(args, 'reserve_vram_mib', 0)
+    if reserve_mib and backend == 'mps':
+        raise ValueError('VRAM reservation requires CUDA or HIP')
     reserved_vram = torch.empty(reserve_mib * 1024 ** 2, dtype=torch.uint8, device='cuda') if reserve_mib else None
     runtime = Runtime(config)
-    nvidia_uuid = torch.cuda.get_device_properties(runtime.engine.gpu).uuid if runtime.engine.backend == 'cuda' else None
-    report = {'engine': runtime.version, 'backend': config['engine']['backend'],
+    gpu = runtime.engine.gpu
+    nvidia_uuid = torch.cuda.get_device_properties(gpu).uuid if backend == 'cuda' else None
+    report = {'engine': runtime.version, 'backend': backend,
               'torch': torch.__version__, 'cuda': torch.version.cuda, 'hip': torch.version.hip,
-              'gpu': torch.cuda.get_device_name(), 'threads': args.threads,
+              'gpu': torch.backends.mps.get_name() if backend == 'mps' else torch.cuda.get_device_name(gpu),
+              'threads': args.threads,
               'concurrency': args.concurrency, 'render_workers': args.render_workers,
               'cache_bytes_per_page': args.cache_mib * 1024 ** 2,
               'translation_source': 'fixed fixture text; no provider call', 'runs': [], 'cpu_resources': resources,
               'inference_settings': inference, 'detector': runtime.engine.detector_settings,
               'ocr': runtime.engine.ocr.identity, 'reserved_test_vram_mib': reserve_mib}
+
+    def measure(operation):
+        if backend != 'mps':
+            torch.cuda.reset_peak_memory_stats(gpu)
+        value, usage = measured(operation, nvidia_uuid=nvidia_uuid)
+        if backend == 'mps':
+            # Metal exposes a point-in-time allocation, not CUDA's high-water mark.
+            usage['mps_current_allocated_bytes'] = torch.mps.current_allocated_memory()
+        else:
+            usage.update(torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(gpu),
+                         torch_peak_reserved_bytes=torch.cuda.max_memory_reserved(gpu))
+        return value, usage
 
     def page(path):
         data = path.read_bytes()
@@ -129,15 +147,12 @@ def run(args):
             report['pipeline_resident_bytes'] = args.resident_mib * 1024 ** 2
             report['cache_bytes_per_page'] = None
             for repeat in range(args.repeats):
-                torch.cuda.reset_peak_memory_stats()
                 with TemporaryDirectory(prefix='long-pipeline-') as directory:
-                    result, resources = measured(lambda: exercise(Path(directory), 'throughput', runtime,
+                    result, resources = measure(lambda: exercise(Path(directory), 'throughput', runtime,
                         total=args.total, timeout=600, local_pages=args.concurrency, inputs=inputs,
                         local={'resident_bytes': args.resident_mib * 1024 ** 2,
-                               'render_workers': args.render_workers}), nvidia_uuid=nvidia_uuid)
-                report['runs'].append({**resources, **result,
-                    'torch_peak_allocated_bytes': torch.cuda.max_memory_allocated(),
-                    'torch_peak_reserved_bytes': torch.cuda.max_memory_reserved()})
+                               'engine': {'backend': backend, 'gpu': gpu}, 'render_workers': args.render_workers}))
+                report['runs'].append({**resources, **result})
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
                 print(json.dumps({'repeat': repeat, 'pipeline_wall_seconds': result['wall_s'],
@@ -147,10 +162,7 @@ def run(args):
             # Keep first-shape stalls visible, separately from warmed repetitions.
             report['first_pass'] = list(pool.map(page, paths))
             for repeat in range(args.repeats):
-                torch.cuda.reset_peak_memory_stats()
-                pages, resources = measured(lambda: list(pool.map(page, paths)), nvidia_uuid=nvidia_uuid)
-                resources['torch_peak_allocated_bytes'] = torch.cuda.max_memory_allocated()
-                resources['torch_peak_reserved_bytes'] = torch.cuda.max_memory_reserved()
+                pages, resources = measure(lambda: list(pool.map(page, paths)))
                 report['runs'].append({'pages': pages, **resources})
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
@@ -167,7 +179,7 @@ if __name__ == '__main__':
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--models', type=Path, required=True)
-    parser.add_argument('--backend', choices=('cuda', 'amd'), default='cuda')
+    parser.add_argument('--backend', choices=BACKENDS, default='cuda')
     parser.add_argument('--detect-precision', choices=('auto', 'fp32', 'fp16'), default='auto')
     parser.add_argument('--hayai-model', type=Path, help='Override the bundled models/hayai directory')
     parser.add_argument('--repeats', type=int, choices=range(1, 21), default=3)

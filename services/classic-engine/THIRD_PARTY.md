@@ -74,11 +74,13 @@ Preparation requires an exact single match for each patch, marks the changes in 
 
 The lock also records the DBNet checkpoint from [manga-image-translator](https://github.com/zyddnys/manga-image-translator), the LaMa Large checkpoint from [AnimeMangaInpainting](https://huggingface.co/dreMaz/AnimeMangaInpainting), and MangaLens weights distributed by the MTU author.
 
+On NVIDIA, explicit FP16 DBNet inference stores the folded convolution weights in PyTorch's `channels_last` format at load time to match the existing NHWC-backed image tensors. Checkpoint files and the FP32 path are unchanged.
+
 Text fill and single-outline colors reuse MTU's unmodified `ModelPaddleOCR._estimate_colors_batch` preprocessing/per-character aggregation, its perspective crop, `Model48pxOCR` loader and `TextBlock.set_font_colors`. Paragraphs without obvious chroma use black fill and white outline directly. Native `check_color` examines original valid line crops in bounded windows, without brightness-ratio or bubble-containment requirements; gray and reversed text intentionally lose their original gray style. Other paragraphs use one valid representative line, selected with Comic Translate's existing `_line_area` rule and preference for aligned nonempty OCR; original text and geometry remain intact. These are style-policy changes, not equivalent replacements for all-line color averaging; see [colors.py](mtu_engine/colors.py). The `ocr_ar_48px.ckpt` and `alphabet-all-v7.txt` files from manga-image-translator's `beta-0.3` release are SHA-256-pinned in the same lock; the upstream GPL-3.0 source notices remain in the prepared MTU tree. One shared 48px model supplies colors only; its text never replaces the selected language recognizer. For line-aligned OCR text, the adapter feeds existing tokens through the native decoder layers and color heads in a causal full-sequence pass, bypassing character prediction and beam search. A read-only attention view preserves the incremental cross-attention XPOS query scale while calling the native attention implementation; it does not copy the attention algorithm or mutate shared modules. Unsupported or unaligned text retains native beam inference; see [color inference tests](tests/test_color_text_inference.py) for the reuse boundary. There is no model conversion or upstream color-source patch.
 
 Request-local adapters keep OCR tokens isolated between pages and preserve native padding and per-character color aggregation. Returned tensors move to CPU before aggregation, avoiding per-character CUDA scalar reads. Conditioning on a different recognizer's text can change colors; this is not a claim of equivalent model outputs. Fallback beam parameters remain unchanged.
 
-On CUDA and AMD, [color_positions.py](mtu_engine/color_positions.py) derives reusable factors from the native XPOS module on basis vectors. Frozen layers with equal scales share a bounded, model-local LRU. The cache contains no image or recognition data.
+On CUDA, AMD and MPS, [color_positions.py](mtu_engine/color_positions.py) derives reusable factors from the native XPOS module on basis vectors. Frozen layers with equal scales share a bounded, model-local LRU. The cache contains no image or recognition data.
 
 An analysis-local bounded cache reuses identical native perspective crops and RGB/BGR conversion for color estimation. Arrays and retained input owners are accounted for and released at analysis exit.
 
@@ -86,7 +88,7 @@ The LaMa adapter in [inpainting.py](mtu_engine/inpainting.py) wraps the pinned
 upstream FP32 generator with PyTorch CUDA/HIP graphs, captured only during startup for
 eight native square sizes (64 through 512). CUDA skips capture below 4 GiB free at warmup.
 The locked `inpainting_lama_mpe.py` adapter transfers RGB and binary masks as bytes
-on NVIDIA, normalizes in FP32 on-device and returns uint8 RGB. The native Fourier
+on NVIDIA and AMD, normalizes in FP32 on-device and returns uint8 RGB. The native Fourier
 generator masks its input; resize, padding, weights and paste-back stay native.
 Replay owns its output clone. CUDA orders reuse of static buffers using a stream
 event; HIP synchronizes before releasing the lock. Unsupported shapes stay eager.

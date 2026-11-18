@@ -170,6 +170,24 @@ def test_pool_renders_with_same_identity_and_receives_budget_and_cancellation():
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize('threads,workers', [(1, 1), (2, 2), (16, 4)])
+def test_single_renderer_uses_its_own_slots_only_for_tiled_output(threads, workers):
+    from classic_node.timing import collect
+    runtime, _, _, analysis, translated = fixture()
+    runtime.config['engine'] = {'threads': threads}
+    source = np.zeros((17000, 16, 3), np.uint8)
+    cleaned = source.copy()
+    cleaned[::512, 0] = 255
+    def render():
+        return runtime.render(source, cleaned, analysis, translated, 'en', None, allow_tiles=True, use_render_pool=False)
+    with collect() as local:
+        packed = render()
+    runtime.render_pool = object()  # The reservation did not admit IPC; peers may own the other CPUs.
+    with collect() as fallback:
+        assert render() == packed
+    assert local['render_output_workers'] == workers and fallback['render_output_workers'] == 1
+
+
 def test_shared_memory_failure_falls_back_locally_and_warns_once(caplog, monkeypatch):
     from classic_node.render_pool import RenderMemoryError
     from classic_node.operations import LOG

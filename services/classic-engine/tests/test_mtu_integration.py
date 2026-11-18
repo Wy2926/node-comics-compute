@@ -569,20 +569,30 @@ def test_detector_fusion_preserves_fp32_predictions_and_rejects_unknown_normaliz
         default.MODEL = None
 
 
-def test_detector_fusion_runs_in_half_on_selected_gpu(assets, offline):
+def test_detector_fusion_runs_in_half_on_selected_gpu(assets, offline, monkeypatch):
     import asyncio
     import torch
     from mtu_engine.assets import activate
+    from mtu_engine import detection
     activate(assets[0])
     from manga_translator.detection import default
     from manga_translator.utils import ModelWrapper
     device = 'mps' if os.environ.get('MTU_TEST_BACKEND') == 'mps' else 'cuda'
     ModelWrapper._MODEL_DIR = str(assets[0])
     detector = default.DefaultDetector()
+    fold = detection.fuse_conv_bn_eval
+    folded_dtypes = set()
+    def fold_fp32(conv, bn, **kwargs):
+        folded_dtypes.update((conv.weight.dtype, bn.running_var.dtype))
+        return fold(conv, bn, **kwargs)
+    monkeypatch.setattr(detection, 'fuse_conv_bn_eval', fold_fp32)
     asyncio.run(detector.load(device, precision='fp16'))
     try:
         weight = next(detector.model.parameters())
+        assert folded_dtypes == {torch.float32}
         assert weight.device.type == device and weight.dtype == torch.float16
+        if device == 'cuda' and torch.version.cuda:
+            assert weight.is_contiguous(memory_format=torch.channels_last)
         assert not any(isinstance(m, torch.nn.BatchNorm2d) for m in detector.model.modules())
         batch = np.random.default_rng(3).integers(0, 256, (1, 256, 256, 3), dtype=np.uint8)
         for prediction in default.det_batch_forward_default(batch, device):
@@ -1184,7 +1194,7 @@ def test_color_position_cache_matches_native_prefixes_and_keeps_no_image(assets)
     from mtu_engine.color_positions import prepare_color_positions
     activate(assets[0])
     from manga_translator.ocr.xpos_relative_position import XPOS
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'mps' if os.environ.get('MTU_TEST_BACKEND') == 'mps' else ('cuda' if torch.cuda.is_available() else 'cpu')
     layers = torch.nn.ModuleList(torch.nn.Module() for _ in range(3))
     for layer, base in zip(layers, (320, 320, 512)):
         layer.xpos = XPOS(80, base).to(device)
@@ -1218,8 +1228,8 @@ def test_native_48px_colors_reuse_ocr_and_keep_failure_fallback_offline(assets, 
     ModelWrapper._MODEL_DIR = str(models)
     native = Model48pxOCR()
     assert native.is_downloaded()
-    # This component probe can run on CPU; Engine still requires CUDA.
-    asyncio.run(native.load('cuda' if torch.cuda.is_available() else 'cpu'))
+    device = 'mps' if os.environ.get('MTU_TEST_BACKEND') == 'mps' else ('cuda' if torch.cuda.is_available() else 'cpu')
+    asyncio.run(native.load(device))
     colors = Colors(native)
     try:
         image = Image.new('RGB', (700, 160), (240, 220, 190))
@@ -1382,12 +1392,14 @@ def test_lama_graphs_match_native_pixels_through_cpu_transfer_and_concurrent_pag
     asyncio.run(native.load('cuda', force_torch=True))
     config = configuration().inpainter
     samples = []
+    reference_shapes = []
     rng = np.random.default_rng(317)
     def infer(image, mask):
         with device_context(os.environ['MTU_TEST_BACKEND'], 0):
             return asyncio.run(native.inpaint(image, mask, config, 512))
     def reference_transfer(model, pixels, mask, device):
         import torch
+        reference_shapes.append(pixels.shape[:2])
         image = torch.from_numpy(pixels).permute(2, 0, 1)[None].float().div(255).to(device)
         mask = torch.from_numpy(mask[:, :, 0])[None, None].float().to(device)
         with torch.no_grad():
@@ -1402,6 +1414,7 @@ def test_lama_graphs_match_native_pixels_through_cpu_transfer_and_concurrent_pag
                 mask[height//3:height*2//3, width//4:width*3//4] = 255
                 mask[0, :width//3] = 255
                 samples.append((image, mask, infer(image, mask)))
+        assert len(reference_shapes) == len(samples)  # Both CUDA and HIP must actually select the byte-transfer hook.
         native.model.generator = LamaGraphs(native.model.generator)
         native.model.generator.prepare()
         assert len(native.model.generator.graphs) == 8

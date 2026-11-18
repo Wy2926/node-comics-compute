@@ -66,3 +66,40 @@ def test_offline_profiles_keep_detailed_metrics_with_production_filter(tmp_path)
         assert profile['timings']['ocr_batches'] == 2
         assert profile['timings']['ocr_batch_max'] == 4
         assert profile['timings']['ocr_infer'] >= 0
+
+
+@pytest.mark.parametrize('pipeline', [False, True])
+def test_mps_page_benchmark_uses_metal_memory_and_real_dispatch_limit(tmp_path, monkeypatch, pipeline):
+    import json
+    from types import SimpleNamespace
+    from PIL import Image
+    from tools import benchmark_pages as bench
+    inputs = tmp_path / 'input'
+    inputs.mkdir()
+    Image.new('RGB', (32, 32)).save(inputs / 'p.png')
+    (tmp_path / 'licenses').mkdir()
+    (tmp_path / 'licenses/font-sources.json').write_text('{"fonts":[]}')
+    monkeypatch.setattr(bench, 'torch', SimpleNamespace(__version__='fixture', version=SimpleNamespace(cuda=None, hip=None),
+        backends=SimpleNamespace(mps=SimpleNamespace(get_name=lambda: 'Apple GPU')),
+        mps=SimpleNamespace(current_allocated_memory=lambda: 123)))  # No CUDA API in this fixture.
+    runtime = FixtureRuntime()
+    runtime.warmup = runtime.close = lambda: None
+    runtime.engine = SimpleNamespace(gpu=0, detector_settings={}, ocr=SimpleNamespace(identity={}))
+    monkeypatch.setattr(bench, 'Runtime', lambda _: runtime)
+    args = SimpleNamespace(input=inputs, output=tmp_path/'result.json', models=tmp_path/'models', backend='mps',
+        detect_precision='auto', auto_cpu=False, threads=2, render_workers=1, cache_mib=0, hayai_model=None,
+        concurrency=2, pipeline=pipeline, total=8, resident_mib=512, repeats=1, reserve_vram_mib=1)
+    with pytest.raises(ValueError, match='CUDA or HIP'):
+        bench.run(args)
+    args.reserve_vram_mib = 0
+    bench.run(args)
+    report = json.loads(args.output.read_bytes())
+    row, = report['runs']
+    assert report['gpu'] == 'Apple GPU' and row['mps_current_allocated_bytes'] == 123
+    assert 'torch_peak_allocated_bytes' not in row
+    if pipeline:
+        assert row['completed'] == 8 and row['journal_empty']
+        spans = sorted((s['start_s'], s['end_s']) for s in row['stage_spans'] if s['stage'] in {'analyze', 'inpaint'})
+        assert len(spans) == 16 and all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))
+    else:
+        assert row['pages'][0]['regions'] == 1

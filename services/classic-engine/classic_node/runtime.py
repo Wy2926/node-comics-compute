@@ -1,4 +1,5 @@
 """Compute protocol adapter for the pinned MTU CUDA/Qt pipeline."""
+from contextlib import nullcontext
 import hashlib
 from importlib.metadata import version as package_version
 from io import BytesIO
@@ -272,6 +273,9 @@ class Runtime:
         if not pooled:
             if check_cancelled:
                 check_cancelled()
+            if self.render_pool is None:
+                # A single renderer owns these CPU slots; IPC fallbacks do not.
+                options['output_budget'] = lambda: nullcontext(min(4, self.config['engine'].get('threads', 1)))
             result = render_page(self.engine.renderer, *args, **options, check_cancelled=check_cancelled)
         if check_cancelled:
             check_cancelled()

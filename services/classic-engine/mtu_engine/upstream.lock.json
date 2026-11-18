@@ -297,7 +297,7 @@
       "manga_translator/inpainting/inpainting_lama_mpe.py": [
         {
           "before": "        mask_pad = prep.pop('mask_pad')\n\n        if isinstance(self.model, LamaFourier):",
-          "after": "        mask_pad = prep.pop('mask_pad')\n\n        if self.device.startswith('cuda') and torch.version.cuda and isinstance(self.model, LamaFourier) and str(config.inpainting_precision) == 'fp32':\n            from mtu_engine.inpainting import cuda_lama_pixels\n            return self._restore_large_output(cuda_lama_pixels(self.model, image_pad, mask_pad, self.device), prep)\n\n        if isinstance(self.model, LamaFourier):"
+          "after": "        mask_pad = prep.pop('mask_pad')\n\n        if self.device.startswith('cuda') and isinstance(self.model, LamaFourier) and str(config.inpainting_precision) == 'fp32':\n            from mtu_engine.inpainting import cuda_lama_pixels\n            return self._restore_large_output(cuda_lama_pixels(self.model, image_pad, mask_pad, self.device), prep)\n\n        if isinstance(self.model, LamaFourier):"
         },
         {
           "before": "            mask_resized = resize_keep_aspect(mask_original, inpainting_size)\n",
