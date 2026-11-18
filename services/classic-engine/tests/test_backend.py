@@ -27,15 +27,15 @@ def test_backend_config_is_opt_in_and_keeps_resource_defaults(tmp_path, selectio
     assert config['engine']['ocr_arena_extend_strategy'] == 'kSameAsRequested'
     assert config['engine']['ocr_arena_shrinkage'] is True
     assert execution_settings(config)['engine']['backend'] == (selection or 'cuda')
-    engine['backend'] = 'auto'
-    value = json.loads(path.read_text())
-    value['engine'] = engine
-    path.write_text(json.dumps(value))
-    with pytest.raises(ValueError, match='backend must be cuda, amd or mps'):
-        load(path)
-    value['engine'] = {'detect_precision': 'fp8'}
-    path.write_text(json.dumps(value))
-    with pytest.raises(ValueError, match='detect_precision'):
+
+
+@pytest.mark.parametrize('options,error', [({'backend': 'auto'}, 'backend must be cuda, amd or mps'),
+                                          ({'detect_precision': 'fp8'}, 'detect_precision')])
+def test_invalid_detector_or_device_choice_is_rejected(tmp_path, options, error):
+    path = tmp_path / 'node.json'
+    path.write_text(json.dumps({'protocol_version': 3, 'control_url': 'https://example.test',
+        'node_id': 'test', 'node_token': 'fixture', 'resource_id': 'test', 'engine': options}))
+    with pytest.raises(ValueError, match=error):
         load(path)
 
 

@@ -6,6 +6,27 @@ import numpy as np
 import pytest
 
 from mtu_engine.assets import LOCK
+from mtu_engine.masks import merge_components
+
+
+def test_component_votes_match_strict_xor_improvement_across_bands():
+    rng = np.random.default_rng(71)
+    labels = rng.integers(0, 13, (530, 512), dtype=np.uint16)
+    pred = rng.integers(0, 256, labels.shape, dtype=np.uint8)
+    merged = (rng.random(labels.shape) > .7).astype(np.uint8) * 255
+    # Two fresh pixels on opposite sides of the band boundary make an exact tie.
+    labels[0, 0] = labels[-1, 0] = 13
+    merged[0, 0] = merged[-1, 0] = 0
+    pred[0, 0], pred[-1, 0] = 0, 255
+    expected = merged.copy()
+    eligible = np.arange(14) % 3 != 0
+    for label in np.flatnonzero(eligible):
+        candidate = expected.copy()
+        candidate[labels == label] = 255
+        if (candidate ^ pred).sum() < (expected ^ pred).sum():
+            expected = candidate
+    merge_components(merged, pred, labels, eligible)
+    np.testing.assert_array_equal(merged, expected)
 
 
 @pytest.mark.parametrize('dtype', [np.uint8, np.int16, np.float32])

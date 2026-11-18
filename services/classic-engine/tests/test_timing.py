@@ -5,7 +5,7 @@ from threading import Lock
 import pytest
 
 from classic_node import timing
-from classic_node.timing import OCR_FIELDS, WIRE_FIELDS, collect, record, stage, waiting_for
+from classic_node.timing import LOCAL_TIMINGS, OCR_FIELDS, WIRE_FIELDS, collect, record, safe_timings, stage, waiting_for
 
 
 def test_collector_isolates_pages_and_accumulates_ocr_workers():
@@ -89,13 +89,15 @@ def test_offline_collection_nests_without_changing_production_filter():
 
 
 def test_production_ocr_details_are_numeric_local_diagnostics_only():
-    from classic_node.document_runner import LOCAL_TIMINGS, safe_timings
     with collect(LOCAL_TIMINGS) as values:
         record('ocr_infer', .125)
         record('ocr_batches', 3)
         record('ocr_output_tokens', 42)
+        record('color_model_lines', 18)
+        record('analyze_color_gate', .019)
         record('unlisted', 1)
     assert OCR_FIELDS <= LOCAL_TIMINGS
+    assert values['color_model_lines'] == 18
     assert safe_timings(values | {'source': 'private text', 'ocr_decode': float('nan'),
                                  'ocr_transfer': -1, 'ocr_preprocess': 'private text'}) == values
     assert {key: value for key, value in values.items() if key in WIRE_FIELDS} == {}

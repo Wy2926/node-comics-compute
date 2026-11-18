@@ -1,6 +1,6 @@
 # 节点配置
 
-以 [node.example.json](../services/classic-engine/node.example.json) 和 `classic_node/config.py` 为字段及默认值来源。
+引擎目录的 `node.example.json` 和 `classic_node/config.py` 为字段及默认值来源。
 
 | 字段 | 作用 |
 | --- | --- |
@@ -15,7 +15,7 @@
 
 Windows 便携包使用 `data/node.json`；Linux 挂载 `node.local.json`。模型和字体从固定清单准备，运行时不下载。
 
-`engine.detect_precision` 仅控制 DBNet：`auto` 在 MPS 使用融合后的 FP16，在 AMD/CUDA 使用 FP32；可显式选择 `fp16` 或 `fp32`。AMD 实测 FP16 节省显存，但个别 OCR 和掩膜有变化，见[技术汇总](../services/classic-engine/docs/TECHNICAL_SUMMARY.md)。需要对照 CPU 双边滤波时，可在进程启动前设置 `OPENCV_OPENCL_RUNTIME=disabled`。
+`engine.detect_precision` 仅控制 DBNet：`auto` 在 MPS 使用融合后的 FP16，在 AMD/CUDA 使用 FP32；可显式选择 `fp16` 或 `fp32`。精度和批量可能改变 OCR、颜色或掩膜，选择依据见[流水线实测](PIPELINE.md#调优依据)。对照 CPU 双边滤波时，可在进程启动前设置 `OPENCV_OPENCL_RUNTIME=disabled`。
 
 ## 中心连接与调度
 
@@ -33,4 +33,9 @@ macOS 解析子进程保留 CPU 时间、输出文件大小、文件描述符和
 
 `state_dir/documents/` 必须持久化并有磁盘容量限制；源文件、规范化页、检查点和 ZIP 共用预算。节点不配置 LLM 或 R2 密钥，只使用中心签发的精确临时授权。
 
-[运行与恢复](../services/classic-engine/docs/NODE_OPERATIONS.md)
+## 运行与恢复
+
+- 用中心连接和新鲜心跳判断节点在线。停止先停领，再排空；同一节点身份不得在两台机器同时运行。
+- 重启通过持久化的领取编号和文件 `sync` 恢复。结果先写入 SQLite，断网后重传冻结结果，不重复请求翻译。只有确认终态后才清理文件工作区。
+- 升级前处理未完成任务与待确认交付，保留 `state_dir`、私有配置及额外模型；勿删除数据库或工作区强行切换。模型／上游锁变化时须配套准备新资产。
+- 运维日志位于 `state_dir/logs/node.log`，只记录阶段、错误码及数值指标。排查阶段耗时见[诊断与复测](PIPELINE.md#诊断与复测)。

@@ -5,7 +5,7 @@
 - [Windows 便携包](services/compute-node/README.md)：安装进度、双击升级
 - [Linux NVIDIA](services/compute-node/linux/README.md)
 - [Apple Silicon Mac 便携包](services/compute-node/macos/README.md)：双击安装、启动与更新
-- [引擎开发](services/classic-engine/README.md) · [配置与恢复](docs/NODE_CONFIGURATION.md)
+- [图像与文件流水线、性能实测](docs/PIPELINE.md) · [引擎开发](services/classic-engine/README.md) · [配置与恢复](docs/NODE_CONFIGURATION.md)
 - 文件解析包：`packages/document-files/`
 
 ## 检查

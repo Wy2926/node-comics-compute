@@ -146,8 +146,8 @@ def run(args):
                                   'completed': result['completed']}), flush=True)
             return
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-            # Warm every page shape and render worker before recording samples.
-            list(pool.map(page, paths))
+            # Keep first-shape stalls visible, separately from warmed repetitions.
+            report['first_pass'] = list(pool.map(page, paths))
             for repeat in range(args.repeats):
                 torch.cuda.reset_peak_memory_stats()
                 pages, resources = measured(lambda: list(pool.map(page, paths)))

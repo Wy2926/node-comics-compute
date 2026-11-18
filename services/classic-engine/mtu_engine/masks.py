@@ -7,6 +7,24 @@ import numpy as np
 from .backend import check_cancelled
 
 
+def merge_components(merged, pred, labels, eligible):
+    """Score disjoint CTD components together against the current merged mask."""
+    if not eligible.any():
+        return
+    gain = np.zeros(len(eligible), dtype=np.float64)
+    rows = max(1, 256 * 1024 // labels.shape[1])
+    for y in range(0, len(labels), rows):
+        band = slice(y, y + rows)
+        fresh = merged[band] == 0
+        # At a newly set pixel the XOR error falls from p to 255-p. Ties stay unset.
+        weights = 2 * pred[band][fresh].astype(np.int16) - 255
+        gain += np.bincount(labels[band][fresh], weights=weights, minlength=len(eligible))
+    keep = eligible & (gain > 0)
+    for y in range(0, len(labels), rows):
+        band = slice(y, y + rows)
+        merged[band][keep[labels[band]]] = 255
+
+
 def complete_mask(rgb, mask, textlines, dilation_offset=0, kernel_size=3):
     from manga_translator.detection.ctd_utils.textmask import REFINEMASK_ANNOTATION, refine_mask
     from manga_translator.detection.ctd_utils.utils.imgproc_utils import enlarge_window

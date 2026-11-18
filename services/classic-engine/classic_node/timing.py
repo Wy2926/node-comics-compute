@@ -1,6 +1,7 @@
 """Per-operation node diagnostics; never part of image or analysis identity."""
 from contextlib import contextmanager
 from contextvars import ContextVar
+import math
 from threading import Lock
 from time import perf_counter
 
@@ -16,11 +17,26 @@ WIRE_FIELDS = frozenset(('download', 'download_queue', 'analyze', 'analyze_queue
 
 OCR_FIELDS = frozenset(('analyze_detect', 'detect_filter', 'analyze_group', 'analyze_route', 'analyze_ocr',
     'analyze_colors', 'analyze_bubbles', 'analyze_bubble_mask', 'analyze_refine', 'analyze_checkpoint',
+    'analyze_color_gate', 'color_fast_regions', 'color_model_lines', 'color_batches', 'color_batch_max',
     'ocr_crop', 'ocr_preprocess', 'ocr_transfer', 'ocr_infer', 'ocr_decode', 'ocr_lock_wait', 'ocr_model_lock_wait',
     'ocr_paragraphs', 'ocr_batches', 'ocr_batch_max', 'ocr_output_tokens', 'ocr_truncated',
     'ocr_graph_batches', 'ocr_eager_batches', 'ocr_capture_wait', 'ocr_capture', 'ocr_graph_captures',
     'ocr_width_max', 'ocr_input_bytes_max', 'ocr_ooms', 'ocr_oom_retries',
     'ocr_cache_release', 'ocr_cache_releases'))
+
+LOCAL_TIMINGS = WIRE_FIELDS | OCR_FIELDS | frozenset((
+    'prepare', 'prepare_queue', 'package', 'package_queue', 'persist', 'persist_queue',
+    'deliver', 'deliver_queue', 'download_sign', 'download_sign_attempts',
+    'download_get', 'download_get_attempts', 'download_retries',
+    'upload_sign', 'upload_sign_attempts', 'upload_put', 'upload_put_attempts',
+    'upload_retries', 'complete', 'complete_attempts', 'complete_retries',
+    'inpaint_prepare', 'inpaint_solid_fill', 'inpaint_lama', 'inpaint_model',
+    'inpaint_blocks', 'inpaint_solid_regions', 'inpaint_graph_blocks', 'inpaint_eager_blocks'))
+
+
+def safe_timings(values):
+    return {name: round(value, 6) for name, value in values.items() if name in LOCAL_TIMINGS
+            and type(value) in (int, float) and math.isfinite(value) and value >= 0}
 
 
 @contextmanager

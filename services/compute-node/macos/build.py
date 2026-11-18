@@ -17,9 +17,9 @@ def build(output, version, uv):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     engine = REPO / 'services/classic-engine'
-    for name in ('classic_node', 'mtu_engine', 'tools', 'docs', 'environments/macos'):
+    for name in ('classic_node', 'mtu_engine', 'tools', 'environments/macos'):
         copy_sources(engine / name, output / 'source/classic-engine' / name)
-    for name in ('pyproject.toml', 'uv.lock', 'README.md', 'ENGINE.md', 'THIRD_PARTY.md', 'LICENSE'):
+    for name in ('pyproject.toml', 'uv.lock', 'README.md', 'node.example.json', 'THIRD_PARTY.md', 'LICENSE'):
         shutil.copy2(engine / name, output / 'source/classic-engine' / name)
     for name in ('run_node.py', 'build_support.py', 'assets.json'):
         target = output / 'source/compute-node' / name

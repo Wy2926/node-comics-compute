@@ -307,6 +307,9 @@ class Engine:
             self.detector.model.register_forward_pre_hook(check_cancelled)
             self.detector_settings = {'dtype': str(next(self.detector.model.parameters()).dtype),
                                       'opencl_filter': self.detector.opencl_filter}
+            if backend == 'amd':
+                from .color_positions import prepare_color_positions
+                prepare_color_positions(self.color_model.model)
             self.colors = Colors(self.color_model, color_batch_size)
             options = {'batch_size': ocr_batch_size, 'min_batch_size': ocr_min_batch_size,
                        'arena_extend_strategy': ocr_arena_extend_strategy, 'arena_shrinkage': ocr_arena_shrinkage}

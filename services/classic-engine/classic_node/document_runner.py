@@ -11,28 +11,15 @@ import time
 from .object_transfer import ObjectTransfer
 from .operations import report_page_failure
 from .protocol import ControlFailure, NodeFailure, MAX_CHECKPOINT_BYTES
-from .timing import OCR_FIELDS, WIRE_FIELDS
+from .timing import safe_timings
 from .config import LOCAL_DEFAULTS
 
 PREFIX = 'document-lease:'
 LOG = logging.getLogger('classic-node')
-LOCAL_TIMINGS = WIRE_FIELDS | OCR_FIELDS | frozenset((
-    'prepare', 'prepare_queue', 'package', 'package_queue', 'persist', 'persist_queue',
-    'deliver', 'deliver_queue', 'download_sign', 'download_sign_attempts',
-    'download_get', 'download_get_attempts', 'download_retries',
-    'upload_sign', 'upload_sign_attempts', 'upload_put', 'upload_put_attempts',
-    'upload_retries', 'complete', 'complete_attempts', 'complete_retries',
-    'inpaint_prepare', 'inpaint_solid_fill', 'inpaint_lama', 'inpaint_model',
-    'inpaint_blocks', 'inpaint_solid_regions', 'inpaint_graph_blocks', 'inpaint_eager_blocks'))
 
 
 def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
-
-
-def safe_timings(values):
-    return {name: round(value, 6) for name, value in values.items() if name in LOCAL_TIMINGS
-            and type(value) in (int, float) and math.isfinite(value) and value >= 0}
 
 
 class DocumentRunner:

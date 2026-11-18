@@ -17,6 +17,7 @@ from classic_node.protocol import digest
 from classic_node.runtime import Runtime
 from mtu_engine.engine import LANGUAGES
 from classic_node.timing import collect
+from tools.validate_render_output import reconstruct
 
 
 def run(args):
@@ -73,15 +74,7 @@ def run(args):
                     translated = {'analysis_hash': digest(analysis), 'language': args.language,
                                   'translations': translations[path.name], 'revision': digest(translations[path.name])}
                     packed = runtime.render(rgb, cleaned, analysis, translated, args.language, None, allow_tiles=True)
-                    if packed['result']['representation'] == 'original':
-                        rendered = Image.fromarray(rgb)
-                    elif packed['result']['representation'] == 'overlay-v1':
-                        rendered = Image.fromarray(rgb)
-                        with Image.open(BytesIO(packed['output_bytes'])) as patch:
-                            box = packed['result']['bbox']
-                            rendered.paste(patch, (box['x'], box['y']), patch)
-                    else:
-                        raise ValueError('Use the node client to reconstruct tiled validation pages')
+                    rendered = Image.fromarray(reconstruct(packed, rgb, None))
                     rendered.save(output / (path.stem + '.' + args.language + '.png'))
                 if rendered is not None and args.reference and (args.reference / path.name).is_file():
                     with Image.open(args.reference / path.name) as reference:

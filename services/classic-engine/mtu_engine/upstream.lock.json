@@ -50,6 +50,20 @@
           "after": "            box = self.unclip(points, unclip_ratio=self.unclip_ratio)\n            if len(box) != 1:\n                continue\n            box, sside = self.get_mini_boxes(box.reshape(-1, 1, 2))\n"
         }
       ],
+      "manga_translator/detection/ctd_utils/textmask.py": [
+        {
+          "before": "from .utils.imgproc_utils import enlarge_window, union_area\n",
+          "after": "from .utils.imgproc_utils import enlarge_window, union_area\nfrom mtu_engine.masks import merge_components\n"
+        },
+        {
+          "before": "        for label_index, stat, centroid in zip(range(num_labels), stats, centroids):\n            if label_index != 0: # skip background label\n                x, y, w, h, area = stat\n                if w * h < 3:\n                    continue\n                x1, y1, x2, y2 = x, y, x+w, y+h\n                label_local = labels[y1: y2, x1: x2]\n                label_coordinates = np.where(label_local==label_index)\n                tmp_merged = np.zeros_like(label_local, np.uint8)\n                tmp_merged[label_coordinates] = 255\n                tmp_merged = cv2.bitwise_or(mask_merged[y1: y2, x1: x2], tmp_merged)\n                xor_merged = cv2.bitwise_xor(tmp_merged, pred_mask[y1: y2, x1: x2]).sum()\n                xor_origin = cv2.bitwise_xor(mask_merged[y1: y2, x1: x2], pred_mask[y1: y2, x1: x2]).sum()\n                if xor_merged < xor_origin:\n                    mask_merged[y1: y2, x1: x2] = tmp_merged\n",
+          "after": "        eligible = stats[:, cv2.CC_STAT_WIDTH].astype(np.int64) * stats[:, cv2.CC_STAT_HEIGHT] >= 3\n        eligible[0] = False\n        merge_components(mask_merged, pred_mask, labels, eligible)\n"
+        },
+        {
+          "before": "    for label_index, stat, centroid in zip(range(num_labels), stats, centroids):\n        x, y, w, h, area = stat\n        if area < area_thresh:\n            x1, y1, x2, y2 = x, y, x+w, y+h\n            label_local = labels[y1: y2, x1: x2]\n            label_coordinates = np.where(label_local==label_index)\n            tmp_merged = np.zeros_like(label_local, np.uint8)\n            tmp_merged[label_coordinates] = 255\n            tmp_merged = cv2.bitwise_or(mask_merged[y1: y2, x1: x2], tmp_merged)\n            xor_merged = cv2.bitwise_xor(tmp_merged, pred_mask[y1: y2, x1: x2]).sum()\n            xor_origin = cv2.bitwise_xor(mask_merged[y1: y2, x1: x2], pred_mask[y1: y2, x1: x2]).sum()\n            if xor_merged < xor_origin:\n                mask_merged[y1: y2, x1: x2] = tmp_merged\n",
+          "after": "    merge_components(mask_merged, pred_mask, labels, stats[:, cv2.CC_STAT_AREA] < area_thresh)\n"
+        }
+      ],
       "manga_translator/detection/common.py": [
         {
           "before": "        rearrange_before_border = self._should_rearrange_before_border(\n            image,\n            detect_size,\n            det_rearrange_min_effective_short_side,\n        )\n        # Automatically add border if image too small (instead of simply resizing due to them more likely containing large fonts)\n        add_border = min(img_w, img_h) < minimum_image_size and not rearrange_before_border\n",

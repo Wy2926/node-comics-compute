@@ -114,13 +114,9 @@ def private_case(entry, directory, index, language):
                      analysis.get('input_hash'))
 
 
-def reconstruct(packed, original, alpha):
-    """Decode both wire representations and preserve the source alpha exactly."""
-    rgb = original.copy()
-    result, data = packed['result'], packed['output_bytes']
-    patches = []
+def overlay_patches(result, data):
     if result['representation'] == 'overlay-v1':
-        patches.append((result['bbox'], data))
+        yield result['bbox'], data
     elif result['representation'] == 'overlay-tiles-v1':
         if data[:8] != b'NCOT0001':
             raise AssertionError('Invalid tiles header')
@@ -129,13 +125,18 @@ def reconstruct(packed, original, alpha):
         offset = 12 + length
         for tile in manifest['tiles']:
             body = data[offset:offset + tile['byte_size']]
-            assert hashlib.sha256(body).hexdigest() == tile['sha256']
-            patches.append((tile, body))
+            assert len(body) == tile['byte_size'] and hashlib.sha256(body).hexdigest() == tile['sha256']
+            yield tile, body
             offset += tile['byte_size']
         assert offset == len(data)
     elif result['representation'] != 'original' or data is not None:
         raise AssertionError('Unknown output representation')
-    for box, body in patches:
+
+
+def reconstruct(packed, original, alpha):
+    """Decode both wire representations and preserve the source alpha exactly."""
+    rgb = original.copy()
+    for box, body in overlay_patches(packed['result'], packed['output_bytes']):
         with Image.open(BytesIO(body)) as image:
             patch = np.array(image.convert('RGBA'))
         selected = patch[..., 3] == 255

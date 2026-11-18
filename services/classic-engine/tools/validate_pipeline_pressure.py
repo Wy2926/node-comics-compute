@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 from io import BytesIO
 import json
-import struct
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Lock
@@ -24,6 +23,7 @@ from classic_node.journal import Journal
 from classic_node.protocol import digest, pack_result, png64
 from classic_node.timing import collect
 from mtu_engine.fonts import DEFAULT_FONT_IDS
+from tools.validate_render_output import overlay_patches
 
 
 def fixture_image():
@@ -220,23 +220,12 @@ class SimulatedTransport:
             check()
             assert len(data) == info['byte_size']
             assert hashlib.sha256(data).hexdigest() == info['sha256']
-            if body['result']['representation'] == 'overlay-tiles-v1':
-                assert data[:8] == b'NCOT0001'
-                length = struct.unpack('<I', data[8:12])[0]
-                manifest = json.loads(data[12:12 + length])
-                offset = 12 + length
-                for tile in manifest['tiles']:
-                    patch = data[offset:offset + tile['byte_size']]
-                    assert hashlib.sha256(patch).hexdigest() == tile['sha256']
-                    with Image.open(BytesIO(patch)) as image:
-                        image.load()
-                        assert image.size == (tile['width'], tile['height'])
-                    offset += len(patch)
-                assert offset == len(data)
-            else:
-                with Image.open(BytesIO(data)) as image:
+            for box, patch in overlay_patches(body['result'], data):
+                with Image.open(BytesIO(patch)) as image:
                     image.load()
-                    assert image.size == (info['width'], info['height'])
+                    assert image.size == (box['width'], box['height'])
+                    if body['result']['representation'] == 'overlay-v1':
+                        assert image.size == (info['width'], info['height'])
         self.gate('complete', key)
         receipt = {'status': 'terminal', 'lease_id': key}
         with self.lock:

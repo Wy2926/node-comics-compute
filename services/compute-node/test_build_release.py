@@ -169,6 +169,9 @@ def test_packaged_sources_resolve_local_parser_and_operator_docs(tmp_path, monke
     readme = (builder.output / 'README.md').read_text(encoding='utf-8')
     assert '(docs/NODE_CONFIGURATION.md)' in readme
     assert (builder.output / 'docs/NODE_CONFIGURATION.md').is_file()
+    engine = builder.output / 'source/classic-engine'
+    assert (engine / '../../docs/PIPELINE.md').is_file()
+    assert (engine / 'node.example.json').is_file()
 
 
 def test_first_install_runtime_has_no_copied_application_code(tmp_path, monkeypatch):
@@ -205,9 +208,9 @@ def test_build_only_emits_portable_package(tmp_path, monkeypatch):
     import build_release
     builder = Builder.__new__(Builder)
     builder.output, builder.version, builder.go = tmp_path / 'NodeComicsNode', '0.3.0', 'go'
-    builder.env, builder.tool_envs = {}, {'packaging': 'pytest-python'}
+    builder.env = {}
     builder.prepare_go = lambda: None
-    builder.environment = lambda name: None
+    builder.environment = lambda name: 'pytest-python'
     builder.package_sources = lambda: None
     for name in ('prepare_models', 'package_runtime', 'package_fonts'):
         monkeypatch.setattr(builder, name, lambda: pytest.fail('small-package build prepared a GPU environment'))

@@ -1,60 +1,22 @@
 # 图像引擎
 
-Python 3.12 + uv，默认 CUDA 12.6。在本目录执行：
+Python 3.12 + uv。在本目录按 GPU 选择一个环境：
+
+| 后端 | 安装 | 后续命令前缀 |
+| --- | --- | --- |
+| NVIDIA CUDA 12.6 | `uv sync --locked --extra test` | `uv run` |
+| Windows AMD | `uv sync --project environments/amd --locked --group test` | `uv run --project environments/amd` |
+| Apple Silicon，macOS 14+ | `uv sync --project environments/macos --locked --group test` | `uv run --project environments/macos` |
+
+复制 [node.example.json](node.example.json) 为私有 `node.local.json`，设置身份、模型路径和 `engine.backend`（`cuda`、`amd` 或 `mps`）。以下以 CUDA 为例：
 
 ```sh
-uv sync --locked --extra test
 uv run python -m tools.prepare_mtu
 uv run python -m classic_node check --config node.local.json
 uv run python -m classic_node run --config node.local.json
-uv run pytest -q
+uv run python -m pytest -q
 ```
 
-先复制 `node.example.json` 为私有 `node.local.json`。`check` 验证资产与预热，`run` 才接单；运行时不下载资产。
+`check` 校验资产并预热；`run` 才接单。使用 Hayai 时，运行 `python -m tools.prepare_hayai --source <下载目录> --output <模型目录>`，配置 `engine.ocr_backend=hayai`、`engine.ocr_model` 指向该目录。仅准备 Hayai 的公共资产时给 `prepare_mtu` 加 `--ocr-backend hayai`。更新上游补丁时，在独立目录按新锁重新准备资产。
 
-AMD 使用 `uv sync --project environments/amd --locked --group test`。各环境独立，显式选择 `engine.backend`，不自动降级或混装。
-
-长图检测、CTD 细化和输出差分共用同一实现。普通页在 OpenCV 能匹配推理 GPU 且像素预算允许时使用 OpenCL 双边滤波。`engine.detect_precision` 支持 `auto`、`fp32`、`fp16`；FP16 先在 FP32 融合卷积和归一化，概率图恢复 FP32。AMD/CUDA 默认 FP32，MPS 默认 FP16。RX 6900 XT 实测、Mac 对照和画质差异见[技术汇总](docs/TECHNICAL_SUMMARY.md)。
-
-## Apple Silicon Mac
-
-原生 arm64、macOS 14 或更新版本。在本目录执行：
-
-```sh
-uv sync --project environments/macos --locked --group test
-uv run --project environments/macos --locked python -m tools.prepare_mtu
-```
-
-私有 `node.local.json` 设置 `engine.backend: "mps"`、`engine.gpu: 0`，模型和字体路径沿用示例。检测、取色、气泡和 LaMa 使用 MPS；经典 OCR 的日文模型使用 MPS，PP-OCR 使用 CPU ONNX。MPS 分析／抹字一次派发一页，多页并发仍可重叠下载、嵌字和交付；CPU 预算按逻辑核心数分配，长图编码可借用渲染池空闲额度。
-
-```sh
-uv run --project environments/macos --locked python -m classic_node check --config node.local.json
-uv run --project environments/macos --locked python -m classic_node run --config node.local.json
-```
-
-使用 Hayai 时，先运行 `tools.prepare_hayai --source <下载目录> --output <模型目录>`，再设置 `engine.ocr_backend: "hayai"`、`engine.ocr_model` 为该模型目录、`engine.ocr_batch_size: 8`。已有模型可继续使用；路径相对配置文件解析。仅准备 Hayai 公共资产时可给 `prepare_mtu` 加 `--ocr-backend hayai`。
-
-升级遵循[恢复规则](docs/NODE_OPERATIONS.md)。上游补丁变化时，在独立目录按新锁文件重新准备资产，再停机更新源码和资产清单；保留私有配置与恢复数据。
-
-Mac 实际模型回归（资产目录需包含经典 OCR 模型）：
-
-```sh
-MTU_TEST_BACKEND=mps MTU_TEST_ASSETS=/absolute/path/assets \
-  uv run --project environments/macos --locked python -m pytest -q \
-  tests/test_render_glyph_cache.py tests/test_mtu_integration.py \
-  -k 'outline or native_rearrange or streamed_detection or rectangular_detection or detection_candidate or detector_fusion or detector_inputs or long_page_cross_seam or ctd_'
-```
-
-## 验证
-
-`tools.prepare_hayai` 准备可选 Hayai OCR；`tools.validate_mtu`、`tools.benchmark_pages`、`tools.benchmark_ocr` 用于离线效果和性能验证，参数见 `--help`。样本与输出由调用者指定。
-
-[OCR 耗时与并发对比](docs/OCR_PERFORMANCE.md)：阶段耗时、模型锁等待、批量、吞吐与识别摘要。
-
-[抹字耗时](docs/INPAINT_PERFORMANCE.md)：LaMa 调用、GPU 等待、AMD 图重放与预热约束。
-
-[排版嵌字验证](docs/RENDER_PERFORMANCE.md)：离线 Qt、双进程耗时、结果摘要与字体轮廓缓存边界。
-
-真实模型测试设置 `MTU_TEST_ASSETS`；默认测试不证明 GPU 或实图效果。中心联调在后端仓库显式设置 `COMICS_COMPUTE_ROOT`。
-
-[引擎约束](ENGINE.md) · [配置](../../docs/NODE_CONFIGURATION.md) · [第三方来源](THIRD_PARTY.md)
+[流水线、实测与离线验证](../../docs/PIPELINE.md) · [配置与恢复](../../docs/NODE_CONFIGURATION.md) · [第三方来源与修改](THIRD_PARTY.md)

@@ -32,7 +32,6 @@ class Builder:
             raise RuntimeError('uv version mismatch')
         self.downloads = self.work / 'downloads'
         self.assets = self.session / 'assets'
-        self.tool_envs = {}
 
     def requirements(self, project, target):
         run([self.uv, 'export', '--project', project, '--frozen', '--no-dev', '--no-emit-project',
@@ -72,7 +71,6 @@ class Builder:
         self.requirements(ROOT / 'build-deps' / name, requirements)
         run([self.uv, 'pip', 'install', '--python', python, '--require-hashes', '--only-binary', ':all:',
              '-r', requirements], cwd=ROOT, env=self.env)
-        self.tool_envs[name] = python
         return python
 
     def prepare_go(self):
@@ -141,13 +139,13 @@ class Builder:
         copy_sources(ROOT / 'build-deps', host / 'build-deps')
         copy_sources(ROOT / 'tests', host / 'tests')
         engine = source / 'classic-engine'
-        for directory in ('classic_node', 'mtu_engine', 'tools', 'docs'):
+        for directory in ('classic_node', 'mtu_engine', 'tools'):
             copy_sources(ENGINE / directory, engine / directory)
         amd = engine / 'environments/amd'
         amd.mkdir(parents=True)
         for name in ('pyproject.toml', 'uv.lock'):
             shutil.copy2(ENGINE / 'environments/amd' / name, amd / name)
-        for name in ('LICENSE', 'THIRD_PARTY.md', 'uv.lock', 'pyproject.toml', 'README.md', 'ENGINE.md'):
+        for name in ('LICENSE', 'THIRD_PARTY.md', 'uv.lock', 'pyproject.toml', 'README.md', 'node.example.json'):
             shutil.copy2(ENGINE / name, engine / name)
         (self.output / 'licenses').mkdir(exist_ok=True)
         for name in ('sys', 'term'):
@@ -163,13 +161,13 @@ class Builder:
             raise ValueError('Output must be a new directory; never overwrite a configured node')
         self.output.mkdir(parents=True)
         self.prepare_go()
-        self.environment('packaging')
+        packaging_python = self.environment('packaging')
         event('native_host')
         run([self.go, 'build', '-trimpath', '-buildvcs=false', '-ldflags', f'-s -w -X main.version={self.version}',
              '-o', self.output / 'node.exe', '.'], cwd=ROOT, env=self.env)
         run([self.go, 'test', '.'], cwd=ROOT, env=self.env)
         run([self.go, 'vet', '.'], cwd=ROOT, env=self.env)
-        run([self.tool_envs['packaging'], '-B', '-m', 'pytest', ROOT / 'test_build_release.py',
+        run([packaging_python, '-B', '-m', 'pytest', ROOT / 'test_build_release.py',
              ROOT / 'test_portable.py', ROOT / 'test_run_node.py', '-q'], cwd=ROOT, env=self.env)
         self.package_sources()
         for name in ('Start.cmd', 'Stop.cmd', 'Status.cmd', 'Update.cmd', 'Enable-Autostart.cmd', 'Disable-Autostart.cmd'):

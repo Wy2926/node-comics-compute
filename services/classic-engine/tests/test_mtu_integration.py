@@ -848,6 +848,28 @@ def test_ctd_refinement_keeps_outlines_edges_and_excludes_nearby_text(assets, tu
         np.testing.assert_array_equal(actual, expected)
 
 
+def test_ctd_batched_component_selection_and_fill_match_native(assets):
+    import inspect
+    from mtu_engine.assets import LOCK, activate
+    activate(assets[0])
+    from manga_translator.detection.ctd_utils import textmask
+    source = inspect.getsource(textmask.merge_mask_list)
+    for patch in LOCK['source']['patches']['manga_translator/detection/ctd_utils/textmask.py'][1:]:
+        assert source.count(patch['after']) == 1
+        source = source.replace(patch['after'], patch['before'])
+    scope = dict(vars(textmask))
+    exec(source, scope)
+    native = scope['merge_mask_list']
+    rng = np.random.default_rng(34)
+    for probability in (0, .15, .55, 1):
+        candidates = [[(rng.random((51, 79)) < probability).astype(np.uint8) * 255, k] for k in (2, 0, 1)]
+        pred = rng.integers(0, 256, candidates[0][0].shape, dtype=np.uint8)
+        for threshold, mode in ((0, textmask.REFINEMASK_ANNOTATION), (30, textmask.REFINEMASK_INPAINT)):
+            args = dict(pred_thresh=threshold, refine_mode=mode)
+            np.testing.assert_array_equal(textmask.merge_mask_list(candidates.copy(), pred, **args),
+                                          native(candidates.copy(), pred, **args))
+
+
 def test_ctd_refinement_cancels_between_lines_and_resumes(assets, monkeypatch):
     import sys
     from mtu_engine.assets import activate
@@ -1073,16 +1095,12 @@ def test_qt_mask_optimization_preserves_pixels_and_layout(assets, offline, monke
     assert _reference_masks.get() is None
 
 
-@pytest.mark.parametrize('enclosed', [False, True])
-@pytest.mark.parametrize('matching_background', [False, True])
-@pytest.mark.parametrize('adjust', [False, True, None])
-@pytest.mark.parametrize('fg,bg,stroke', [
-    ([0, 0, 0], [10, 10, 10], [255, 255, 255]),
-    ([255, 255, 255], [240, 240, 240], [0, 0, 0]),
-    ([235, 35, 60], [80, 80, 80], [0, 0, 0]),
-    ([245, 245, 245], [20, 40, 130], [20, 40, 130]),
-    ([210, 40, 60], [205, 38, 58], [255, 255, 255]),
-    ([0, 0, 0], [90, 90, 90], [90, 90, 90]),
+# Exact luminance thresholds are covered without Qt in test_colors.py.
+@pytest.mark.parametrize('enclosed,matching_background,adjust,fg,bg,stroke', [
+    (False, True, None, [0, 0, 0], [10, 10, 10], [255, 255, 255]),
+    (True, True, True, [255, 255, 255], [240, 240, 240], [0, 0, 0]),
+    (True, False, False, [245, 245, 245], [20, 40, 130], [20, 40, 130]),
+    (False, False, True, [210, 40, 60], [205, 38, 58], [255, 255, 255]),
 ])
 def test_qt_guards_stroke_contrast_after_checkpoint_restore(
         assets, offline, enclosed, matching_background, adjust, fg, bg, stroke):
@@ -1180,6 +1198,33 @@ def test_native_monochrome_color_gate_without_bubble(assets, style, skip):
     assert block.get_font_colors() == (((0., 0., 0.), (255., 255., 255.)) if skip else
                                       ((90., 60., 30.), (200., 210., 220.)))
     assert block.texts == ['PLAIN TEXT'] and len(block.lines) == 1
+
+
+def test_color_position_cache_matches_native_prefixes_and_keeps_no_image(assets):
+    import torch
+    from mtu_engine.assets import activate
+    from mtu_engine.color_positions import prepare_color_positions
+    activate(assets[0])
+    from manga_translator.ocr.xpos_relative_position import XPOS
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    layers = torch.nn.ModuleList(torch.nn.Module() for _ in range(3))
+    for layer, base in zip(layers, (320, 320, 512)):
+        layer.xpos = XPOS(80, base).to(device)
+    native = layers[0].xpos
+    with torch.inference_mode():
+        prepare_color_positions(layers)
+        cached = layers[0].xpos
+        assert cached is layers[1].xpos
+        assert type(layers[2].xpos) is XPOS
+        for length, offset, down in [(1, 0, False), (1, 2, False), (7, 4, True),
+                                     (64, 0, True), (1025, 0, True)]:
+            for batch in (1, 5):
+                x = torch.randn(batch, length, 80, device=device)
+                torch.testing.assert_close(cached(x, offset, down), native(x, offset, down), rtol=0, atol=0)
+        assert cached.factors.cache_info().hits == 4  # Batch contents aren't cache keys; oversized shapes bypass.
+        for offset in range(40):
+            cached(x[:, :1], offset, False)
+        assert cached.factors.cache_info().currsize == 32
 
 
 def test_native_48px_colors_reuse_ocr_and_keep_failure_fallback_offline(assets, offline, monkeypatch):

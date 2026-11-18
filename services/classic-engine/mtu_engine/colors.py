@@ -228,7 +228,8 @@ class Colors:
         # Bound both crops and GPU batches, including on very long pages. Native
         # crops, preprocessing and per-character aggregation stay intact. Only
         # one line contributes colors; full OCR/erasure/layout geometry is retained.
-        for batch in chunks(predicted, self.batch_size):
+        # MTU splits at 16. Keep the request's token rows aligned with each native call.
+        for batch in chunks(predicted, min(self.batch_size, 16)):
             check_cancelled()
             crops, owners, tokens = [], [], []
             for region in batch:

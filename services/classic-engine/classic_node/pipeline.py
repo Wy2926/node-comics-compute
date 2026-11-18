@@ -10,9 +10,8 @@ from mtu_engine.backend import cancellation
 
 from .protocol import MAX_CHECKPOINT_BYTES, ControlFailure, NodeFailure, digest
 from .operations import LOG, report_page_failure
-from .timing import WIRE_FIELDS, collect
+from .timing import LOCAL_TIMINGS, WIRE_FIELDS, collect, safe_timings
 from .config import LOCAL_DEFAULTS
-from .document_runner import LOCAL_TIMINGS, safe_timings
 
 
 class Pipeline:

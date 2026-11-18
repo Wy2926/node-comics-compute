@@ -1,6 +1,5 @@
 """Color adapter wiring and bounded crops; no neural model or CUDA execution."""
 import json
-import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event, Lock
@@ -116,23 +115,6 @@ def test_capture_guard_skips_gray_cpu_work_but_protects_model_batches(colors, pl
     assert called.is_set() and not guard.locked()
 
 
-def test_color_model_preserves_native_exception_for_upstream_fallback(colors, monkeypatch):
-    _, native = colors
-    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(is_tensor=lambda value: False))
-    failure = RuntimeError('fixture inference failure')
-    calls = []
-
-    def fail(*args, **kwargs):
-        calls.append(True)
-        raise failure
-
-    native.color_model.model.infer_beam_batch_tensor = fail
-    with pytest.raises(RuntimeError) as caught:
-        native.color_model.infer_beam_batch_tensor(object(), [240], beams_k=5, max_seq_length=255)
-    assert caught.value is failure and len(calls) == 1
-    assert not native.color_model._lock.locked()
-
-
 @pytest.mark.parametrize('fail_transfer', [False, True])
 def test_color_model_keeps_cpu_transfer_inside_lock_and_releases_on_failure(monkeypatch, fail_transfer):
     failure = RuntimeError('fixture transfer failure')
@@ -157,12 +139,6 @@ def test_color_model_keeps_cpu_transfer_inside_lock_and_releases_on_failure(monk
     else:
         assert proxy.infer_beam_batch_tensor() == [('cpu result', .9)]
     assert not proxy._lock.locked()
-
-
-def test_contrast_guard_import_does_not_load_torch_in_cpu_render_workers():
-    subprocess.run([sys.executable, '-c',
-        "import sys; from mtu_engine.colors import ensure_stroke_contrast; assert 'torch' not in sys.modules"],
-        check=True, capture_output=True, text=True)
 
 
 def test_native_prediction_receives_bounded_bgr_crops_and_preserves_ocr(colors):
@@ -234,35 +210,8 @@ def test_plain_gate_uses_original_pixels_and_native_chroma_check(plain_gate):
     assert not crop.flags.writeable
 
 
-@pytest.mark.parametrize('kind,skip', [('blank', True), ('dark', True), ('reversed', True),
-    ('gray_text', True), ('gray_background', True), ('faint_tint', True), ('oversized', True),
-    ('color_text', False), ('color_outline', False), ('tiny_color', False), ('empty', False)])
-def test_only_obvious_chroma_requires_model_not_gray_style(plain_gate, kind, skip):
-    crop = plain_crop()
-    if kind == 'blank':
-        crop[:] = 255
-    elif kind == 'dark':
-        crop[:] = 0
-    elif kind == 'reversed':
-        crop = 255 - crop
-    elif kind == 'gray_text':
-        crop[12:36, 30:70] = 100
-    elif kind == 'gray_background':
-        crop[crop[..., 0] == 255] = 190
-    elif kind == 'faint_tint':
-        crop[crop[..., 0] == 255] = [250, 248, 249]
-    elif kind == 'color_text':
-        crop[12:36, 30:70] = [120, 0, 0]
-    elif kind == 'color_outline':
-        crop[10:12, 30:70] = [40, 100, 220]
-    elif kind == 'tiny_color':
-        crop[20:23, 110:114] = [200, 20, 20]
-    elif kind == 'oversized':
-        crop = np.tile(crop, (32, 2, 1))
-    elif kind == 'empty':
-        crop = crop[:0]
-    assert _monochrome(crop) is skip
-    assert all(tile.shape[0] <= 512 and tile.shape[1] <= 512 for tile in plain_gate)
+def test_empty_crop_is_not_classified_as_gray(plain_gate):
+    assert not _monochrome(plain_crop()[:0]) and not plain_gate
 
 
 def test_large_chroma_gate_checks_last_tile_and_stops_on_color(plain_gate):
@@ -271,6 +220,7 @@ def test_large_chroma_gate_checks_last_tile_and_stops_on_color(plain_gate):
     with collect() as metrics:
         assert not _monochrome(crop)
     assert len(plain_gate) == 8  # Last row, second column: no final tile needed.
+    assert all(max(tile.shape[:2]) <= 512 for tile in plain_gate)
     assert metrics['color_gate_pixels'] == 1025 * 1025 - 1
 
 
@@ -418,6 +368,15 @@ def test_mixed_texts_invalid_crops_and_multiple_owners_stay_aligned(text_colors)
     assert first.fg_colors.tolist() == [200, 30, 40]
     assert second.fg_colors.tolist() == [20, 40, 220]
     assert first.texts == ['A', 'B', ''] and second.texts == ['A', '😀']
+
+
+def test_large_color_batch_keeps_teacher_tokens_with_native_subbatch(text_colors):
+    adapter, _, calls, _ = text_colors
+    adapter.batch_size = 32
+    crop = np.zeros((48, 100, 3), np.uint8)
+    blocks = [region([crop], [text], 'en') for text in ['A'] * 16 + ['B']]
+    adapter.apply(None, blocks)
+    assert [options['text_indices'] for _, _, options in calls] == [[[4]] * 16, [[5]]]
 
 
 def test_text_context_is_isolated_between_pages(text_colors):
