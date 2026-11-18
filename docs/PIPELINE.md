@@ -16,7 +16,7 @@
 
 - 下载、分析／抹字、渲染、落盘和交付分别有界。页面、原生掩膜和渲染进程传输缓冲共用 `resident_bytes`。可选参考掩膜每页最多 64 MiB；内存不足不增加并发。文件拆页及 ZIP 另受工作区磁盘预算约束。
 - CUDA／AMD 以 `local_pages` 限制计算并发；MPS 一次派发一项分析／抹字，I/O 和渲染可重叠。`engine.threads`、渲染进程与页面数要一起评估；并发提高吞吐不等于降低单页延迟。
-- AMD Hayai 使用原生 HIP Graph：可用显存至少 8 GiB 时最多保留 8 组状态，否则 4 组。仅捕获与其他 GPU 模型调用互斥；捕获失败退回原生 eager。AMD 取色复用位置系数，LaMa 在启动期准备固定形状的图。缓存不跨页复用识别结果。
+- AMD Hayai 使用原生 HIP Graph：模型加载时空闲显存不足 8 GiB 保留 4 组状态；足够时保留 8 组，OCR 批量为 8 时上限为 9。仅捕获与其他 GPU 模型调用互斥；捕获失败退回原生 eager。AMD 取色复用位置系数，LaMa 在启动期准备固定形状的图。缓存不跨页复用识别结果。
 
 ## 调优依据
 
@@ -33,13 +33,23 @@ GPU 忙碌率取 Windows 进程最忙引擎。空 MIOpen 缓存、完成节点�
 
 这类长图建议 `engine.detect_batch_size=1`、`engine.ocr_batch_size=8`、`engine.color_batch_size=16`、`engine.threads=4`。增加至 8 或 16 线程未缩短单页延迟；1、2、3 路同图吞吐分别为 0.212、0.251、0.259 页/s。普通短页应另测：21 个混合输入的调度对照中，2 路计算、OCR 批量 4 更合适。批量和 FP16 都可能改变识别或像素，参数并非通用默认值。Apple Silicon 31 页实测融合 FP16 比 FP32 图像阶段少耗时约 12%，OCR 一致但像素不逐点等价；以上均不是线上翻译耗时。
 
+### 高清普通页
+
+同机将 20 张 `939×1350` 日漫页放大至 `1408×2025`，固定译文，检测／OCR／取色批量 `1/8/16`。普通页在匹配的 OpenCL GPU 上按 `detect_size²` 像素预算滤波，不再依赖检测批量；超限时分条，内边缘各保留 8 行邻域。
+
+- **滤波**：与 `d235f1e` 批量 1 相比，单路预滤波由 234.0 降到 6.27 ms/页，整页分析由 546.2 降到 311.5 ms/页。分条与旧版整页 GPU 滤波的分析、掩膜及像素一致；与旧版 CPU 滤波相比，19 页文字、18 页行框、16 页成品像素一致，其中一页右下角少检一处浅色小字。
+- **渲染**：复用同页、同字体参数下的文字尺寸和竖排进量，普通页用快速无损 WebP。单路渲染 20 页由 6.61 降到 4.97 s；与仅优化滤波时相比，成品像素一致，覆盖层字节总量增加 2.0%。另测中、日、英、阿 16 组像素一致，`720×20000` 长图的分块输出字节一致。
+- **按页 OCR**：这组图使用 9 种 HIP Graph 形状。显存充足时将上限从 8 调至 9，交错对照中 20 页由 7.64 降到 7.53 s；最终配置四轮热测未重复捕获，99 段文字及成品字节一致。
+
+专机连续处理这类页可用 `local_pages=3`、`render_workers=2`、`engine.threads=4`、4 GiB 页面预算。真实本地调度、模拟中心的四轮热测中，`max_leases` 从 4 增到 8，20 页由 7.52 降到 **7.16 s（2.79 页/s）**，GPU 最忙引擎均值由 47.8% 升到 51.7%；领单到本地结果就绪的单页中位数由 1.32 增至 2.30 s。重吞吐选 8，重单页响应选 4。
+
 ## 诊断与复测
 
 `state_dir/logs/node.log` 的 `event=page_stage` 和 `event=document_page_stage` 记录本地阶段秒数。先分清排队（`*_queue`）、等模型锁（`*_lock_wait`）和计算，再看以下字段。嵌套耗时不能相加，并发页耗时之和不等于墙钟时间。
 
 | 排查项 | 主要字段 |
 | --- | --- |
-| 检测／OCR | `analyze_detect`、`detect_filter`、`analyze_group`、`analyze_route`、`analyze_ocr`；Hayai 细分 `ocr_preprocess`、`ocr_infer`、`ocr_decode`、`ocr_capture` |
+| 检测／OCR | `analyze_detect`、`detect_filter`；`detect_filter_opencl_chunks` 和 `detect_filter_cpu_pages` 分别计 GPU 条带和 CPU 页数；另有 `analyze_group`、`analyze_route`、`analyze_ocr`、`ocr_preprocess`、`ocr_infer`、`ocr_decode`、`ocr_capture` |
 | 分析后处理 | `analyze_colors`、`analyze_color_gate`、`color_model_lines`、`analyze_bubbles`、`analyze_bubble_mask`、`analyze_refine`、`analyze_checkpoint` |
 | 抹字与排版 | `inpaint_solid_fill`、`inpaint_blocks`、`inpaint_lama`、`inpaint_model`；`render_layout`、`render_diff`、`render_encode`、`persist` |
 

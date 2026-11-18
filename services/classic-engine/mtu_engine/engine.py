@@ -17,6 +17,7 @@ from .backend import check_cancelled, device_context, validate_backend
 from .colors import ensure_stroke_contrast
 from .fonts import FONT_CHOICES, font_filename
 from .layout import associate_bubbles, fit_bubbles
+from .layout_metrics import page_measurements
 from .page_cache import page_images
 
 LANGUAGES = {'zh-Hans': 'CHS', 'zh-Hant': 'CHT', 'ja': 'JPN', 'ko': 'KOR', 'en': 'ENG',
@@ -140,7 +141,7 @@ class Renderer:
             mask_cache_bytes = cleaned.shape[0] * cleaned.shape[1] * len(blocks)
         # MTU's font selection is thread-local; its registry/hyphenator caches
         # are shared. Bound the whole upstream call until concurrency is proven.
-        with self._lock:
+        with self._lock, page_measurements():
             if bubble_mask is not None and not bubble_prepared:
                 with stage('render_bubble_prepare'):
                     associate_bubbles(blocks, bubble_mask)

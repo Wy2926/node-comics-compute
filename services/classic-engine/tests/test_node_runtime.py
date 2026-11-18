@@ -1,7 +1,6 @@
 """Lossless sparse RGB replacement pixels and canonical input validation."""
 import hashlib
 from io import BytesIO
-import json
 import struct
 import zlib
 from types import SimpleNamespace
@@ -73,6 +72,7 @@ def test_render_crops_all_inpaint_and_lettering_changes_and_preserves_source_alp
         assert patch.format == 'WEBP' and patch.size == (4, 5)
         rgba = np.asarray(patch.convert('RGBA'))
     assert set(np.unique(rgba[..., 3])) == {0, 255}
+    assert not rgba[rgba[..., 3] == 0, :3].any()  # Transparent overlay pixels must not reveal source RGB.
     assert tuple(rgba[0, 0]) == (31, 45, 60, 255)
     assert tuple(rgba[4, 3]) == (100, 101, 102, 255)
     # Integer 1:1 source-atop with binary source alpha replaces RGB only.
@@ -372,6 +372,7 @@ def test_decode_uses_center_metadata_without_independent_pixel_or_edge_limit(siz
 
 
 def test_tiles_partition_final_glyph_pixels_across_boundaries_without_relayout():
+    from tools.validate_render_output import overlay_patches, reconstruct
     rgb = np.full((20000, 64, 3), 240, dtype=np.uint8)
     final = Image.fromarray(rgb)
     drawing = ImageDraw.Draw(final)
@@ -383,22 +384,21 @@ def test_tiles_partition_final_glyph_pixels_across_boundaries_without_relayout()
     with pytest.raises(NodeFailure, match='CLASSIC_OUTPUT_TOO_LARGE'):
         pack_result(np.asarray(final), rgb, None, 'test', analysis, translated)
     packed = pack_result(np.asarray(final), rgb, None, 'test', analysis, translated, allow_tiles=True)
-    data = packed['output_bytes']
-    assert packed['result']['representation'] == 'overlay-tiles-v1' and data[:8] == b'NCOT0001'
-    length = struct.unpack('<I', data[8:12])[0]
-    manifest = json.loads(data[12:12 + length])
-    restored, offset = rgb.copy(), 12 + length
-    for tile in manifest['tiles']:
-        body = data[offset:offset + tile['byte_size']]
-        offset += tile['byte_size']
-        assert hashlib.sha256(body).hexdigest() == tile['sha256']
-        assert tile['width'] <= 2048 and tile['height'] <= 4096
-        patch = np.asarray(Image.open(BytesIO(body)).convert('RGBA'))
+    assert packed['result']['representation'] == 'overlay-tiles-v1'
+    tiles = list(overlay_patches(packed['result'], packed['output_bytes']))
+    for tile, body in tiles:
         x, y, w, h = (tile[key] for key in ('x', 'y', 'width', 'height'))
-        mask = patch[..., 3] == 255
-        restored[y:y + h, x:x + w][mask] = patch[..., :3][mask]
-    assert offset == len(data) and np.array_equal(restored, np.asarray(final))
-    assert any(tile['y'] < 4096 for tile in manifest['tiles']) and any(4096 <= tile['y'] < 4200 for tile in manifest['tiles'])
+        assert 0 <= x < x + w <= rgb.shape[1] and 0 <= y < y + h <= rgb.shape[0]
+        assert w <= 2048 and h <= 4096
+        crop = final.crop((x, y, x + w, y + h))
+        changed = (np.asarray(crop) != rgb[y:y + h, x:x + w]).any(axis=2)
+        expected = Image.new('RGBA', crop.size)
+        expected.paste(crop, mask=Image.fromarray(changed))
+        stream = BytesIO()
+        expected.save(stream, format='WEBP', lossless=True, method=4, quality=10, exact=False)
+        assert body == stream.getvalue()  # Tiled output retains the original compression.
+    np.testing.assert_array_equal(reconstruct(packed, rgb, None), np.asarray(final))
+    assert any(t['y'] < 4096 for t, _ in tiles) and any(4096 <= t['y'] < 4200 for t, _ in tiles)
 
 
 def test_tile_capability_preserves_existing_single_webp_bytes():

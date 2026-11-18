@@ -58,9 +58,9 @@ class HayaiOCR:
             self.engine = sys.modules[type(model).__module__]._FastEngine(model, torch.float16)
             if backend == 'amd':
                 self.engine._capture = self._capture
-                # Keep the native LRU small on busy cards; recapturing evicted shapes stalls other GPU stages.
                 if torch.cuda.mem_get_info(gpu)[0] >= 8 * 1024**3:
-                    self.engine.MAX_STATES = 8
+                    # Batch 8 can use all eight row counts plus a second visual-prefix bucket.
+                    self.engine.MAX_STATES = 9 if batch_size == 8 else 8
 
     def _capture(self, state):
         # HIP rejects device synchronization by another model during capture,

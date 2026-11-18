@@ -41,6 +41,7 @@ def test_invalid_detector_or_device_choice_is_rejected(tmp_path, options, error)
 
 def test_detector_filter_respects_device_and_input_budget(monkeypatch):
     import numpy as np
+    from classic_node.timing import collect
     from mtu_engine import detection
     cv = detection.cv2
     props = SimpleNamespace(name='AMD Radeon', gcnArchName='gfx1030:sramecc-')
@@ -68,7 +69,42 @@ def test_detector_filter_respects_device_and_input_budget(monkeypatch):
     expected = cv.bilateralFilter(image, 17, 80, 80)
     monkeypatch.setattr(cv, 'UMat', lambda *args: pytest.fail('Unbudgeted device allocation'))
     for enabled, budget in ((False, 144), (True, 143)):
-        np.testing.assert_array_equal(detection.filter_detector_image(image, enabled, budget), expected)
+        with collect() as timings:
+            np.testing.assert_array_equal(detection.filter_detector_image(image, enabled, budget), expected)
+        assert timings['detect_filter_cpu_pages'] == 1
+
+
+@pytest.mark.parametrize('chunked', [False, True])
+def test_detector_filter_matches_full_umat_at_edges_and_seams(monkeypatch, chunked):
+    import numpy as np
+    from classic_node.timing import collect
+    from mtu_engine import detection
+    from mtu_engine.backend import cancellation
+    cv = detection.cv2
+    image = np.random.default_rng(27).integers(0, 256, (121, 75, 3), np.uint8)[:, 1:-1]
+    image.flags.writeable = False
+    height, width = image.shape[:2]
+    budget = width * (46 if chunked else height)
+    umat = cv.UMat
+    transfers = []
+    def upload(rows):
+        assert rows.shape[0] * rows.shape[1] <= budget
+        transfers.append(rows.shape[0])
+        return umat(rows)
+    monkeypatch.setattr(cv, 'UMat', upload)
+    with collect() as timings:
+        actual = detection.filter_detector_image(image, True, budget)
+    assert (len(transfers) > 1) == chunked
+    assert timings['detect_filter_opencl_chunks'] == len(transfers)
+    np.testing.assert_array_equal(actual, cv.bilateralFilter(umat(image), 17, 80, 80).get())
+    if chunked:
+        transfers.clear()
+        def cancel():
+            if transfers:
+                raise RuntimeError('cancelled')
+        with cancellation(cancel), pytest.raises(RuntimeError, match='cancelled'):
+            detection.filter_detector_image(image, True, budget)
+        assert len(transfers) == 1
 
 
 @pytest.mark.parametrize('backend,hip,platform,gpu,count,error', [

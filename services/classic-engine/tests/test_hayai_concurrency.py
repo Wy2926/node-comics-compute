@@ -152,10 +152,11 @@ def test_hip_graph_lru_retains_fifth_batch_size_only_with_headroom(monkeypatch):
     image = Image.new('RGB', (160, 48), 'white')
     ImageDraw.Draw(image).text((4, 4), 'HELLO WORLD', fill='black', font_size=22)
     outputs = []
-    for available, captures in ((8 * 1024**3 - 1, 1), (8 * 1024**3, 0)):
+    for available, captures, capacity in ((8 * 1024**3 - 1, 1, 4), (8 * 1024**3, 0, 9)):
         monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda *_, n=available: (n, total))
         ocr = HayaiOCR(os.environ['MTU_TEST_HAYAI'], backend='amd', batch_size=8)
         try:
+            assert ocr.engine.MAX_STATES == capacity
             outputs.append([ocr._recognize([image] * n) for n in range(1, 6)])
             with collect() as timings:
                 assert ocr._recognize([image]) == outputs[-1][0]

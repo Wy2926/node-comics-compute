@@ -2,12 +2,14 @@
 import os
 
 import cv2
+import numpy as np
 import torch
 from torch import nn
 from torch.nn.utils import fuse_conv_bn_eval
 from torchvision.models.resnet import BasicBlock, ResNet
 
-from classic_node.timing import stage
+from classic_node.timing import record, stage
+from .backend import check_cancelled
 
 
 def prepare_detector(model, device, precision):
@@ -48,10 +50,27 @@ def matching_opencl_gpu(device):
 
 def filter_detector_image(image, opencl, pixel_budget):
     with stage('detect_filter'):
-        # The native bilateral filter precedes resizing: bound full-size device buffers.
-        if opencl and image.shape[0] * image.shape[1] <= pixel_budget:
-            return cv2.bilateralFilter(cv2.UMat(image), 17, 80, 80).get()
-        return cv2.bilateralFilter(image, 17, 80, 80)
+        height, width = image.shape[:2]
+        diameter = 17
+        radius = diameter // 2
+        if opencl:
+            def filtered(rows):
+                result = cv2.bilateralFilter(cv2.UMat(rows), diameter, 80, 80).get()
+                record('detect_filter_opencl_chunks', 1)
+                return result
+            if height * width <= pixel_budget:
+                return filtered(image)
+            stride = pixel_budget // width - 2 * radius
+            # Keep both halos in budget; avoid processing more halo than useful rows.
+            if stride >= 2 * radius:
+                out = np.empty_like(image)
+                for y in range(0, height, stride):
+                    check_cancelled()
+                    top, end = max(0, y - radius), min(y + stride, height)
+                    out[y:end] = filtered(image[top:end + radius])[y - top:end - top]
+                return out
+        record('detect_filter_cpu_pages', 1)
+        return cv2.bilateralFilter(image, diameter, 80, 80)
 
 
 def fuse_detector(model):

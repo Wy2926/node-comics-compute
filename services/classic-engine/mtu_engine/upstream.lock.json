@@ -21,7 +21,7 @@
         },
         {
           "before": "imgproc.resize_aspect_ratio(cv2.bilateralFilter(image, 17, 80, 80), detect_size, cv2.INTER_LINEAR, mag_ratio = 1)",
-          "after": "imgproc.resize_aspect_ratio(\n                filter_detector_image(image, self.opencl_filter, self.max_batch_size * detect_size ** 2),\n                detect_size, cv2.INTER_LINEAR, mag_ratio=1)"
+          "after": "imgproc.resize_aspect_ratio(\n                filter_detector_image(image, self.opencl_filter, detect_size ** 2),\n                detect_size, cv2.INTER_LINEAR, mag_ratio=1)"
         },
         {
           "before": "    if isinstance(batch, list):\n        batch = np.array(batch)\n    batch = einops.rearrange(batch.astype(np.float32) / 127.5 - 1.0, 'n h w c -> n c h w')\n    batch = torch.from_numpy(batch).to(device)\n    with torch.no_grad():\n        db, mask = MODEL(batch)\n        db = db.sigmoid().cpu().numpy()\n        mask = mask.cpu().numpy()\n",
@@ -191,7 +191,7 @@
       "manga_translator/rendering/text_render/_layout.py": [
         {
           "before": "from PyQt6.QtGui import QFontMetricsF, QPainterPath, QTransform\n",
-          "after": "from PyQt6.QtGui import QFontMetricsF, QPainterPath, QRawFont, QTransform\n"
+          "after": "from PyQt6.QtGui import QFontMetricsF, QPainterPath, QRawFont, QTransform\nfrom mtu_engine.layout_metrics import measured_ink\n"
         },
         {
           "before": "def _horizontal_glyph_path(\n",
@@ -200,6 +200,20 @@
         {
           "before": "            glyph_path = raw_font.pathForGlyph(glyph_id)\n",
           "after": "            glyph_path = _glyph_path(raw_font, glyph_id)\n"
+        },
+        {
+          "before": "    with _style_font_scope(span.style), _bold_scope(effective_bold):\n        geometry = _line_ink_geometry(\n",
+          "after": "    with _style_font_scope(span.style), _bold_scope(effective_bold):\n        measure = measured_ink if geometry_sink is None and profile_stats is None else _line_ink_geometry\n        geometry = measure(\n"
+        }
+      ],
+      "manga_translator/rendering/auto_linebreak.py": [
+        {
+          "before": "from . import text_render\n",
+          "after": "from . import text_render\nfrom mtu_engine.layout_metrics import vertical_advances\n"
+        },
+        {
+          "before": "        for cdpt in paragraph:\n            if not cdpt:\n                continue\n            adv = _vert_char_advance(font_size, cdpt, letter_spacing=letter_spacing)\n",
+          "after": "        for cdpt, adv in zip(paragraph, vertical_advances(paragraph, font_size, letter_spacing)):\n"
         }
       ],
       "manga_translator/inpainting/ballon_fill.py": [

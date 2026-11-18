@@ -1,6 +1,7 @@
 """Real Qt outline reuse: exact geometry, physical fonts and bounded ownership."""
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -98,3 +99,57 @@ def test_outline_caches_remain_thread_local(assets, offline):
     with ThreadPoolExecutor(2) as workers:
         left, right = list(workers.map(draw, (24, 48)))
     assert left is not right and left.glyph_paths is not right.glyph_paths
+
+
+def test_page_ink_reuses_only_matching_qt_metrics(assets, offline, monkeypatch):
+    from mtu_engine.layout_metrics import measured_ink, page_measurements
+    Renderer(*assets)
+    from manga_translator.rendering.text_render import _fonts, _layout
+    text = 'Ａ！سَلَام 12＿\u200d'
+    ink = _layout._line_ink_geometry
+    counted = Mock(wraps=ink)
+    monkeypatch.setattr(_layout, '_line_ink_geometry', counted)
+    variants = [('NotoSans-Regular.ttf', False, 22, 0.), ('Mada.ttf', False, 22, 0.),
+                ('Mada.ttf', True, 22, 0.), ('Mada.ttf', True, 22, .15), ('Mada.ttf', True, 27, .15)]
+    with page_measurements():
+        for face, bold, size, shear in variants:
+            _fonts.set_font(str(assets[0].parent / 'fonts' / face))
+            with _fonts._bold_scope(bold):
+                args = text, size, .1, True, 1.2, None, shear, 1.3, .8
+                expected = ink(*args)
+                for _ in range(2):
+                    bounds = measured_ink(*args)
+                    assert bounds == {k: expected[k] for k in bounds}
+                    assert {'path', 'layout'}.isdisjoint(bounds)
+        assert counted.call_count == len(variants)
+        with _fonts._bold_scope(bold):
+            _fonts._font_registry_changed()
+            measured_ink(*args)
+        assert counted.call_count == len(variants) + 1
+
+
+def test_page_advances_are_bounded_and_discarded_on_error(assets, offline, monkeypatch):
+    from mtu_engine.layout_metrics import page_measurements, vertical_advances
+    Renderer(*assets)
+    from manga_translator.rendering import auto_linebreak
+    advance = Mock(wraps=auto_linebreak._vert_char_advance)
+    monkeypatch.setattr(auto_linebreak, '_vert_char_advance', advance)
+    def widths(text):
+        return tuple(vertical_advances(text, 12, 1))
+    text = '＿سَلَام\u200d'
+    expected = widths(text)
+    advance.reset_mock()
+    with pytest.raises(RuntimeError, match='cancelled'), page_measurements():
+        for _ in range(2):
+            assert widths(text) == expected
+            widths('z' * 257)
+        assert advance.call_count == len(text) + 2 * 257
+        for i in range(256):
+            widths(chr(0x400 + i))
+        advance.reset_mock()
+        widths(text)
+        assert advance.call_count == len(text)  # Evicted.
+        raise RuntimeError('cancelled')
+    widths(text)
+    widths(text)
+    assert advance.call_count == 3 * len(text)  # No cache survives the render.

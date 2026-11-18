@@ -65,7 +65,8 @@ def pack_result(final, original, alpha, version, analysis, translated, *, allow_
         'width': width, 'height': height, 'bbox': None, 'output': None}
     # Large negotiated pages are partitioned before diffing. Qt still lays out
     # the whole page once; only disjoint final pixels are processed in parallel.
-    if allow_tiles and tiled_output(width, height):
+    large_page = tiled_output(width, height)
+    if allow_tiles and large_page:
         record('render_diff', perf_counter() - started)
         with stage('render_encode'):
             return _pack_tiled(final, original, alpha, result, output_workers)
@@ -77,9 +78,8 @@ def pack_result(final, original, alpha, version, analysis, translated, *, allow_
     if max(right - x, bottom - y) > 16383:
         raise NodeFailure('CLASSIC_OUTPUT_TOO_LARGE')
     record('render_diff', perf_counter() - started)
-    started = perf_counter()
-    data = encode_patch(final[y:bottom, x:right], changed[y:bottom, x:right])
-    record('render_encode', perf_counter() - started)
+    with stage('render_encode'):
+        data = encode_patch(final[y:bottom, x:right], changed[y:bottom, x:right], fast=not large_page)
     result.update(representation='overlay-v1', bbox={'x': x, 'y': y, 'width': right - x, 'height': bottom - y},
         output={'sha256': hashlib.sha256(data).hexdigest(), 'byte_size': len(data),
                 'width': right - x, 'height': bottom - y, 'mime': 'image/webp'})
@@ -179,15 +179,16 @@ def _pack_tiled(final, original, alpha, result, workers):
     return {'output_bytes': data, 'result': result}
 
 
-def encode_patch(rgb, mask):
+def encode_patch(rgb, mask, *, fast=False):
+    import cv2
     import numpy as np
-    patch = np.zeros((*mask.shape, 4), dtype=np.uint8)
-    patch[..., :3][mask] = rgb[mask]
-    patch[..., 3][mask] = 255
+    patch = cv2.cvtColor(rgb, cv2.COLOR_RGB2RGBA)
+    # Clear all four channels together, including hidden RGB under transparent pixels.
+    patch.view(np.uint32).reshape(mask.shape)[~mask] = 0
     stream = BytesIO()
     try:
         with Image.fromarray(patch) as image:
-            image.save(stream, format='WEBP', lossless=True, method=4, quality=10, exact=False)
+            image.save(stream, format='WEBP', lossless=True, method=1 if fast else 4, quality=10, exact=fast)
         del patch
         data = stream.getvalue()
         if len(data) > MAX_RESULT_BYTES:
