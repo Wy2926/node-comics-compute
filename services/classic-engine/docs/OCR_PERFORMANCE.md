@@ -6,6 +6,7 @@
 | --- | --- |
 | `analyze_queue` | 等待页面计算槽 |
 | `analyze_detect` / `detect_lock_wait` | 检测总耗时 / 检测锁等待 |
+| `detect_filter` | 普通页双边滤波，含 OpenCL 路径的传输；包含在 `analyze_detect` 中 |
 | `analyze_group` / `analyze_route` | 分段 / classic 语言探测 |
 | `analyze_ocr` | 正式识别，含锁等待 |
 | `ocr_crop` / `ocr_preprocess` | Hayai 裁剪 / CPU 预处理 |

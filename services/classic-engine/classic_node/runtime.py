@@ -74,6 +74,7 @@ class Runtime:
         dependencies = {name: package_version(name) for name in packages}
         self.version = f'mtu-{backend}-v1-' + digest({'upstream': LOCK['source']['revision'],
             'code': code, 'assets': assets, 'dependencies': dependencies, 'ocr': self.engine.ocr.identity,
+            'detector': self.engine.detector_settings,
             'font_choices': FONT_CHOICES, 'default_font_ids': DEFAULT_FONT_IDS,
             'fonts': [file_hash(path) for path in options['font']],
             'options': {key: value for key, value in options.items()

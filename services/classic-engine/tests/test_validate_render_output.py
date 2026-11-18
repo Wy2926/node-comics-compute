@@ -15,8 +15,9 @@ from tools.validate_render_output import SharedTracker, fingerprint, main, make_
 def test_reconstruct_wire_pixels_and_source_alpha(height, alpha_kind):
     source = np.full((height, 4, 3), 210, np.uint8)
     final = source.copy()
-    final[1, 1] = (10, 20, 30)
-    final[-2, 2] = (50, 60, 70)
+    final[1, 1, 0] = 10
+    final[-2, 2, 1] = 60
+    final[-1, 3, 2] = 70
     alpha = None
     if alpha_kind:
         alpha = np.full(source.shape[:2], 128, np.uint8)

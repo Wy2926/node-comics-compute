@@ -8,12 +8,24 @@
     "patches": {
       "manga_translator/detection/default.py": [
         {
-          "before": "        self.model.eval()\n        self.device = device\n",
-          "after": "        self.model.eval()\n        if device == 'mps':\n            from mtu_engine.detection import fuse_detector\n            self.model = fuse_detector(self.model).half()\n        self.device = device\n"
+          "before": "from .common import OfflineDetector\n",
+          "after": "from .common import OfflineDetector\nfrom mtu_engine.detection import filter_detector_image, matching_opencl_gpu, prepare_detector\n"
         },
         {
-          "before": "    batch = torch.from_numpy(batch).to(device)\n    with torch.no_grad():\n        db, mask = MODEL(batch)\n        db = db.sigmoid().cpu().numpy()\n        mask = mask.cpu().numpy()\n",
-          "after": "    batch = torch.from_numpy(batch).to(device, dtype=next(MODEL.parameters()).dtype)\n    with torch.no_grad():\n        db, mask = MODEL(batch)\n        db = db.float().sigmoid().cpu().numpy()\n        mask = mask.float().cpu().numpy()\n"
+          "before": "    async def _load(self, device: str):\n",
+          "after": "    async def _load(self, device: str, *, precision='auto'):\n"
+        },
+        {
+          "before": "        self.model.eval()\n        self.device = device\n",
+          "after": "        self.model = prepare_detector(self.model.eval(), device, precision)\n        self.opencl_filter = matching_opencl_gpu(device)\n        self.device = device\n"
+        },
+        {
+          "before": "imgproc.resize_aspect_ratio(cv2.bilateralFilter(image, 17, 80, 80), detect_size, cv2.INTER_LINEAR, mag_ratio = 1)",
+          "after": "imgproc.resize_aspect_ratio(\n                filter_detector_image(image, self.opencl_filter, self.max_batch_size * detect_size ** 2),\n                detect_size, cv2.INTER_LINEAR, mag_ratio=1)"
+        },
+        {
+          "before": "    if isinstance(batch, list):\n        batch = np.array(batch)\n    batch = einops.rearrange(batch.astype(np.float32) / 127.5 - 1.0, 'n h w c -> n c h w')\n    batch = torch.from_numpy(batch).to(device)\n    with torch.no_grad():\n        db, mask = MODEL(batch)\n        db = db.sigmoid().cpu().numpy()\n        mask = mask.cpu().numpy()\n",
+          "after": "    with torch.no_grad():\n        batch = torch.from_numpy(np.ascontiguousarray(batch)).to(device).permute(0, 3, 1, 2)\n        # Transfer uint8 pixels; a device FP32 divisor avoids rounded reciprocal multiplication on HIP.\n        batch = batch.div(batch.new_full((), 127.5, dtype=torch.float32)).sub_(1)\n        db, mask = MODEL(batch.to(next(MODEL.parameters()).dtype))\n        db = db.float().sigmoid().cpu().numpy()\n        mask = mask.float().cpu().numpy()\n"
         },
         {
           "before": "            detect_size,\n            4,\n            device=self.device,\n",

@@ -19,6 +19,7 @@ def test_backend_config_is_opt_in_and_keeps_resource_defaults(tmp_path, selectio
         'node_id': 'test', 'node_token': 'fixture', 'resource_id': 'test', 'engine': engine}))
     config = load(path)
     assert config['engine']['backend'] == (selection or 'cuda')
+    assert config['engine']['detect_precision'] == 'auto'
     assert config['local_pages'] == 2 and config['max_leases'] == 8
     assert config['inpaint_slots'] == 2
     assert config['engine']['ocr_batch_size'] == 4
@@ -32,6 +33,42 @@ def test_backend_config_is_opt_in_and_keeps_resource_defaults(tmp_path, selectio
     path.write_text(json.dumps(value))
     with pytest.raises(ValueError, match='backend must be cuda, amd or mps'):
         load(path)
+    value['engine'] = {'detect_precision': 'fp8'}
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match='detect_precision'):
+        load(path)
+
+
+def test_detector_filter_respects_device_and_input_budget(monkeypatch):
+    import numpy as np
+    from mtu_engine import detection
+    cv = detection.cv2
+    props = SimpleNamespace(name='AMD Radeon', gcnArchName='gfx1030:sramecc-')
+    cl = SimpleNamespace(name=lambda: 'gfx1030', type=lambda: cv.ocl.Device_TYPE_GPU, isAMD=lambda: True)
+    for key in ('CUDA_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'GPU_DEVICE_ORDINAL'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(detection.torch.cuda, 'device_count', lambda: 1)
+    monkeypatch.setattr(detection.torch.cuda, 'current_device', lambda: 0)
+    monkeypatch.setattr(detection.torch.cuda, 'get_device_properties', lambda _: props)
+    monkeypatch.setattr(cv.ocl, 'useOpenCL', lambda: True)
+    monkeypatch.setattr(cv.ocl, 'Device_getDefault', lambda: cl)
+    assert detection.matching_opencl_gpu('cuda')
+    assert not detection.matching_opencl_gpu('cpu') and not detection.matching_opencl_gpu('mps')
+    cl.name = lambda: 'another GPU'
+    assert not detection.matching_opencl_gpu('cuda')
+    cl.name = lambda: props.name
+    monkeypatch.setattr(detection.torch.cuda, 'device_count', lambda: 2)
+    assert not detection.matching_opencl_gpu('cuda')  # Two adapters with the same name.
+    monkeypatch.setattr(detection.torch.cuda, 'get_device_properties',
+                        lambda i: props if i == 0 else SimpleNamespace(name='another GPU'))
+    assert detection.matching_opencl_gpu('cuda')
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '1')
+    assert not detection.matching_opencl_gpu('cuda')
+    image = np.arange(12 * 12 * 3, dtype=np.uint8).reshape(12, 12, 3)
+    expected = cv.bilateralFilter(image, 17, 80, 80)
+    monkeypatch.setattr(cv, 'UMat', lambda *args: pytest.fail('Unbudgeted device allocation'))
+    for enabled, budget in ((False, 144), (True, 143)):
+        np.testing.assert_array_equal(detection.filter_detector_image(image, enabled, budget), expected)
 
 
 @pytest.mark.parametrize('backend,hip,platform,gpu,count,error', [

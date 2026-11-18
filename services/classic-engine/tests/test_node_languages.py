@@ -13,6 +13,7 @@ def prepare(monkeypatch, tmp_path, covers):
     monkeypatch.setattr(runtime, 'package_version', lambda *args: 'test')
     monkeypatch.setattr(runtime, 'Engine', lambda **kwargs: SimpleNamespace(
         renderer=SimpleNamespace(covers=covers, font_ids=['comic-relief']),
+        detector_settings={'dtype': 'torch.float32', 'opencl_filter': False},
         ocr=SimpleNamespace(identity={'backend': kwargs.get('ocr_backend', 'classic')}), close=lambda: None))
     return {'engine': {'models': 'unused', 'gpu': 0, 'font': [str(font)]}}
 

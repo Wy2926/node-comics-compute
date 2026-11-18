@@ -20,7 +20,7 @@ import torch
 from classic_node.protocol import digest
 from classic_node.runtime import Runtime
 from classic_node.timing import collect
-from classic_node.config import ENGINE_DEFAULTS
+from classic_node.config import ENGINE_DEFAULTS, engine_options
 from tools.validate_render_output import measured, reconstruct
 
 
@@ -43,13 +43,20 @@ def run(args):
         args.threads, args.render_workers = resources['analysis_threads'], resources['render_workers']
     inference = {key: getattr(args, key, default) for key, default in ENGINE_DEFAULTS.items()
                  if key.endswith('_batch_size') or key.startswith('ocr_arena_')}
-    if inference['ocr_min_batch_size'] > inference['ocr_batch_size']:
+    if args.hayai_model:
+        if inference['ocr_batch_size'] > 8:
+            raise ValueError('Hayai supports an OCR batch size of at most 8')
+        inference = engine_options(inference | {'ocr_backend': 'hayai'})
+    elif inference['ocr_min_batch_size'] > inference['ocr_batch_size']:
         raise ValueError('ocr_min_batch_size must not exceed ocr_batch_size')
     config = {'engine': {**inference, 'backend': getattr(args, 'backend', 'cuda'),
+                         'detect_precision': args.detect_precision,
                          'models': str(args.models.resolve()), 'threads': args.threads,
                          'font': [str(assets / 'fonts' / f['name']) for f in fonts]},
               'render_workers': args.render_workers,
               '_render_threads': resources['render_threads'] if resources else 1}
+    if args.hayai_model:
+        config['engine']['ocr_model'] = str(args.hayai_model.resolve())
     paths = sorted(p for p in source.iterdir() if p.suffix.lower() in {'.png', '.webp', '.jpg', '.jpeg'})
     if not paths:
         raise ValueError('No input images')
@@ -64,7 +71,8 @@ def run(args):
               'concurrency': args.concurrency, 'render_workers': args.render_workers,
               'cache_bytes_per_page': args.cache_mib * 1024 ** 2,
               'translation_source': 'fixed fixture text; no provider call', 'runs': [], 'cpu_resources': resources,
-              'inference_settings': inference, 'reserved_test_vram_mib': reserve_mib}
+              'inference_settings': inference, 'detector': runtime.engine.detector_settings,
+              'ocr': runtime.engine.ocr.identity, 'reserved_test_vram_mib': reserve_mib}
 
     def page(path):
         data = path.read_bytes()
@@ -102,6 +110,8 @@ def run(args):
                     'timings': timings,
                     'image_stage_seconds': sum(timings[k] for k in ('analyze', 'inpaint', 'render')),
                     'analysis_sha256': digest({k: v for k, v in analysis.items() if k != 'version'}),
+                    'text_sha256': digest([s['source'] for s in analysis['segments']]),
+                    'lines_sha256': digest([r['lines'] for r in analysis['regions']]),
                     'clean_sha256': hashlib.sha256(cleaned.tobytes()).hexdigest(),
                     'pixels_sha256': hashlib.sha256(np.asarray(final).tobytes()).hexdigest(),
                     'output_sha256': hashlib.sha256(packed['output_bytes'] or b'').hexdigest(),
@@ -160,6 +170,8 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--models', type=Path, required=True)
     parser.add_argument('--backend', choices=('cuda', 'amd'), default='cuda')
+    parser.add_argument('--detect-precision', choices=('auto', 'fp32', 'fp16'), default='auto')
+    parser.add_argument('--hayai-model', type=Path, help='Use this prepared Hayai model instead of classic OCR')
     parser.add_argument('--repeats', type=int, choices=range(1, 21), default=3)
     parser.add_argument('--concurrency', type=int, choices=range(1, 9), default=1)
     parser.add_argument('--render-workers', type=int, choices=range(1, 9), default=2)

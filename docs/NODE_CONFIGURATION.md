@@ -15,6 +15,8 @@
 
 Windows 便携包使用 `data/node.json`；Linux 挂载 `node.local.json`。模型和字体从固定清单准备，运行时不下载。
 
+`engine.detect_precision` 仅控制 DBNet：`auto` 在 MPS 使用融合后的 FP16，在 AMD/CUDA 使用 FP32；可显式选择 `fp16` 或 `fp32`。AMD 实测 FP16 节省显存，但个别 OCR 和掩膜有变化，见[技术汇总](../services/classic-engine/docs/TECHNICAL_SUMMARY.md)。需要对照 CPU 双边滤波时，可在进程启动前设置 `OPENCV_OPENCL_RUNTIME=disabled`。
+
 ## 中心连接与调度
 
 节点从 `control_url` 建立 `compute.pull.v1` WebSocket 控制通道，单图与文件共用一个领取入口；TLS、独立 CA 和显式代理复用 HTTPS 配置。代理须允许 WebSocket Upgrade，原图、结果与租约心跳走 HTTPS。与中心配套升级，保留状态目录。

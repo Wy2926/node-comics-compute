@@ -1,6 +1,6 @@
 # 技术方案与性能验证
 
-当前实现与 2026-11-17 的 31 张实图对照；图片、OCR 全文和实验产物保存在仓库外。
+当前实现及 RX 6900 XT、Apple Silicon 的实图对照；图片和原始实验产物保存在仓库外。
 
 ## 处理流程
 
@@ -17,7 +17,7 @@ HTTP 接单 → 输入校验／文件拆页 → DBNet 检测与概率图合并
 
 | 阶段 | 实现与约束 | 入口 |
 | --- | --- | --- |
-| 检测 | 保留短边尺度，超过检测尺寸才缩小；长边约为原窗口两倍，DBNet 两维补齐到 256 倍数。重叠保留原窗口的 1/5，整图概率图羽化合并后再提框。MPS 先 FP32 融合 Conv／BN，再 FP16 推理，输出概率恢复 FP32 | `mtu_engine/detection.py`、`upstream.lock.json` → 上游 `utils/generic.py`、`detection/default.py` |
+| 检测 | 保留短边尺度，超过检测尺寸才缩小；长边约为原窗口两倍，DBNet 两维补齐到 256 倍数。重叠保留原窗口的 1/5，整图概率图羽化合并后再提框。只运行提框和掩膜需要的输出头；FP16 先在 FP32 融合 Conv／BN，输出恢复 FP32 | `mtu_engine/detection.py`、`upstream.lock.json` → 上游 `utils/generic.py`、`detection/default.py` |
 | 检测后处理 | 像素阈值 0.5、框阈值 0.6、扩框 2.3；每等效窗口 1000 候选、最多 3000。uint8 二值图避免 int64 中间数组，跳过补边框、零面积框及空／分裂扩框 | `mtu_engine/engine.py`、上游 `detection/common.py`、`default_utils/dbnet_utils.py` |
 | OCR／取色 | classic 按语言分流到 PP-OCRv5／Manga OCR；Hayai 使用原生有界批处理并拒绝截断输出。页面内复用裁剪与探测结果，灰度文字走快速取色，彩色代表行复用原生颜色头 | `mtu_engine/ocr/`、`colors.py` |
 | 掩膜细化 | 直接调用固定 MTU CTD 主色／Otsu 及填洞；一次标记源连通域，逐行处理完整相交组件，保留大于 9 像素的门槛。RGB 转 BGR、annotation 模式、源笔画合并、字号相关膨胀、气泡约束与行间取消 | `mtu_engine/masks.py`、上游 `mask_refinement/__init__.py` |
@@ -27,11 +27,36 @@ HTTP 接单 → 输入校验／文件拆页 → DBNet 检测与概率图合并
 
 检测输入逐批补边，预测裁剪后保存紧凑数组；批量受 `detect_batch_size × detect_size²` 像素预算约束，至少允许一张。长图 `930×28007` 使用 13 张 `2560×1024` 输入；单张前向更长，不能推导显存峰值或取消延迟必然下降。
 
-MPS 融合复用 PyTorch `fuse_conv_bn_eval`，覆盖固定 DBNet 的 70 对 Conv／BN，包括 ResNet 残差块及转置卷积；剩余 BatchNorm 拒绝启动。输入跟随模型 dtype，DB sigmoid 和掩膜输出使用 FP32；CUDA／AMD 检测保持 FP32。
+`engine.detect_precision=fp16` 在所有推理后端复用 PyTorch `fuse_conv_bn_eval`，覆盖固定 DBNet 的 70 对 Conv／BN，包括 ResNet 残差块及转置卷积；剩余 BatchNorm 拒绝启动。输入跟随模型 dtype，DB sigmoid 和掩膜输出使用 FP32。普通页双边滤波可使用与推理卡唯一匹配的 OpenCL 设备；设备不可匹配、配置了设备可见性掩码或滤波输入超过检测像素预算时，沿用 CPU 滤波。长条分块不走这个滤波步骤。
 
 细化仅支持 `fit_text`，完整组件窗口避免检测多边形截断同一字形；保留源笔画恢复和气泡边界保护。
 
-## 31 张实图对照
+## Windows AMD：20 张单页及一张拼接长图（2026-11-18）
+
+RX 6900 XT 16 GiB / Ryzen 7 5800X，驱动 32.0.21030.2001，PyTorch 2.13.0+rocm10.1.0、OpenCV 5.0.0。输入为下载目录 `NodeComics-20pages-ja-ko-en-vi/ja` 的 20 张 `939×1350` PNG，另将前 8 张按文件名顺序原尺寸纵拼为 `939×10800`。基线 `f80fe83` 和新版本分别按锁准备资产。Hayai 批量 8、检测尺寸 1280 / 批量上限 4、CPU 4 线程、参考掩膜缓存 64 MiB。固定英文译文，逐方案独立进程，整组预热后测两轮取平均。
+
+| 单页串行，21 个输入 | 基线 FP32 | 优化 FP32（默认） | 优化 FP16 |
+| --- | ---: | ---: | ---: |
+| 整批墙钟（含解码、输出重建及摘要） | 20.58 s | **16.59 s** | 16.55 s |
+| 检测总耗时 | 3.77 s | **1.02 s** | 0.79 s |
+| 其中：普通页双边滤波 / 批输入、前向及回传 | 2.429 / 0.983 s | 0.045 / 0.658 s | 0.044 / 0.428 s |
+| 拼接长图：检测 / 分析、抹字及排版合计 | 0.462 / 4.655 s | 0.324 / 4.267 s | 0.234 / 4.242 s |
+| 进程 GPU 平均忙碌率 | 22.2% | 28.1% | 26.6% |
+| PyTorch 峰值已分配 / 保留显存（GiB） | 2.61 / 4.21 | 2.59 / 4.21 | **1.80 / 3.20** |
+
+- **默认收益：** 匹配的 OpenCL 设备执行原双边滤波；DBNet 传 uint8，在设备上用 FP32 归一化，只计算和合并实际读取的 DB 通道及原始掩膜。输出逐 RGB 通道计算相同的可见差分，整组差分耗时从 0.379 降至 0.078 s（长图含各块之和）。优化后最大阶段为排版测量与绘制 4.11 s、OCR 3.96 s。
+- **双页并发：** 两路页面、两路渲染、每个渲染进程 1 线程，基线和优化 FP32 整批分别为 15.80 / **12.60 s**（1.33 / **1.67 页/s**）；进程 GPU 均值 29.4% / **36.7%**。GPU 数值取 Windows `GPU Engine` 性能计数器，每秒取推理进程最忙引擎，剔除预热与跨边界样本；不是 GPU 核占用率。PyTorch 显存不含 OpenCL/驱动分配。
+- **效果：** 默认方案 122 个区域（长图 32 个）的逐行坐标及 OCR 与基线全部一致。17/21 张最终像素一致；另 4 页合计有 255 个修复掩膜像素、18,179 个成品像素不同。融合 FP16 实际加载到 HIP GPU、两种输出均为 FP32；保留全部区域，但 5 个区域行框有变化、2 个区域 OCR 有变化。相对优化 FP32，批推理再快 35%，整批仅差 0.04 s，因此在这张卡上 FP16 作为省显存选项。
+
+复测（AMD 环境，工作目录与资产同盘；输入、报告分别放不同目录）：
+
+```sh
+python -m tools.benchmark_pages --backend amd --models <assets>/models --hayai-model <hayai> --input <pages> --output fp32.json --detect-precision fp32 --ocr-batch-size 8 --threads 4 --render-workers 1 --cache-mib 64 --repeats 2
+```
+
+改用 `--detect-precision fp16` 或 `--concurrency 2 --render-workers 2` 并指定新报告名。报告记录实际检测 dtype、滤波路径、逐页耗时及 OCR/行框摘要。以上是本地暖机图像计算，不含真实中心、翻译或网络耗时。
+
+## Apple Silicon：31 张实图对照（2026-11-17）
 
 **条件：** Apple M6 Mac mini，12 CPU／12 GPU 核、24 GB，PyTorch 2.14.1；Hayai MPS FP16、LaMa MPS FP32，GPU 回退关闭。检测批量 1、OCR 批量 8、CPU 线程 2、渲染进程 2、页面预算 2 GiB。
 
@@ -61,8 +86,8 @@ MPS 融合复用 PyTorch `fuse_conv_bn_eval`，覆盖固定 DBNet 的 70 对 Con
 
 - 回归覆盖融合数值、输入／输出精度、未知归一化拒绝、补丁漂移、尺度与批量边界、预测所有权、完整字形、气泡保护及取消恢复。命令见[引擎 README](../README.md)。
 - 真实 MPS 接缝验证覆盖横竖长图、18px／26px 共 90 行：检测／经典英文 OCR 完整无重复，细化覆盖字形及抗锯齿边缘。合成用例不能替代实图比较。
-- 正式源码／新资产重放 31 张及 31 个本地任务，分析内容（除版本标识）、抹字像素、排版像素和输出字节与融合候选一致。
+- 11 月 17 日的 MPS 版本重放 31 张及 31 个本地任务，分析内容（除版本标识）、抹字像素、排版像素和输出字节与当时的融合候选一致。本次检测改动的实机回归使用 Windows AMD。
 - Windows 包、Linux 镜像／在线安装和 Mac 共用 `tools.prepare_mtu`，融合代码随现有源码目录交付。升级需重新准备匹配新锁的资产，旧清单会被拒绝；按[恢复规则](NODE_OPERATIONS.md)排空并保留私有配置及未确认结果。
-- 其他 GPU、Linux 实机、真实中心端到端、大规模人工准确率及持续功耗未验证。
+- Linux/NVIDIA 实机、真实中心端到端、大规模人工准确率及持续功耗未验证。
 
 [第三方来源](../THIRD_PARTY.md) · [OCR](OCR_PERFORMANCE.md) · [抹字](INPAINT_PERFORMANCE.md) · [排版](RENDER_PERFORMANCE.md) · [流水线](PIPELINE_PERFORMANCE.md)

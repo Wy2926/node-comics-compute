@@ -1,7 +1,57 @@
-"""Fold the pinned DBNet's eval normalization before low-precision inference."""
+"""Inference-only preparation for the pinned DBNet."""
+import os
+
+import cv2
+import torch
 from torch import nn
 from torch.nn.utils import fuse_conv_bn_eval
 from torchvision.models.resnet import BasicBlock, ResNet
+
+from classic_node.timing import stage
+
+
+def prepare_detector(model, device, precision):
+    if precision == 'auto':
+        # On the RX 6900 XT FP16 saves VRAM but changes two real-page readings.
+        precision = 'fp16' if device == 'mps' else 'fp32'
+    if precision == 'fp16':
+        model = fuse_detector(model).half()
+    elif precision != 'fp32':
+        raise ValueError('detect_precision must be auto, fp32 or fp16')
+    # Both DB postprocessing and its debug view read only shrink logits (channel 0).
+    model.conv_db = model.conv_db.binarize
+    return model
+
+
+def matching_opencl_gpu(device):
+    # OpenCV's default adapter does not follow CUDA/HIP device masks.
+    masks = ('CUDA_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'GPU_DEVICE_ORDINAL')
+    if device != 'cuda' or any(os.environ.get(k) for k in masks):
+        return False
+    try:
+        if not cv2.ocl.useOpenCL():
+            return False
+        cl = cv2.ocl.Device_getDefault()
+        name, amd = cl.name(), cl.isAMD()
+        if cl.type() != cv2.ocl.Device_TYPE_GPU or not name:
+            return False
+    except cv2.error:
+        # An unavailable OpenCL ICD must not prevent native CPU preprocessing.
+        return False
+    def matches(index):
+        gpu = torch.cuda.get_device_properties(index)
+        arch = (getattr(gpu, 'gcnArchName', '') or '').partition(':')[0]
+        return gpu.name == name or (amd and arch == name)
+    # Identically named adapters cannot be disambiguated by OpenCV's Python API.
+    return [i for i in range(torch.cuda.device_count()) if matches(i)] == [torch.cuda.current_device()]
+
+
+def filter_detector_image(image, opencl, pixel_budget):
+    with stage('detect_filter'):
+        # The native bilateral filter precedes resizing: bound full-size device buffers.
+        if opencl and image.shape[0] * image.shape[1] <= pixel_budget:
+            return cv2.bilateralFilter(cv2.UMat(image), 17, 80, 80).get()
+        return cv2.bilateralFilter(image, 17, 80, 80)
 
 
 def fuse_detector(model):

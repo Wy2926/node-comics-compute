@@ -1,7 +1,7 @@
 """Shared wire encoding. Never include arbitrary server/engine errors in logs."""
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime
 import hashlib
 from io import BytesIO
 import json
@@ -43,7 +43,10 @@ def tiled_output(width, height):
 def _visible_diff(final, original, alpha):
     """Shared exact diff/bounds for a whole page or one disjoint output tile."""
     import numpy as np
-    changed = np.any(final != original, axis=2)
+    # Compare RGB planes directly instead of reducing an H x W x 3 temporary.
+    changed = final[..., 0] != original[..., 0]
+    changed |= final[..., 1] != original[..., 1]
+    changed |= final[..., 2] != original[..., 2]
     if alpha is not None:
         changed &= np.asarray(alpha) > 0
     ys, xs = np.flatnonzero(changed.any(axis=1)), np.flatnonzero(changed.any(axis=0))

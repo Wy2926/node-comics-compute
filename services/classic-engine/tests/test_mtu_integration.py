@@ -557,21 +557,27 @@ def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, o
         getattr(torch, device).empty_cache()
 
 
-def test_detector_fusion_preserves_fp32_predictions_and_rejects_unknown_normalization(assets, offline):
+def test_detector_fusion_preserves_fp32_predictions_and_rejects_unknown_normalization(assets, offline, monkeypatch):
     import asyncio
     import torch
     from mtu_engine.assets import activate
-    from mtu_engine.detection import fuse_detector
+    from mtu_engine.detection import fuse_detector, prepare_detector
     activate(assets[0])
     from manga_translator.detection import default
     from manga_translator.utils import ModelWrapper
     ModelWrapper._MODEL_DIR = str(assets[0])
     detector = default.DefaultDetector()
+    monkeypatch.setattr(default, 'prepare_detector', lambda model, *_: model)
     asyncio.run(detector.load('cpu'))
     try:
         assert sum(isinstance(m, torch.nn.BatchNorm2d) for m in detector.model.modules()) == 70
         batch = np.random.default_rng(71).integers(0, 256, (1, 256, 256, 3), dtype=np.uint8)
-        expected = default.det_batch_forward_default(batch, 'cpu')
+        raw, mask = default.det_batch_forward_default(batch, 'cpu')
+        assert raw.shape[1] == 2
+        expected = raw[:, :1], mask
+        prepare_detector(detector.model, 'cpu', 'fp32')
+        for left, right in zip(default.det_batch_forward_default(batch, 'cpu'), expected, strict=True):
+            np.testing.assert_array_equal(left, right)
         assert fuse_detector(detector.model) is detector.model
         actual = default.det_batch_forward_default(batch, 'cpu')
         assert not any(isinstance(m, torch.nn.BatchNorm2d) for m in detector.model.modules())
@@ -585,25 +591,51 @@ def test_detector_fusion_preserves_fp32_predictions_and_rejects_unknown_normaliz
         default.MODEL = None
 
 
-def test_detector_inputs_follow_fp16_model_and_predictions_remain_fp32(assets, monkeypatch):
+def test_detector_fusion_runs_in_half_on_selected_gpu(assets, offline):
+    import asyncio
     import torch
     from mtu_engine.assets import activate
     activate(assets[0])
     from manga_translator.detection import default
+    from manga_translator.utils import ModelWrapper
+    device = 'mps' if os.environ.get('MTU_TEST_BACKEND') == 'mps' else 'cuda'
+    ModelWrapper._MODEL_DIR = str(assets[0])
+    detector = default.DefaultDetector()
+    asyncio.run(detector.load(device, precision='fp16'))
+    try:
+        weight = next(detector.model.parameters())
+        assert weight.device.type == device and weight.dtype == torch.float16
+        assert not any(isinstance(m, torch.nn.BatchNorm2d) for m in detector.model.modules())
+        batch = np.random.default_rng(3).integers(0, 256, (1, 256, 256, 3), dtype=np.uint8)
+        for prediction in default.det_batch_forward_default(batch, device):
+            assert prediction.shape[1] == 1 and prediction.dtype == np.float32
+            assert np.isfinite(prediction).all()
+    finally:
+        asyncio.run(detector.unload())
+        default.MODEL = None
+
+
+@pytest.mark.parametrize('precision', ['float16', 'float32'])
+def test_detector_inputs_follow_model_and_predictions_remain_fp32(assets, monkeypatch, precision):
+    import torch
+    from mtu_engine.assets import activate
+    activate(assets[0])
+    from manga_translator.detection import default
+    dtype = getattr(torch, precision)
 
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16))
+            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=dtype))
 
         def forward(self, batch):
-            assert batch.dtype == torch.float16 and not torch.is_grad_enabled()
+            assert batch.dtype == dtype and not torch.is_grad_enabled()
             return batch[:, :2], batch[:, :1]
 
     monkeypatch.setattr(default, 'MODEL', Model())
-    batch = np.random.default_rng(71).integers(0, 256, (2, 32, 64, 3), dtype=np.uint8)
+    batch = np.arange(2 * 32 * 64 * 3, dtype=np.uint8).reshape(2, 32, 64, 3)[:, :, ::-1]
     db, mask = default.det_batch_forward_default(batch, 'cpu')
-    expected = torch.from_numpy((batch.astype(np.float32) / 127.5 - 1).transpose(0, 3, 1, 2)).half().float()
+    expected = torch.from_numpy((batch.astype(np.float32) / 127.5 - 1).transpose(0, 3, 1, 2)).to(dtype).float()
     np.testing.assert_allclose(db, expected[:, :2].sigmoid().numpy(), atol=1e-7, rtol=0)
     np.testing.assert_array_equal(mask, expected[:, :1].numpy())
     assert db.dtype == mask.dtype == np.float32

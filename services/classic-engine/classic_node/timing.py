@@ -14,7 +14,7 @@ WIRE_FIELDS = frozenset(('download', 'download_queue', 'analyze', 'analyze_queue
     'local_total', 'output_put', 'render_areas', 'render_layout', 'render_diff',
     'render_encode', 'detect_lock_wait', 'ocr_lock_wait', 'inpaint_lock_wait'))
 
-OCR_FIELDS = frozenset(('analyze_detect', 'analyze_group', 'analyze_route', 'analyze_ocr',
+OCR_FIELDS = frozenset(('analyze_detect', 'detect_filter', 'analyze_group', 'analyze_route', 'analyze_ocr',
     'analyze_colors', 'analyze_bubbles', 'analyze_bubble_mask', 'analyze_refine', 'analyze_checkpoint',
     'ocr_crop', 'ocr_preprocess', 'ocr_transfer', 'ocr_infer', 'ocr_decode', 'ocr_lock_wait', 'ocr_model_lock_wait',
     'ocr_paragraphs', 'ocr_batches', 'ocr_batch_max', 'ocr_output_tokens', 'ocr_truncated',

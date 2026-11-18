@@ -249,7 +249,7 @@ class Engine:
     def __init__(self, models, font, gpu=0, threads=2, detect_size=1280, inpainting_size=512, keep_lang=None,
                  ocr_batch_size=None, ocr_min_batch_size=None, color_batch_size=None, detect_batch_size=None,
                  ocr_arena_extend_strategy=None, ocr_arena_shrinkage=None, backend='cuda',
-                 ocr_backend='classic', ocr_model=None):
+                 ocr_backend='classic', ocr_model=None, detect_precision='auto'):
         from classic_node.config import ENGINE_DEFAULTS
         import cv2
         import torch
@@ -298,11 +298,15 @@ class Engine:
                 if not model.is_downloaded():
                     raise ValueError('Missing prepared model; runtime downloads are disabled')
                 device = 'mps' if backend == 'mps' else 'cuda'
-                if backend != 'cuda' and model is self.inpainter:
+                if model is self.detector:
+                    asyncio.run(model.load(device, precision=detect_precision))
+                elif backend != 'cuda' and model is self.inpainter:
                     asyncio.run(model.load(device, force_torch=True))
                 else:
                     asyncio.run(model.load(device))
             self.detector.model.register_forward_pre_hook(check_cancelled)
+            self.detector_settings = {'dtype': str(next(self.detector.model.parameters()).dtype),
+                                      'opencl_filter': self.detector.opencl_filter}
             self.colors = Colors(self.color_model, color_batch_size)
             options = {'batch_size': ocr_batch_size, 'min_batch_size': ocr_min_batch_size,
                        'arena_extend_strategy': ocr_arena_extend_strategy, 'arena_shrinkage': ocr_arena_shrinkage}

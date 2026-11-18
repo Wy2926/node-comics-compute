@@ -8,7 +8,7 @@ from .resources import resolve_cpu_resources
 
 ENGINE_DEFAULTS = {'models': '.assets/models', 'gpu': 0, 'threads': 'auto', 'backend': 'cuda',
     'ocr_backend': 'classic', 'ocr_model': None,
-    'font': [], 'detect_size': 1280, 'inpainting_size': 512, 'keep_lang': None,
+    'font': [], 'detect_size': 1280, 'detect_precision': 'auto', 'inpainting_size': 512, 'keep_lang': None,
     'ocr_batch_size': 4, 'ocr_min_batch_size': 1, 'color_batch_size': 4, 'detect_batch_size': 4,
     'ocr_arena_extend_strategy': 'kSameAsRequested', 'ocr_arena_shrinkage': True}
 LOCAL_DEFAULTS = {'local_pages': 2, 'render_workers': 'auto', 'max_leases': 8,
@@ -113,6 +113,8 @@ def load(path):
         raise ValueError('inpainting_size must be 512, 768 or 1024')
     if type(value['engine']['detect_size']) is not int or not 512 <= value['engine']['detect_size'] <= 2048:
         raise ValueError('detect_size must be between 512 and 2048')
+    if value['engine']['detect_precision'] not in ('auto', 'fp32', 'fp16'):
+        raise ValueError('detect_precision must be auto, fp32 or fp16')
     for key in ('ocr_batch_size', 'color_batch_size', 'detect_batch_size'):
         limit = 8 if key == 'ocr_batch_size' and value['engine']['ocr_backend'] == 'hayai' else 32
         if type(value['engine'][key]) is not int or not 1 <= value['engine'][key] <= limit:

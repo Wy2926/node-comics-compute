@@ -25,6 +25,7 @@
     "ocr_arena_extend_strategy": "kSameAsRequested",
     "ocr_arena_shrinkage": true,
     "detect_size": 1280,
+    "detect_precision": "auto",
     "inpainting_size": 512
   }
 }

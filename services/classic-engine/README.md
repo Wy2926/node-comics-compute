@@ -14,7 +14,7 @@ uv run pytest -q
 
 AMD 使用 `uv sync --project environments/amd --locked --group test`。各环境独立，显式选择 `engine.backend`，不自动降级或混装。
 
-长图检测保留文字尺度，使用有界批量的对齐长矩形及概率图羽化合并；掩膜细化复用固定版本 CTD。参数、31 张实测和已知画质问题见[技术汇总](docs/TECHNICAL_SUMMARY.md)。
+长图检测、CTD 细化和输出差分共用同一实现。普通页在 OpenCV 能匹配推理 GPU 且像素预算允许时使用 OpenCL 双边滤波。`engine.detect_precision` 支持 `auto`、`fp32`、`fp16`；FP16 先在 FP32 融合卷积和归一化，概率图恢复 FP32。AMD/CUDA 默认 FP32，MPS 默认 FP16。RX 6900 XT 实测、Mac 对照和画质差异见[技术汇总](docs/TECHNICAL_SUMMARY.md)。
 
 ## Apple Silicon Mac
 
@@ -26,8 +26,6 @@ uv run --project environments/macos --locked python -m tools.prepare_mtu
 ```
 
 私有 `node.local.json` 设置 `engine.backend: "mps"`、`engine.gpu: 0`，模型和字体路径沿用示例。检测、取色、气泡和 LaMa 使用 MPS；经典 OCR 的日文模型使用 MPS，PP-OCR 使用 CPU ONNX。MPS 分析／抹字一次派发一页，多页并发仍可重叠下载、嵌字和交付；CPU 预算按逻辑核心数分配，长图编码可借用渲染池空闲额度。
-
-MPS 检测先在 FP32 下融合卷积／归一化，再以 FP16 推理，概率图恢复 FP32；LaMa 保持 FP32。直接将未融合检测器转为 FP16 会改变召回，不采用。
 
 ```sh
 uv run --project environments/macos --locked python -m classic_node check --config node.local.json
