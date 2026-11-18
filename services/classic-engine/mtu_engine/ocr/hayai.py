@@ -1,19 +1,45 @@
 """Local Hayai paragraph recognition using the pinned upstream inference engine."""
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import sys
-from threading import Lock
+from threading import Condition, Lock
 
 from PIL import Image
 
 from classic_node.timing import record, stage, waiting_for
-from mtu_engine.backend import check_cancelled, device_context
+from mtu_engine.backend import CUDA_GRAPH_MIN_FREE, check_cancelled, device_context
 from . import Reading
 from .crops import paragraph_box
 from .models import verify_hayai
 
 MAX_PATCHES = 512
 MAX_TOKENS = 512
+
+
+class CudaModelCalls:
+    """Independent models can overlap; graph capture must drain all of them."""
+    def __init__(self):
+        self.admission = Lock()
+        self.idle = Condition()
+        self.active = 0
+
+    def __enter__(self):
+        with self.admission, self.idle:
+            self.active += 1
+
+    def __exit__(self, *_):
+        with self.idle:
+            self.active -= 1
+            if not self.active:
+                self.idle.notify_all()
+
+    @contextmanager
+    def capture(self):
+        with waiting_for(self.admission, 'ocr_capture_wait'):
+            with self.idle, stage('ocr_capture_wait'):
+                self.idle.wait_for(lambda: not self.active)
+            yield
 
 
 def complete_texts(sequences, tokenizer):
@@ -31,6 +57,8 @@ def complete_texts(sequences, tokenizer):
 
 class HayaiOCR:
     def __init__(self, model, gpu=0, *, backend='cuda', batch_size=4):
+        if type(batch_size) is not int or not 1 <= batch_size <= 8:
+            raise ValueError('Hayai batch_size must be between 1 and 8')
         import torch
         from transformers import AutoConfig, AutoImageProcessor, AutoModel, PreTrainedTokenizerFast
 
@@ -39,7 +67,6 @@ class HayaiOCR:
         self.backend, self.gpu, self.batch_size = backend, gpu, batch_size
         self.device = 'mps' if backend == 'mps' else f'cuda:{gpu}'
         self._lock = Lock()
-        self.capture_lock = Lock()
         with device_context(backend, gpu):
             config = AutoConfig.from_pretrained(root / 'model', trust_remote_code=True, local_files_only=True)
             vision = json.loads((root / 'processor/config.json').read_text())
@@ -56,17 +83,25 @@ class HayaiOCR:
             # weights/KV cache. Avoid generate()'s silent FP32/reference fallback
             # and retain EOS information for truncation detection.
             self.engine = sys.modules[type(model).__module__]._FastEngine(model, torch.float16)
-            if backend == 'amd':
+            free = torch.cuda.mem_get_info(gpu)[0] if backend != 'mps' else 0
+            self.capture_lock = Lock() if backend == 'amd' else (
+                CudaModelCalls() if free >= CUDA_GRAPH_MIN_FREE else None)
+            self.identity['decoder_graph'] = self.capture_lock is not None
+            if self.capture_lock is not None:
                 self.engine._capture = self._capture
-                if torch.cuda.mem_get_info(gpu)[0] >= 8 * 1024**3:
+                if free >= 8 * 1024**3:
                     # Batch 8 can use all eight row counts plus a second visual-prefix bucket.
                     self.engine.MAX_STATES = 9 if batch_size == 8 else 8
+                elif backend == 'cuda':
+                    # The fifth prefix/batch shape avoids recapture on the 8 GiB RTX 4060.
+                    self.engine.MAX_STATES = 5
 
     def _capture(self, state):
-        # HIP rejects device synchronization by another model during capture,
-        # even with upstream's thread-local capture mode. Normal OCR inference
-        # still overlaps other stages; only graph creation takes this guard.
-        with waiting_for(self.capture_lock, 'ocr_capture_wait'), stage('ocr_capture'):
+        # Device synchronization from another model can invalidate capture.
+        # Replay uses the ordinary OCR model lock, not this cross-model guard.
+        guard = (self.capture_lock.capture() if self.backend == 'cuda'
+                 else waiting_for(self.capture_lock, 'ocr_capture_wait'))
+        with guard, stage('ocr_capture'):
             result = type(self.engine)._capture(self.engine, state)
             record('ocr_graph_captures', 1)
             return result
@@ -107,10 +142,8 @@ class HayaiOCR:
             with stage('ocr_infer'):
                 tokens = self.engine.run(**inputs, bos=self.tokenizer.bos_token_id,
                     eos=self.tokenizer.eos_token_id, pad=self.tokenizer.pad_token_id,
-                    # Windows HIP: replay the upstream bounded decoder graphs
-                    # instead of issuing every tiny token kernel from Python.
-                    max_new=MAX_TOKENS, use_graph=self.backend == 'amd')
-            record('ocr_graph_batches' if self.backend == 'amd' and not self.engine._graph_failed
+                    max_new=MAX_TOKENS, use_graph=self.capture_lock is not None)
+            record('ocr_graph_batches' if self.capture_lock is not None and not self.engine._graph_failed
                    else 'ocr_eager_batches', 1)
         with stage('ocr_decode'):
             return complete_texts(tokens.tolist(), self.tokenizer)

@@ -8,7 +8,9 @@ from PIL import Image
 
 from classic_node.protocol import pack_result, png64
 from classic_node import render_pool
-from tools.validate_render_output import SharedTracker, fingerprint, main, make_case, private_case, reconstruct, synthetic
+from tools import validate_render_output
+from tools.validate_render_output import (
+    SharedTracker, fingerprint, main, make_case, measured, private_case, reconstruct, synthetic)
 
 
 @pytest.mark.parametrize(('height', 'alpha_kind'), [(20, None), (20, 'mixed'), (17000, None)])
@@ -44,6 +46,26 @@ def test_original_and_fingerprint_exclude_diagnostic_timings():
     packed['timings'] = {'render_layout': 99}
     assert before == fingerprint(packed, case)
     assert before['output_bytes'] == 0
+
+
+def test_measured_selects_gpu_by_uuid_and_ignores_unavailable_samples(monkeypatch):
+    stopped = []
+    def start(args, *, stdout, stderr):
+        assert '--id=GPU-test' in args
+        stdout.write(b'0\nN/A\n100\n')
+        return SimpleNamespace(terminate=lambda: stopped.append('stop'), wait=lambda: stopped.append('wait'))
+    monkeypatch.setattr(validate_render_output.subprocess, 'Popen', start)
+    value, metrics = measured(lambda: 42, nvidia_uuid='test')
+    assert value == 42 and metrics['gpu_busy_percent'] == 50 and metrics['gpu_samples'] == 2
+    assert metrics['cpu_percent_of_host'] == pytest.approx(100 * metrics['cpu_core_equivalents'] / metrics['logical_cpus'])
+    with pytest.raises(ValueError):
+        measured(lambda: int('fail'), nvidia_uuid='test')
+    assert stopped == ['stop', 'wait'] * 2
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError
+    monkeypatch.setattr(validate_render_output.subprocess, 'Popen', unavailable)
+    _, metrics = measured(lambda: 42, nvidia_uuid='test')
+    assert metrics['gpu_busy_percent'] is None and metrics['gpu_samples'] == 0
 
 
 def test_alpha_synthetic_has_nonbinary_source_alpha_and_independent_input_arrays():

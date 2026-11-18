@@ -1,15 +1,10 @@
-"""Geometry and width limits shared by recognition and color extraction."""
-OCR_IMAGE_SHAPE = (3, 48, 320)
+"""Hayai paragraph bounds and the native 48px color model's input limit."""
 OCR_MAX_WIDTH = 3200
 
 
 def valid_crop(image):
     return (image is not None and image.size > 0
-            and image.shape[1] * OCR_IMAGE_SHAPE[1] <= image.shape[0] * OCR_MAX_WIDTH)
-
-
-def short_crop(image):
-    return image.shape[1] * OCR_IMAGE_SHAPE[1] <= image.shape[0] * OCR_IMAGE_SHAPE[2]
+            and image.shape[1] * 48 <= image.shape[0] * OCR_MAX_WIDTH)
 
 
 def paragraph_box(box, width, height):

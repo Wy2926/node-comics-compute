@@ -6,7 +6,6 @@ dependencies = [
     "node-comics-classic-engine",
     "torch[device-gfx1030]",
     "torchvision[device-gfx1030]",
-    "onnxruntime-directml==1.24.4",
     "amd-torch-device-gfx1030==2.13.0+rocm10.1.0",
     "amd-torchvision-device-gfx1030==0.28.0+rocm10.1.0",
     "rocm==10.1.0",
@@ -20,7 +19,6 @@ test = ["pytest>=8"]
 
 [tool.uv]
 environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]
-exclude-dependencies = ["onnxruntime-gpu", "onnxruntime"]
 override-dependencies = [
     "torch[device-gfx1030]==2.13.0+rocm10.1.0",
     "torchvision[device-gfx1030]==0.28.0+rocm10.1.0",

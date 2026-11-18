@@ -6,16 +6,15 @@ from pathlib import Path
 
 def verify(root):
     import torch
-    import onnxruntime
     from PIL import features
     from classic_node.runtime import LANGUAGE_PROBES
     from mtu_engine.assets import verify as verify_assets
     from mtu_engine.engine import Renderer
     if not torch.version.cuda or not features.check('webp'):
         raise ValueError('Runtime requires CUDA-enabled PyTorch and WebP support')
-    if 'CUDAExecutionProvider' not in onnxruntime.get_available_providers():
-        raise ValueError('Runtime requires CUDA-enabled ONNX Runtime')
     verify_assets(root / 'models')
+    from mtu_engine.ocr.models import verify_hayai
+    verify_hayai(root / 'models/hayai')
     manifest = json.loads((root / 'release.json').read_text())
     renderer = Renderer(root / 'models', [str(root / name) for name in manifest['fonts']])
     for language, probe in LANGUAGE_PROBES.items():

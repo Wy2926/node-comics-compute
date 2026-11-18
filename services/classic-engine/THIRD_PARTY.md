@@ -6,7 +6,7 @@
 
 ## Hayai OCR v2.5 Nova
 
-[prepare_hayai.py](tools/prepare_hayai.py) prepares
+[prepare_mtu.py](tools/prepare_mtu.py) includes
 [Hayai OCR v2.5 Nova](https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2.5-nova)
 at revision `2803d0dc005fa4396ab1e7c5a472d2c450a247f7` (Apache-2.0).
 Its original FP32 `model.safetensors` is 627,709,088 bytes, SHA-256
@@ -15,7 +15,7 @@ The [SigLIP2 NaFlex processor](https://huggingface.co/google/siglip2-base-patch1
 is pinned at `b53b807d3a2d5e2b3911292f2d69e5341cdc064c` (Apache-2.0);
 its weights are already included in the Hayai checkpoint and are not downloaded again.
 
-[models.py](mtu_engine/ocr/models.py) pins SHA-256 for every model/configuration
+[upstream.lock.json](mtu_engine/upstream.lock.json) pins SHA-256 for every model/configuration
 source file, tokenizer, processor and model card. Preparation retains those files
 unchanged with a `source.json` manifest, publishing only complete verified assets
 outside the repository. Runtime checks all hashes before importing the checkpoint's
@@ -26,21 +26,23 @@ algorithms. It checks EOS/pad tokens to reject truncated paragraphs and ignores 
 upstream training-only IDS head. Runtime settings and supported validation scope are
 specified in [the adapter](mtu_engine/ocr/hayai.py) and [its tests](tests/test_ocr_backends.py).
 
-On Windows AMD, the adapter enables the upstream HIP-compatible decoder graph path.
-It retains the native four-state LRU when less than 8 GiB is free at model load.
-With that headroom the limit is eight, or nine for batch size eight to retain
+On CUDA and Windows AMD, the adapter uses the upstream CUDA/HIP decoder graph path.
+At model load CUDA stays eager below 4 GiB free, and keeps up to five graph states
+with 4 to under 8 GiB free. AMD retains the native four-state LRU below 8 GiB.
+With at least 8 GiB free the limit is eight, or nine for batch size eight to retain
 one additional visual-prefix bucket. States are still allocated on demand, with
 native eviction and eager fallback on capture failure. The shared
 model lock also protects graph/KV state. CPU shape/mask metadata stays on CPU as expected
 by `_FastEngine`; only image patches are transferred. Graph decoding uses upstream static
 padding and may change predictions (including punctuation); it is not a bit-identical
-replacement for eager decoding. NVIDIA and MPS retain eager decoding pending separate
-hardware validation. Local timings report preprocessing, transfer, inference, decoding,
+replacement for eager decoding. MPS retains eager decoding.
+Local timings report preprocessing, transfer, inference, decoding,
 model wait, successful graph/eager batches and truncated paragraphs without OCR text.
-The AMD capture adapter delegates to the original `_capture` method under a guard shared
-with detector, color, bubble and inpainting model calls, preventing HIP device-wide
+The capture adapter delegates to the original `_capture` method under a guard shared
+with detector, color, bubble and inpainting model calls, preventing device-wide
 synchronization during graph capture. Ordinary OCR replay and CPU preprocessing do not
-take this guard. The inference and graph algorithms remain upstream-owned.
+take this guard. On CUDA independent models can run concurrently; capture closes
+admission and waits for active model calls to finish before invoking upstream.
 
 ## Manga Translator UI
 
@@ -70,44 +72,32 @@ Local source edits are recorded verbatim as ordered per-file patches in the lock
 
 Preparation requires an exact single match for each patch, marks the changes in source, and hashes the resulting files in the asset manifest. Other MTU source files remain unmodified. Existing assets must be prepared again; startup rejects the previous lock hash.
 
-The lock also records the DBNet checkpoint from [manga-image-translator](https://github.com/zyddnys/manga-image-translator), PP-OCRv5 Korean weights/dictionary distributed by MTU, the LaMa Large checkpoint from [AnimeMangaInpainting](https://huggingface.co/dreMaz/AnimeMangaInpainting), and MangaLens weights distributed by the MTU author. PP-OCR reuses MTU's Apache-2.0 perspective crop and CTC decoder with published ONNX files pinned by SHA-256; no locally exported models or patched inference bindings are shipped.
+The lock also records the DBNet checkpoint from [manga-image-translator](https://github.com/zyddnys/manga-image-translator), the LaMa Large checkpoint from [AnimeMangaInpainting](https://huggingface.co/dreMaz/AnimeMangaInpainting), and MangaLens weights distributed by the MTU author.
 
 Text fill and single-outline colors reuse MTU's unmodified `ModelPaddleOCR._estimate_colors_batch` preprocessing/per-character aggregation, its perspective crop, `Model48pxOCR` loader and `TextBlock.set_font_colors`. Paragraphs without obvious chroma use black fill and white outline directly. Native `check_color` examines original valid line crops in bounded windows, without brightness-ratio or bubble-containment requirements; gray and reversed text intentionally lose their original gray style. Other paragraphs use one valid representative line, selected with Comic Translate's existing `_line_area` rule and preference for aligned nonempty OCR; original text and geometry remain intact. These are style-policy changes, not equivalent replacements for all-line color averaging; see [colors.py](mtu_engine/colors.py). The `ocr_ar_48px.ckpt` and `alphabet-all-v7.txt` files from manga-image-translator's `beta-0.3` release are SHA-256-pinned in the same lock; the upstream GPL-3.0 source notices remain in the prepared MTU tree. One shared 48px model supplies colors only; its text never replaces the selected language recognizer. For line-aligned OCR text, the adapter feeds existing tokens through the native decoder layers and color heads in a causal full-sequence pass, bypassing character prediction and beam search. A read-only attention view preserves the incremental cross-attention XPOS query scale while calling the native attention implementation; it does not copy the attention algorithm or mutate shared modules. Unsupported or unaligned text retains native beam inference; see [color inference tests](tests/test_color_text_inference.py) for the reuse boundary. There is no model conversion or upstream color-source patch.
 
 Request-local adapters keep OCR tokens isolated between pages and preserve native padding and per-character color aggregation. Returned tensors move to CPU before aggregation, avoiding per-character CUDA scalar reads. Conditioning on a different recognizer's text can change colors; this is not a claim of equivalent model outputs. Fallback beam parameters remain unchanged.
 
-On AMD, [color_positions.py](mtu_engine/color_positions.py) derives reusable factors from the native XPOS module on basis vectors. Frozen layers with equal scales share a bounded, model-local LRU. The cache contains no image or recognition data.
+On CUDA and AMD, [color_positions.py](mtu_engine/color_positions.py) derives reusable factors from the native XPOS module on basis vectors. Frozen layers with equal scales share a bounded, model-local LRU. The cache contains no image or recognition data.
 
-An analysis-local bounded cache reuses identical native perspective crops, RGB/BGR conversion and Paddle preprocessing only when crop identity and padding parameters match. It does not change native preprocessing or reuse differently padded long-line inputs; arrays and retained input owners are accounted for and released at analysis exit.
+An analysis-local bounded cache reuses identical native perspective crops and RGB/BGR conversion for color estimation. Arrays and retained input owners are accounted for and released at analysis exit.
 
-The AMD LaMa adapter in [inpainting.py](mtu_engine/inpainting.py) wraps the pinned
-upstream FP32 generator with PyTorch HIP graphs, captured only during startup for
-eight native square sizes (64 through 512). Original weights, preprocessing,
-window ordering and masked paste-back remain upstream-owned. Replay uses the
-caller's stream and holds its lock until the owned output clone completes;
-unsupported inputs and capture failures retain native eager inference. No model export or additional
-upstream source patch is used.
-
-## RapidOCR
-
-[RapidAI/RapidOCR](https://github.com/RapidAI/RapidOCR) 3.9.2 provides the unmodified `TextRecognizer` aspect-ratio sorting, bounded batching, resize/padding and order restoration. Its wheel and SHA-256 are pinned in `uv.lock`; Apache-2.0 notices remain in the package metadata and source. The adapter supplies the existing MTU CUDA session and decoder instead of loading RapidOCR's default models or dictionary. Before calling it, the adapter separates crops whose width at height 48 is at most 320 from longer crops; each group uses a configurable native batch limit (default four) and native resize/padding. On a recognized allocation failure only, a request-local adapter retries the group with a smaller native batch; long-line padding and therefore predictions may change. No upstream recognition algorithm is copied or rewritten. CUDA arena extension and shrinkage use ONNX Runtime 1.23.2's provider options and public RunOptions, without a custom allocator or binary patch; color batches are configured separately.
+The LaMa adapter in [inpainting.py](mtu_engine/inpainting.py) wraps the pinned
+upstream FP32 generator with PyTorch CUDA/HIP graphs, captured only during startup for
+eight native square sizes (64 through 512). CUDA skips capture below 4 GiB free at warmup.
+The locked `inpainting_lama_mpe.py` adapter transfers RGB and binary masks as bytes
+on NVIDIA, normalizes in FP32 on-device and returns uint8 RGB. The native Fourier
+generator masks its input; resize, padding, weights and paste-back stay native.
+Replay owns its output clone. CUDA orders reuse of static buffers using a stream
+event; HIP synchronizes before releasing the lock. Unsupported shapes stay eager.
 
 ## BallonsTranslator
 
 [dmMaze/BallonsTranslator](https://github.com/dmMaze/BallonsTranslator) supplies the unmodified `group_output` paragraph grouping and reading order, operating on MTU DBNet text lines. Its commit and archive SHA-256 are pinned in the same lock. Preparation retains `ballontranslator/`, the resources required by its library imports, `BallonsTranslator-LICENSE` and its dependency manifest under `upstream/`. No CTD checkpoint is distributed or executed. The adapter does not run the BallonsTranslator GUI or translation modules. No source extraction, rewritten grouping or upstream patch is maintained.
 
-## Paragraph sampling and language routing
+## Representative color line
 
-[ogkalu2/comic-translate](https://github.com/ogkalu2/comic-translate) supplies the unmodified `_line_area` rule used to select a paragraph's largest line, retaining the first line on ties. The selected line uses the same MTU perspective crop and rotation as final recognition, not Comic Translate's axis-aligned crop. Preparation retains its pinned `modules/`, `imkit/`, Apache-2.0 `LICENSE` and dependency manifests under `upstream/comic_translate/`. Its OSD model, GUI, account/credits, cloud OCR and OCR factory are not used. Checksum-recorded patches defer the PySide6 `Qt` import until its GUI layout function is called and ONNX Runtime imports until an OSD session is requested. Using `_line_area` therefore loads neither a second Qt binding nor the unused ONNX runtime; the sampling algorithm is unchanged.
-
-[Yuff1010/Manga-Overlay-Translator](https://github.com/Yuff1010/Manga-Overlay-Translator) supplies the unmodified `detect_lang`, character-script categories and weights. Its complete OCR module and MIT notice are pinned by revision and SHA-256 under `upstream/mot/`. The adapter supplies existing paragraph crops and three batched PP-OCRv5 predictions instead of repeating detection; English replaces the Spanish candidate using the same Latin weights, and Chinese/Japanese share the CJK probe prediction. Empty/unsupported evidence is rejected before the upstream first-candidate default. No learned classifier, custom scoring, model training or conversion is maintained.
-
-## Language-specific recognition
-
-- Chinese / Korean / English: separate PP-OCRv5 mobile recognizers, shared between paragraph probing and final recognition. English and Chinese use the published [ogkalu/ppocr-v5-onnx](https://huggingface.co/ogkalu/ppocr-v5-onnx) ONNX weights and dictionaries under Apache-2.0; Korean files are distributed by MTU. All files are checksum-pinned. The Chinese probe also supplies Japanese routing evidence. Only selected-model representative lines padded to width 320 reuse their probe result; longer lines are recognized normally, and private results are not cached across pages.
-- Japanese: [kha-white/manga-ocr](https://github.com/kha-white/manga-ocr), `manga-ocr==0.1.16`, and [manga-ocr-base](https://huggingface.co/kha-white/manga-ocr-base) at the locked revision. Original model, tokenizer, processor, model card and Apache-2.0 notice are retained. Native paragraph generation and postprocessing are unchanged.
-
-These assets are prepared only for `classic`; the shared 48px color weights remain necessary for either OCR choice. Models load from prepared local paths only. The default locked `onnxruntime-gpu` distribution supplies the CUDA inference runtime; no separate CPU `onnxruntime` distribution is installed.
+[ogkalu2/comic-translate](https://github.com/ogkalu2/comic-translate) supplies the unmodified `_line_area` rule for selecting the representative color line. Preparation retains its pinned `modules/`, `imkit/`, Apache-2.0 `LICENSE` and dependency manifests under `upstream/comic_translate/`. Locked patches defer the optional PySide6 and ONNX Runtime imports; the node uses only the rule and MTU's native perspective crop.
 
 PySide6-Essentials / Shiboken6 are required by upstream utility imports; their original Qt LGPL/GPL notices remain in the wheel metadata. Both are pinned to Qt 6.9.2 to match the existing PyQt6 Qt runtime. `mahotas` retains its MIT license in its distribution. Open-source license obligations remain applicable; no commercial OCR license is used.
 
@@ -115,8 +105,7 @@ PySide6-Essentials / Shiboken6 are required by upstream utility imports; their o
 
 - Document PDF rendering uses [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) 5.14.0 (BSD-3-Clause / Apache-2.0). Wheel URLs and SHA-256 are pinned in `uv.lock`; bundled PDFium and third-party notices remain in the distribution. The first-party `comic-document-files` package contains the shared bounded PDF/ZIP adapter, not copied PDFium implementation. Linux parsing requires kernel Landlock ABI >=3 and the distribution-maintained libseccomp library; user namespaces and privileged containers are not required. Unsupported hosts do not advertise document capability.
 - PyTorch and TorchVision CUDA distributions: upstream package notices and NVIDIA runtime notices are retained in wheel metadata. Qt rendering executes on the CPU.
-- ONNX Runtime GPU 1.23.2 executes all three PP-OCRv5 sessions with the CUDA 12 provider; its package metadata retains Microsoft's MIT notice and bundled dependency notices.
-- The optional Windows RX 6900 XT environment has its own [manifest](environments/amd/pyproject.toml) and [dependency lock](environments/amd/uv.lock). Official [AMD ROCm wheels](https://stable.repo.amd.com/rocm/whl-next/) provide PyTorch 2.13.0 / TorchVision 0.28.0 with ROCm SDK 10.1.0 and gfx1030 device kernels. [TheRock](https://github.com/ROCm/TheRock) build provenance and the original PyTorch, ROCm component and bundled dependency licenses remain in their distributions. ONNX Runtime DirectML 1.24.4 retains Microsoft's MIT and bundled DirectML notices. It replaces, rather than co-installs with, `onnxruntime-gpu` or `onnxruntime`; no patched binaries, exported models or ZLUDA libraries are used. Default CUDA dependencies and release builds do not include these packages.
+- The Windows RX 6900 XT [environment](environments/amd/pyproject.toml) and [lock](environments/amd/uv.lock) use official [AMD ROCm wheels](https://stable.repo.amd.com/rocm/whl-next/) for PyTorch 2.13.0 / TorchVision 0.28.0 with ROCm SDK 10.1.0 and gfx1030 device kernels. [TheRock](https://github.com/ROCm/TheRock) build provenance and the original PyTorch, ROCm component and bundled dependency licenses remain in their distributions.
 - PyQt6 / Qt6: original package licenses remain in the distribution.
 - PyHyphen uses bundled LibreOffice hyphenation data from the pinned Pyphen distribution. Its dictionary-specific notices are retained under `hyphenation/`; no dictionary download is performed during page processing.
 - The fixed translation-font catalog includes lighter and regular-weight choices and an explicit default for each target language. The former heavy defaults are no longer bundled. Noto Sans, Noto Sans CJK and the complete variable Noto Sans Arabic font remain available for fallback. Every font file's upstream revision, source URL, SHA-256 and SIL Open Font License notice are listed in [assets.json](../compute-node/assets.json) and retained under `licenses/`; the public ID, language and default mapping is [fonts.json](mtu_engine/fonts.json). Qt selects the physical face from the original file, without synthetic bolding or glyph modification.
@@ -125,4 +114,4 @@ PySide6-Essentials / Shiboken6 are required by upstream utility imports; their o
 
 `mtu-assets.json` records prepared source, model, dictionary, font and notice hashes. Node startup verifies those files before importing upstream image stages. Distribution manifests include the assembled runtime and source provenance. This inventory records origins; it does not replace upstream terms.
 
-The optional [macOS environment](environments/macos/pyproject.toml) and its lock retain official PyTorch / TorchVision Apple Silicon wheels and ONNX Runtime CPU 1.23.2. Main image stages use MPS; classic PP-OCR uses CPU ONNX. Hayai uses that same PyTorch environment and does not import RapidOCR, Manga OCR or ONNX Runtime. Original distribution notices remain in each environment.
+The [macOS environment](environments/macos/pyproject.toml) and its lock use official PyTorch / TorchVision Apple Silicon wheels for MPS. Original distribution notices remain in each environment.

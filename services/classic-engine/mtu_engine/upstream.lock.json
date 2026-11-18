@@ -296,6 +296,10 @@
       ],
       "manga_translator/inpainting/inpainting_lama_mpe.py": [
         {
+          "before": "        mask_pad = prep.pop('mask_pad')\n\n        if isinstance(self.model, LamaFourier):",
+          "after": "        mask_pad = prep.pop('mask_pad')\n\n        if self.device.startswith('cuda') and torch.version.cuda and isinstance(self.model, LamaFourier) and str(config.inpainting_precision) == 'fp32':\n            from mtu_engine.inpainting import cuda_lama_pixels\n            return self._restore_large_output(cuda_lama_pixels(self.model, image_pad, mask_pad, self.device), prep)\n\n        if isinstance(self.model, LamaFourier):"
+        },
+        {
           "before": "            mask_resized = resize_keep_aspect(mask_original, inpainting_size)\n",
           "after": "            # Keep partial source coverage through uint8 interpolation before binarizing.\n            mask_resized = resize_keep_aspect(mask_original * 255, inpainting_size)\n"
         },
@@ -380,18 +384,6 @@
       "license": "GPL-3.0"
     },
     {
-      "url": "https://github.com/hgmzhn/manga-translator-ui/releases/download/v1.7.1/korean_PP-OCRv5_rec_mobile_infer.onnx",
-      "sha256": "cd6e2ea50f6943ca7271eb8c56a877a5a90720b7047fe9c41a2e541a25773c9b",
-      "file": "ocr/korean_PP-OCRv5_rec_mobile_infer.onnx",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://github.com/hgmzhn/manga-translator-ui/releases/download/v1.7.1/ppocrv5_korean_dict.txt",
-      "sha256": "a88071c68c01707489baa79ebe0405b7beb5cca229f4fc94cc3ef992328802d7",
-      "file": "ocr/ppocrv5_korean_dict.txt",
-      "license": "Apache-2.0"
-    },
-    {
       "url": "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/detect-20241225.ckpt",
       "sha256": "67ce1c4ed4793860f038c71189ba9630a7756f7683b1ee5afb69ca0687dc502e",
       "file": "detection/detect-20241225.ckpt"
@@ -405,98 +397,32 @@
       "url": "https://www.modelscope.cn/models/hgmzhn/manga-translator-ui/resolve/master/mangalens.pt",
       "sha256": "4028152940f7c910f40192f46ede3b3f6c7129e5c76849c324d3564f8ac50198",
       "file": "detection/mangalens.pt"
-    },
-    {
-      "url": "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726c3606c4af92f5133b359ed14e0d30a455/en_PP-OCRv5_rec_mobile_infer.onnx",
-      "sha256": "c3461add59bb4323ecba96a492ab75e06dda42467c9e3d0c18db5d1d21924be8",
-      "file": "ocr/en_PP-OCRv5_rec_mobile_infer.onnx",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726c3606c4af92f5133b359ed14e0d30a455/ppocrv5_en_dict.txt",
-      "sha256": "e025a66d31f327ba0c232e03f407ae8d105e1e709e7ccb3f408aa778c24e70d6",
-      "file": "ocr/ppocrv5_en_dict.txt",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726c3606c4af92f5133b359ed14e0d30a455/ch_PP-OCRv5_rec_mobile_infer.onnx",
-      "sha256": "5825fc7ebf84ae7a412be049820b4d86d77620f204a041697b0494669b1742c5",
-      "file": "ocr/ch_PP-OCRv5_rec_mobile_infer.onnx",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726c3606c4af92f5133b359ed14e0d30a455/ppocrv5_dict.txt",
-      "sha256": "d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b",
-      "file": "ocr/ppocrv5_dict.txt",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/kha-white/manga-ocr-base/resolve/aa6573bd10b0d446cbf622e29c3e084914df9741/config.json",
-      "sha256": "8c0e395de8fa699daaac21aee33a4ba9bd1309cfbff03147813d2a025f39f349",
-      "file": "manga/config.json",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/kha-white/manga-ocr-base/resolve/aa6573bd10b0d446cbf622e29c3e084914df9741/preprocessor_config.json",
-      "sha256": "af4eb4d79cf61b47010fc0bc9352ee967579c417423b4917188d809b7e048948",
-      "file": "manga/preprocessor_config.json",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/kha-white/manga-ocr-base/resolve/aa6573bd10b0d446cbf622e29c3e084914df9741/special_tokens_map.json",
-      "sha256": "303df45a03609e4ead04bc3dc1536d0ab19b5358db685b6f3da123d05ec200e3",
-      "file": "manga/special_tokens_map.json",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/kha-white/manga-ocr-base/resolve/aa6573bd10b0d446cbf622e29c3e084914df9741/tokenizer_config.json",
-      "sha256": "d775ad1deac162dc56b84e9b8638f95ed8a1f263d0f56f4f40834e26e205e266",
-      "file": "manga/tokenizer_config.json",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/kha-white/manga-ocr-base/resolve/aa6573bd10b0d446cbf622e29c3e084914df9741/vocab.txt",
-      "sha256": "344fbb6b8bf18c57839e924e2c9365434697e0227fac00b88bb4899b78aa594d",
-      "file": "manga/vocab.txt",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/kha-white/manga-ocr-base/resolve/aa6573bd10b0d446cbf622e29c3e084914df9741/pytorch_model.bin",
-      "sha256": "c63e0bb5b3ff798c5991de18a8e0956c7ee6d1563aca6729029815eda6f5c2eb",
-      "file": "manga/pytorch_model.bin",
-      "license": "Apache-2.0"
     }
   ],
-  "support": [
-    {
-      "url": "https://raw.githubusercontent.com/Yuff1010/Manga-Overlay-Translator/454d0816869192e60a3aee455d509ab5b59ecdc5/server/ocr.py",
-      "sha256": "120e466e45ffb75fa4ddacddc6a470ca2155762f8e3c1c5ebf941fb3c0207bd3",
-      "file": "upstream/mot/ocr.py",
-      "license": "MIT"
+  "hayai": {
+    "model": {
+      "repo": "JustANormalTinkerer/hayai-ocr-v2.5-nova",
+      "revision": "2803d0dc005fa4396ab1e7c5a472d2c450a247f7",
+      "license": "Apache-2.0",
+      "files": {
+        "README.md": "1ecc6eae28d5d8297c48592b288d9099943fe94ff4ad288923fed79df38c69ef",
+        "config.json": "880c99360c77733032fe06e94de8123dca21610cab782c6df43e4e26c9d37c41",
+        "configuration_hayai.py": "47abd38cf1bae7aef27d01f5b8b4aa0960a7bc625a8afad79c4762ff5e5ed970",
+        "model.safetensors": "ac63cd177c5b68bd91e18dd4408e0400461c7cf19f484b0da1643e232d1ffc3a",
+        "modeling_hayai.py": "3409131b4a35fc1bc1f0d7c40f906f79d10f57476f40fe05939c5a1a0ba9d527",
+        "tokenizer.json": "f8a0a909c628a684fe463094614e236a8b1d3609e7770f77e7beafaf1056bf13",
+        "tokenizer_config.json": "6fb6c69afaedf1275872d3e62e276fd4467bd00da7a84cbbb5566a2cd28f58f6"
+      }
     },
-    {
-      "url": "https://raw.githubusercontent.com/Yuff1010/Manga-Overlay-Translator/454d0816869192e60a3aee455d509ab5b59ecdc5/LICENSE",
-      "sha256": "24df42cf36f4da5eb5b10fbe9314c781d31e30e2ffe4f0b935ac9313c627c960",
-      "file": "upstream/mot/LICENSE",
-      "license": "MIT"
-    },
-    {
-      "url": "https://raw.githubusercontent.com/kha-white/manga-ocr/c333b5d36e88d539d6b040b4c4cf90ad5ecd4f69/LICENSE",
-      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
-      "file": "upstream/manga_ocr/LICENSE",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726c3606c4af92f5133b359ed14e0d30a455/README.md",
-      "sha256": "98b45ea81164d1e1a1dd82255207053b15cd6c69d922a1c5cf3387ce604d4b74",
-      "file": "upstream/mot/ppocr-model-card.md",
-      "license": "Apache-2.0"
-    },
-    {
-      "url": "https://huggingface.co/kha-white/manga-ocr-base/resolve/aa6573bd10b0d446cbf622e29c3e084914df9741/README.md",
-      "sha256": "32f413afcc4295151e77d25202c5c5d81ef621b46f947da1c3bde13256dc0d5f",
-      "file": "upstream/manga_ocr/model-card.md",
-      "license": "Apache-2.0"
+    "processor": {
+      "repo": "google/siglip2-base-patch16-naflex",
+      "revision": "b53b807d3a2d5e2b3911292f2d69e5341cdc064c",
+      "license": "Apache-2.0",
+      "files": {
+        "README.md": "d4353009ea90b7de43575c4ba7e547e195e3239a62f7746afb16ae4ca7fa390a",
+        "config.json": "c0b8c2e7f0527b0bea1b1d9abe0381c0f294352df92439c54590b8420e539118",
+        "preprocessor_config.json": "1125703e5446d5b6ff4d5893a33bac128cdd21dc12e3dad2469a648fb0ae3bf7"
+      }
     }
-  ]
+  }
 }

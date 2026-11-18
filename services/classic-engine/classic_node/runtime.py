@@ -11,12 +11,10 @@ import numpy as np
 from PIL import Image
 
 from mtu_engine.assets import LOCK, file_hash, verify
-from mtu_engine.backend import ORT_PACKAGES
 from mtu_engine.engine import Engine, serialize_region
 from mtu_engine.fonts import DEFAULT_FONT_IDS, FONT_CHOICES, resolve_font_id
 from .render_pool import RenderPool, RenderPoolError, RenderMemoryError, ipc_bytes, render_page
 from .operations import LOG
-from .config import engine_options
 from .protocol import MAX_CHECKPOINT_BYTES, NodeFailure, digest, mask_image, png64
 from .timing import stage
 
@@ -46,10 +44,9 @@ class Runtime:
 
     def __init__(self, config):
         self.config = config
-        options = engine_options(config['engine'])
+        options = config['engine']
         backend = options.get('backend', 'cuda')
-        ocr_backend = options.get('ocr_backend', 'classic')
-        assets = verify(options['models'], ocr_backend)['files']
+        assets = verify(options['models'], include_hayai=False)['files']
         self.engine = Engine(**options)
         self.render_pool = None
         self._render_warning_lock = Lock()
@@ -69,8 +66,6 @@ class Runtime:
             'numpy', 'opencv-python', 'Pillow', 'networkx', 'shapely',
             'transformers', 'huggingface-hub', 'tokenizers', 'safetensors',
             'PySide6-Essentials', 'shiboken6', 'mahotas')
-        if ocr_backend == 'classic':
-            packages += (ORT_PACKAGES[backend], 'rapidocr', 'manga-ocr')
         dependencies = {name: package_version(name) for name in packages}
         self.version = f'mtu-{backend}-v1-' + digest({'upstream': LOCK['source']['revision'],
             'code': code, 'assets': assets, 'dependencies': dependencies, 'ocr': self.engine.ocr.identity,

@@ -389,14 +389,13 @@ def test_tiles_partition_final_glyph_pixels_across_boundaries_without_relayout()
     for tile, body in tiles:
         x, y, w, h = (tile[key] for key in ('x', 'y', 'width', 'height'))
         assert 0 <= x < x + w <= rgb.shape[1] and 0 <= y < y + h <= rgb.shape[0]
-        assert w <= 2048 and h <= 4096
+        assert w <= 2048 and h <= 512
         crop = final.crop((x, y, x + w, y + h))
         changed = (np.asarray(crop) != rgb[y:y + h, x:x + w]).any(axis=2)
         expected = Image.new('RGBA', crop.size)
         expected.paste(crop, mask=Image.fromarray(changed))
-        stream = BytesIO()
-        expected.save(stream, format='WEBP', lossless=True, method=4, quality=10, exact=False)
-        assert body == stream.getvalue()  # Tiled output retains the original compression.
+        with Image.open(BytesIO(body)) as decoded:
+            np.testing.assert_array_equal(decoded.convert('RGBA'), expected)
     np.testing.assert_array_equal(reconstruct(packed, rgb, None), np.asarray(final))
     assert any(t['y'] < 4096 for t, _ in tiles) and any(4096 <= t['y'] < 4200 for t, _ in tiles)
 
@@ -408,6 +407,28 @@ def test_tile_capability_preserves_existing_single_webp_bytes():
     final.putpixel((10, 10), (0, 0, 0))
     ordinary = pack_result(np.asarray(final), rgb, None, runtime.version, analysis, translated)
     assert pack_result(np.asarray(final), rgb, None, runtime.version, analysis, translated, allow_tiles=True) == ordinary
+
+
+def test_larger_fast_tile_container_can_still_fit_using_compact_encoding(monkeypatch):
+    from classic_node import protocol
+    from tools.validate_render_output import reconstruct
+    original = np.zeros((17000, 16, 3), dtype=np.uint8)
+    final = original.copy()
+    final[::250, 0] = 255
+    analysis, translated = {'input_hash': 'a'*64}, {'analysis_hash': 'b'*64, 'revision': 'c'*64}
+    def pack():
+        return pack_result(final, original, None, 'test', analysis, translated, allow_tiles=True)
+    fast = pack()
+    compact = protocol._pack_tiled(final, original, None, dict(fast['result']), 1, compact=True)
+    budget = len(compact['output_bytes'])
+    assert budget < len(fast['output_bytes'])
+    monkeypatch.setattr(protocol, 'MAX_RESULT_BYTES', budget)
+    recovered = pack()
+    assert recovered == compact
+    np.testing.assert_array_equal(reconstruct(recovered, original, None), final)
+    monkeypatch.setattr(protocol, 'MAX_RESULT_BYTES', budget - 1)
+    with pytest.raises(NodeFailure, match='CLASSIC_OUTPUT_TOO_LARGE'):
+        pack()
 
 
 @pytest.mark.parametrize('opacity', [None, 0, 128])

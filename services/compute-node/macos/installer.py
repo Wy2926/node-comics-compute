@@ -81,9 +81,9 @@ def prepare(root, previous=None):
                 shutil.copyfileobj(source, target)
         uv.chmod(0o755)
         env = dict(os.environ, UV_CACHE_DIR=str(cache / 'uv-cache'), UV_NO_CONFIG='1', UV_LINK_MODE='copy')
-        for name in reversed(requirements):
-            subprocess.run([str(uv), 'pip', 'install', '--python', str(python), '--require-hashes',
-                            '--no-build-isolation', '-r', str(root / name)], env=env, check=True)
+        common = ['--python', str(python), '--require-hashes', '--no-build-isolation']
+        subprocess.run([str(uv), 'pip', 'install', *common, '-r', str(root / 'build-requirements.txt')], env=env, check=True)
+        subprocess.run([str(uv), 'pip', 'sync', *common, *(str(root / name) for name in requirements)], env=env, check=True)
         marker.write_text(identity)
     current_lock = sha256(root / 'source/classic-engine/mtu_engine/upstream.lock.json')
     old_assets = previous / 'mtu-assets.json' if previous else root / 'mtu-assets.json'
@@ -95,6 +95,14 @@ def prepare(root, previous=None):
                         '--output', str(stage), '--cache', str(cache)], check=True)
         if previous:
             clone(previous / 'models', root / 'models')
+            if old_assets.is_file():
+                old_files = json.loads(old_assets.read_text())['files']
+                new_files = json.loads((stage / 'mtu-assets.json').read_text())['files']
+                for name in old_files.keys() - new_files.keys():
+                    if name.startswith('models/'):
+                        path = checked_path(root, name)
+                        if path.is_file() and sha256(path) == old_files[name]:
+                            path.unlink()  # Only a retired, unmodified file in the candidate.
         for name in ASSETS:
             if name == 'models' and (root / name).exists():
                 shutil.copytree(stage / name, root / name, dirs_exist_ok=True)

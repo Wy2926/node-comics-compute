@@ -9,8 +9,7 @@ from mtu_engine.assets import LOCK, verify
 from tools import prepare_mtu
 
 
-@pytest.mark.parametrize('ocr_backend', ['classic', 'hayai'])
-def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cache(tmp_path, monkeypatch, ocr_backend):
+def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cache(tmp_path, monkeypatch):
     output, cache = tmp_path / 'prepared', tmp_path / 'download-cache'
     stale = ('models/retired/weights.bin', 'upstream/retired/module.py',
              'upstream/retired/LICENSE', 'licenses/retired-model.txt',
@@ -63,8 +62,8 @@ def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cach
         return target
 
     monkeypatch.setattr(prepare_mtu, 'download', download)
-    manifest = prepare_mtu.prepare(output, cache, ocr_backend)
-    assert verify(output / 'models', ocr_backend) == manifest
+    manifest = prepare_mtu.prepare(output, cache)
+    assert verify(output / 'models') == manifest
     for relative, patches in LOCK['source']['patches'].items():
         expected = '# Upstream license retained\n' + ''.join(p['before'] for p in patches) + '# Other source retained\n'
         for patch in patches:
@@ -78,10 +77,18 @@ def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cach
     assert cached_sample.read_bytes() == b'existing cache content'
     for name in ('upstream/manga_ocr/LICENSE', 'upstream/mot/LICENSE',
                  'models/ocr/ch_PP-OCRv5_rec_mobile_infer.onnx', 'models/manga/pytorch_model.bin'):
-        assert (name in manifest['files']) == (ocr_backend == 'classic')
+        assert name not in manifest['files']
+    assert json.loads((output / 'models/hayai/source.json').read_text()) == LOCK['hayai']
+    for folder, spec in LOCK['hayai'].items():
+        assert all(f'models/hayai/{folder}/{name}' in manifest['files'] for name in spec['files'])
     assert 'models/ocr/ocr_ar_48px.ckpt' in manifest['files']
     assert 'models/ocr/alphabet-all-v7.txt' in manifest['files']
     assert not any(name.startswith('samples/') for name in manifest['files'])
+    image_files = verify(output / 'models', include_hayai=False)['files']
+    assert set(manifest['files']) - set(image_files) == {p for p in manifest['files'] if p.startswith('models/hayai/')}
+    (output / 'models/hayai/model/model.safetensors').write_bytes(b'corrupt')
+    with pytest.raises(ValueError, match='asset checksum mismatch'):
+        verify(output / 'models')
 
 
 @pytest.mark.parametrize('marker', ['node.json', 'state'])

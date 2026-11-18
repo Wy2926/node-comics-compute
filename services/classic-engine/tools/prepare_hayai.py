@@ -26,7 +26,7 @@ def prepare(source, output):
                 if file_hash(original) != checksum:
                     raise ValueError('Hayai source checksum mismatch')
                 shutil.copyfile(original, target / name)
-        (prepared / 'source.json').write_text(json.dumps(SOURCES, indent=2) + '\n')
+        (prepared / 'source.json').write_text(json.dumps(SOURCES, indent=2) + '\n', encoding='utf-8', newline='\n')
         identity = verify_hayai(prepared)
         prepared.rename(output)
     return identity

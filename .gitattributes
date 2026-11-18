@@ -2,3 +2,4 @@
 *.go text eol=lf
 *.toml text eol=lf
 *.lock text eol=lf
+services/classic-engine/mtu_engine/upstream.lock.json text eol=lf

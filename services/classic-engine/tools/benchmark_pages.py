@@ -20,7 +20,7 @@ import torch
 from classic_node.protocol import digest
 from classic_node.runtime import Runtime
 from classic_node.timing import collect
-from classic_node.config import ENGINE_DEFAULTS, engine_options
+from classic_node.config import ENGINE_DEFAULTS
 from tools.validate_render_output import measured, reconstruct
 
 
@@ -42,13 +42,7 @@ def run(args):
                                           local_pages=args.concurrency, max_leases=8)
         args.threads, args.render_workers = resources['analysis_threads'], resources['render_workers']
     inference = {key: getattr(args, key, default) for key, default in ENGINE_DEFAULTS.items()
-                 if key.endswith('_batch_size') or key.startswith('ocr_arena_')}
-    if args.hayai_model:
-        if inference['ocr_batch_size'] > 8:
-            raise ValueError('Hayai supports an OCR batch size of at most 8')
-        inference = engine_options(inference | {'ocr_backend': 'hayai'})
-    elif inference['ocr_min_batch_size'] > inference['ocr_batch_size']:
-        raise ValueError('ocr_min_batch_size must not exceed ocr_batch_size')
+                 if key.endswith('_batch_size')}
     config = {'engine': {**inference, 'backend': getattr(args, 'backend', 'cuda'),
                          'detect_precision': args.detect_precision,
                          'models': str(args.models.resolve()), 'threads': args.threads,
@@ -65,6 +59,7 @@ def run(args):
     reserve_mib = getattr(args, 'reserve_vram_mib', 0)
     reserved_vram = torch.empty(reserve_mib * 1024 ** 2, dtype=torch.uint8, device='cuda') if reserve_mib else None
     runtime = Runtime(config)
+    nvidia_uuid = torch.cuda.get_device_properties(runtime.engine.gpu).uuid if runtime.engine.backend == 'cuda' else None
     report = {'engine': runtime.version, 'backend': config['engine']['backend'],
               'torch': torch.__version__, 'cuda': torch.version.cuda, 'hip': torch.version.hip,
               'gpu': torch.cuda.get_device_name(), 'threads': args.threads,
@@ -121,7 +116,9 @@ def run(args):
                 alpha.close()
 
     try:
+        started = perf_counter()
         runtime.warmup()
+        report['warmup_seconds'] = perf_counter() - started
         if args.pipeline:
             from tools.validate_pipeline_pressure import exercise
             inputs = [path.read_bytes() for path in paths]
@@ -137,8 +134,9 @@ def run(args):
                     result, resources = measured(lambda: exercise(Path(directory), 'throughput', runtime,
                         total=args.total, timeout=600, local_pages=args.concurrency, inputs=inputs,
                         local={'resident_bytes': args.resident_mib * 1024 ** 2,
-                               'render_workers': args.render_workers}))
+                               'render_workers': args.render_workers}), nvidia_uuid=nvidia_uuid)
                 report['runs'].append({**resources, **result,
+                    'torch_peak_allocated_bytes': torch.cuda.max_memory_allocated(),
                     'torch_peak_reserved_bytes': torch.cuda.max_memory_reserved()})
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
@@ -150,7 +148,7 @@ def run(args):
             report['first_pass'] = list(pool.map(page, paths))
             for repeat in range(args.repeats):
                 torch.cuda.reset_peak_memory_stats()
-                pages, resources = measured(lambda: list(pool.map(page, paths)))
+                pages, resources = measured(lambda: list(pool.map(page, paths)), nvidia_uuid=nvidia_uuid)
                 resources['torch_peak_allocated_bytes'] = torch.cuda.max_memory_allocated()
                 resources['torch_peak_reserved_bytes'] = torch.cuda.max_memory_reserved()
                 report['runs'].append({'pages': pages, **resources})
@@ -171,7 +169,7 @@ if __name__ == '__main__':
     parser.add_argument('--models', type=Path, required=True)
     parser.add_argument('--backend', choices=('cuda', 'amd'), default='cuda')
     parser.add_argument('--detect-precision', choices=('auto', 'fp32', 'fp16'), default='auto')
-    parser.add_argument('--hayai-model', type=Path, help='Use this prepared Hayai model instead of classic OCR')
+    parser.add_argument('--hayai-model', type=Path, help='Override the bundled models/hayai directory')
     parser.add_argument('--repeats', type=int, choices=range(1, 21), default=3)
     parser.add_argument('--concurrency', type=int, choices=range(1, 9), default=1)
     parser.add_argument('--render-workers', type=int, choices=range(1, 9), default=2)
@@ -183,10 +181,7 @@ if __name__ == '__main__':
     parser.add_argument('--auto-cpu', action='store_true', help='Exercise the node CPU resource planner')
     parser.add_argument('--reserve-vram-mib', type=int, choices=range(0, 16385), default=0, metavar='0..16384',
                         help='Reserve test-only CUDA memory to simulate a smaller GPU; never use on a busy device')
-    for key in ('ocr_batch_size', 'ocr_min_batch_size', 'color_batch_size', 'detect_batch_size'):
-        parser.add_argument('--' + key.replace('_', '-'), type=int, choices=range(1, 33), default=ENGINE_DEFAULTS[key])
-    parser.add_argument('--ocr-arena-extend-strategy', choices=('kSameAsRequested', 'kNextPowerOfTwo'),
-                        default=ENGINE_DEFAULTS['ocr_arena_extend_strategy'])
-    parser.add_argument('--ocr-arena-shrinkage', action=argparse.BooleanOptionalAction,
-                        default=ENGINE_DEFAULTS['ocr_arena_shrinkage'])
+    for key in ('ocr_batch_size', 'color_batch_size', 'detect_batch_size'):
+        parser.add_argument('--' + key.replace('_', '-'), type=int, choices=range(1, 9 if key == 'ocr_batch_size' else 33),
+                            default=ENGINE_DEFAULTS[key])
     run(parser.parse_args())

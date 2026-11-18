@@ -23,9 +23,7 @@ def test_backend_config_is_opt_in_and_keeps_resource_defaults(tmp_path, selectio
     assert config['local_pages'] == 2 and config['max_leases'] == 8
     assert config['inpaint_slots'] == 2
     assert config['engine']['ocr_batch_size'] == 4
-    assert config['engine']['ocr_min_batch_size'] == 1
-    assert config['engine']['ocr_arena_extend_strategy'] == 'kSameAsRequested'
-    assert config['engine']['ocr_arena_shrinkage'] is True
+    assert execution_settings(config)['engine']['ocr_backend'] == 'hayai'
     assert execution_settings(config)['engine']['backend'] == (selection or 'cuda')
 
 
@@ -137,10 +135,10 @@ def test_backend_dependency_locks_do_not_mix_gpu_runtimes():
     amd = tomllib.loads((root / 'environments/amd/uv.lock').read_text(encoding='utf-8'))
     cuda_names = {p['name'] for p in cuda['package']}
     amd_names = {p['name'] for p in amd['package']}
-    assert 'onnxruntime-gpu' in cuda_names and 'onnxruntime-directml' not in cuda_names
+    macos = tomllib.loads((root / 'environments/macos/uv.lock').read_text(encoding='utf-8'))
+    all_names = cuda_names | amd_names | {p['name'] for p in macos['package']}
+    assert not all_names.intersection({'onnxruntime-gpu', 'onnxruntime', 'onnxruntime-directml', 'manga-ocr', 'rapidocr'})
     assert not any(n.startswith(('rocm', 'amd-torch')) for n in cuda_names)
-    assert 'onnxruntime-directml' in amd_names
-    assert not amd_names.intersection({'onnxruntime', 'onnxruntime-gpu'})
     assert not any(n.startswith('nvidia-') for n in amd_names)
     assert {'amd-torch-device-gfx1030', 'rocm-sdk-device-gfx1030'} <= amd_names
     assert ENGINE_DEFAULTS['backend'] == 'cuda'

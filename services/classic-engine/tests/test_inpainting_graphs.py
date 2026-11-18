@@ -1,4 +1,4 @@
-"""Graph lifecycle/fallback tests; only the explicit AMD test uses a GPU."""
+"""Graph lifecycle/fallback tests, including opt-in CUDA/HIP replay."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import os
@@ -65,8 +65,8 @@ def test_capture_failure_discards_partial_cache_and_validates_eager_fallback(mon
                                    torch.full((1, 3, 4, 4), 1.25))
 
 
-@pytest.mark.skipif(os.environ.get('MTU_TEST_BACKEND') != 'amd', reason='Requires explicit AMD GPU validation')
-def test_hip_graph_outputs_are_owned_across_threads_streams_and_shapes():
+@pytest.mark.skipif(os.environ.get('MTU_TEST_BACKEND') not in ('cuda', 'amd'), reason='Requires CUDA/HIP validation')
+def test_graph_outputs_are_owned_across_threads_streams_and_shapes():
     generator = Generator().cuda().eval()
     wrapper = LamaGraphs(generator)
     wrapper.prepare()
@@ -95,3 +95,17 @@ def test_hip_graph_outputs_are_owned_across_threads_streams_and_shapes():
         torch.testing.assert_close(wrapper(image, mask), generator(image, mask), rtol=0, atol=0)
     assert timings == {'inpaint_eager_blocks': 1}
     assert tuple(wrapper.graphs) == original_graphs  # Runtime shapes cannot grow the cache.
+
+
+@pytest.mark.skipif(os.environ.get('MTU_TEST_BACKEND') != 'cuda', reason='Requires CUDA validation')
+def test_lama_skips_optional_graphs_with_low_cuda_headroom(monkeypatch):
+    generator = Generator().cuda().eval()
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda device: (4 * 1024**3 - 1, 8 * 1024**3))
+    wrapper = LamaGraphs(generator)
+    wrapper.prepare()
+    assert wrapper.prepared and not wrapper.graphs
+    image = torch.ones((1, 3, 64, 64), device='cuda')
+    mask = torch.ones_like(image[:, :1])
+    with collect() as timings:
+        torch.testing.assert_close(wrapper(image, mask), generator(image, mask))
+    assert timings == {'inpaint_eager_blocks': 1}

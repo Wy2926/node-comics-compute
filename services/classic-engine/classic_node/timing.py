@@ -16,14 +16,12 @@ WIRE_FIELDS = frozenset(('download', 'download_queue', 'analyze', 'analyze_queue
     'render_encode', 'detect_lock_wait', 'ocr_lock_wait', 'inpaint_lock_wait'))
 
 OCR_FIELDS = frozenset(('analyze_detect', 'detect_filter', 'detect_filter_opencl_chunks', 'detect_filter_cpu_pages',
-    'analyze_group', 'analyze_route', 'analyze_ocr',
+    'analyze_group', 'analyze_ocr',
     'analyze_colors', 'analyze_bubbles', 'analyze_bubble_mask', 'analyze_refine', 'analyze_checkpoint',
     'analyze_color_gate', 'color_fast_regions', 'color_model_lines', 'color_batches', 'color_batch_max',
     'ocr_crop', 'ocr_preprocess', 'ocr_transfer', 'ocr_infer', 'ocr_decode', 'ocr_lock_wait', 'ocr_model_lock_wait',
     'ocr_paragraphs', 'ocr_batches', 'ocr_batch_max', 'ocr_output_tokens', 'ocr_truncated',
-    'ocr_graph_batches', 'ocr_eager_batches', 'ocr_capture_wait', 'ocr_capture', 'ocr_graph_captures',
-    'ocr_width_max', 'ocr_input_bytes_max', 'ocr_ooms', 'ocr_oom_retries',
-    'ocr_cache_release', 'ocr_cache_releases'))
+    'ocr_graph_batches', 'ocr_eager_batches', 'ocr_capture_wait', 'ocr_capture', 'ocr_graph_captures'))
 
 LOCAL_TIMINGS = WIRE_FIELDS | OCR_FIELDS | frozenset((
     'prepare', 'prepare_queue', 'package', 'package_queue', 'persist', 'persist_queue',

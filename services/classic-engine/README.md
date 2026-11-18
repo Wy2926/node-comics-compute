@@ -17,6 +17,6 @@ uv run python -m classic_node run --config node.local.json
 uv run python -m pytest -q
 ```
 
-`check` 校验资产并预热；`run` 才接单。使用 Hayai 时，运行 `python -m tools.prepare_hayai --source <下载目录> --output <模型目录>`，配置 `engine.ocr_backend=hayai`、`engine.ocr_model` 指向该目录。仅准备 Hayai 的公共资产时给 `prepare_mtu` 加 `--ocr-backend hayai`。更新上游补丁时，在独立目录按新锁重新准备资产。
+`prepare_mtu` 一次准备检测、Hayai OCR、取色、抹字和字体；默认读取 `models/hayai`。已有单独校验过的 Hayai 目录可用 `engine.ocr_model` 指定。`check` 校验并预热，`run` 才接单。旧锁的资产须在独立目录重新准备，保留私有配置和恢复数据。
 
 [流水线、实测与离线验证](../../docs/PIPELINE.md) · [配置与恢复](../../docs/NODE_CONFIGURATION.md) · [第三方来源与修改](THIRD_PARTY.md)

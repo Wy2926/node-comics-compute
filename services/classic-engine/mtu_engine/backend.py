@@ -7,7 +7,7 @@ from threading import RLock
 
 
 BACKENDS = ('cuda', 'amd', 'mps')
-ORT_PACKAGES = {'cuda': 'onnxruntime-gpu', 'amd': 'onnxruntime-directml', 'mps': 'onnxruntime'}
+CUDA_GRAPH_MIN_FREE = 4 * 1024**3
 # Different models share the MPS command stream. PyTorch 2.14.1 can segfault
 # when one worker copies tensors while another encodes an arange operation.
 # Protect the entire device scope, including transfers and model teardown.
@@ -52,7 +52,7 @@ def validate_backend(backend, gpu):
     if backend == 'cuda' and hip:
         raise RuntimeError('CUDA backend requires a CUDA PyTorch environment, not ROCm')
     if backend == 'amd' and (sys.platform != 'win32' or not hip):
-        raise RuntimeError('AMD backend requires the separate Windows ROCm/DirectML environment')
+        raise RuntimeError('AMD backend requires the separate Windows ROCm environment')
     if not torch.cuda.is_available() or not 0 <= gpu < torch.cuda.device_count():
         raise RuntimeError('The configured GPU is unavailable; CPU fallback is disabled')
     if backend == 'amd' and (gpu != 0 or torch.cuda.device_count() != 1):

@@ -1,4 +1,4 @@
-"""Selectable OCR boundaries, ordered paragraphs and pinned local Hayai assets."""
+"""Hayai configuration, ordered paragraphs and pinned local assets."""
 import asyncio
 import json
 import subprocess
@@ -46,6 +46,11 @@ def test_invalid_backend_configuration_fails_before_model_load(tmp_path, option)
         load(configuration(tmp_path, **option))
 
 
+def test_direct_hayai_load_rejects_oversize_batches_before_loading_weights():
+    with pytest.raises(ValueError, match='batch_size'):
+        HayaiOCR('missing', batch_size=9)
+
+
 def block(box, lines=1):
     return SimpleNamespace(xyxy=box, lines=[object()] * lines)
 
@@ -63,7 +68,6 @@ def test_paragraph_batches_are_bounded_and_restore_geometry_order():
     assert batches == [[(2, 2), (3, 4)], [(20, 20)]]
     assert [r.texts for r in result] == [['(20, 20)', '', ''], ['(2, 2)'], ['(3, 4)'], []]
     assert [r.line_aligned for r in result] == [False, True, True, False]
-    assert all(r.language is None for r in result)
     assert regions[0].xyxy == (0, 0, 20, 20) and len(regions[0].lines) == 3
 
 
@@ -77,11 +81,9 @@ def test_empty_paragraphs_cannot_authorize_erasure_and_count_mismatch_fails():
         asyncio.run(ocr.recognize(np.zeros((10, 10, 3), np.uint8), [block((0, 0, 5, 5))], None))
 
 
-def test_inactive_classic_options_do_not_block_hayai_or_enter_diagnostics(tmp_path):
-    config = load(configuration(tmp_path, ocr_min_batch_size=99,
-        ocr_arena_extend_strategy='unused', ocr_arena_shrinkage='unused'))
-    assert not {'ocr_min_batch_size', 'ocr_arena_extend_strategy', 'ocr_arena_shrinkage'} & config['engine'].keys()
-    assert execution_settings(config)['engine']['ocr_backend'] == 'hayai'
+def test_explicit_retired_ocr_is_rejected_before_model_loading(tmp_path):
+    with pytest.raises(ValueError, match='Only Hayai'):
+        load(configuration(tmp_path, ocr_backend='classic'))
 
 
 def test_truncated_or_empty_generation_cannot_authorize_erasure():

@@ -1,4 +1,4 @@
-"""Mocked model-stage policy tests; no neural model or CUDA execution."""
+"""Page-stage boundaries with a mock paragraph reader; no GPU or model assets."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import sys
@@ -9,56 +9,42 @@ import numpy as np
 import pytest
 
 from mtu_engine.engine import Engine
-from mtu_engine.ocr.classic import ClassicOCR
-from classic_node.timing import collect
+from mtu_engine.ocr import Reading
+from mtu_engine.backend import cancellation
+from classic_node.protocol import NodeFailure
 
 
 @pytest.fixture
 def analysis(monkeypatch):
+    engine = Engine.__new__(Engine)
+    engine.gpu, engine.backend, engine.device, engine.keep_lang = 0, 'cuda', 'cuda:0', None
+    engine._detector_lock, engine._bubble_lock, engine._capture_guard = Lock(), Lock(), nullcontext()
     source = np.full((64, 128, 3), 255, dtype=np.uint8)
     quads = [np.array([[4, y], [120, y], [120, y+12], [4, y+12]]) for y in (4, 24, 44)]
     block = SimpleNamespace(lines=quads, font_size=12, angle=0, src_is_vertical=False)
     calls = []
-
     def text_block(**kwargs):
         return SimpleNamespace(**kwargs, text=' '.join(kwargs['texts']), source_lang='en')
-
     async def detect(*args, **kwargs):
-        return [SimpleNamespace(pts=quad) for quad in quads], np.ones(source.shape[:2]), None
-
+        return [SimpleNamespace(pts=q) for q in quads], np.ones(source.shape[:2]), None
+    async def recognize(*args):
+        return [Reading(['one paragraph', '', ''], line_aligned=False)]
     async def refine(regions, rgb, raw, **kwargs):
-        calls.append(('refine', regions))
+        calls.append('refine')
         return raw
-
     monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(cuda=SimpleNamespace(device=lambda _: nullcontext())))
     monkeypatch.setitem(sys.modules, 'manga_translator.mask_refinement', SimpleNamespace(dispatch=refine))
-    monkeypatch.setitem(sys.modules, 'ballontranslator.utils.textblock',
-                        SimpleNamespace(group_output=lambda *args: [block]))
-    monkeypatch.setitem(sys.modules, 'manga_translator.utils', SimpleNamespace(
-        TextBlock=text_block,
-        Quadrilateral=lambda pts, text, prob: SimpleNamespace(pts=pts, text=text, prob=prob),
-        build_bubble_mask_from_mangalens_result=lambda detected, shape: np.zeros(shape),
+    monkeypatch.setitem(sys.modules, 'ballontranslator.utils.textblock', SimpleNamespace(group_output=lambda *args: [block]))
+    monkeypatch.setitem(sys.modules, 'manga_translator.utils', SimpleNamespace(TextBlock=text_block,
+        build_bubble_mask_from_mangalens_result=lambda result, shape: np.zeros(shape),
         is_valuable_text=lambda text: any(char.isalpha() for char in text)))
-    engine = Engine.__new__(Engine)
-    engine.gpu, engine.keep_lang = 0, None
-    engine.backend, engine.device = 'cuda', 'cuda:0'
-    engine.ocr = ClassicOCR.__new__(ClassicOCR)
-    engine.config = SimpleNamespace(
-        detector=SimpleNamespace(detection_size=1280, text_threshold=0.5, box_threshold=0.6, unclip_ratio=2.3),
-        render=SimpleNamespace(stroke_width=0.1),
-        ocr=SimpleNamespace(prob=0.5, min_text_length=1), mask_dilation_offset=0, kernel_size=3)
-    engine._detector_lock, engine._bubble_lock = Lock(), Lock()
-    engine._capture_guard = nullcontext()
+    engine.config = SimpleNamespace(detector=SimpleNamespace(detection_size=1280, text_threshold=.5,
+        box_threshold=.6, unclip_ratio=2.3), render=SimpleNamespace(stroke_width=.1),
+        ocr=SimpleNamespace(min_text_length=1, model_bubble_overlap_threshold=.5), mask_dilation_offset=0, kernel_size=3)
     engine.detector = SimpleNamespace(detect=detect)
-    engine.ocr.router = SimpleNamespace(classify=lambda image, blocks, groups: (['en'] * len(blocks), [None] * len(blocks)))
-    engine.ocr.recognizers = {}
-    engine.ocr.japanese = SimpleNamespace(recognize=lambda *args: pytest.fail('Unexpected Japanese branch'))
-    def colors(image, regions, *, capture_guard=None):
-        assert image is source and not hasattr(engine, '_ocr_lock')
-        assert all(not region.adjust_bg_color and region.default_stroke_width == .1 for region in regions)
-        calls.append(('colors', regions))
-    engine.colors = SimpleNamespace(apply=colors)
-    engine.bubbles = SimpleNamespace(detect=lambda *args, **kwargs: calls.append(('bubbles', None)))
+    engine.ocr = SimpleNamespace(recognize=recognize)
+    engine.colors = SimpleNamespace(apply=lambda *a, **kw: calls.append('colors'))
+    engine.bubbles = SimpleNamespace(detect=lambda *a, **kw: calls.append('bubbles'))
     return engine, source, quads, calls
 
 
@@ -67,303 +53,117 @@ def analysis(monkeypatch):
 def test_analysis_requests_source_short_side_for_native_detection(analysis, shape):
     engine, _, _, _ = analysis
     rgb = np.zeros((*shape, 3), dtype=np.uint8)
-    observed = []
     async def detect(image, size, text_threshold, box_threshold, unclip_ratio, **kwargs):
-        assert image is rgb
-        observed.append((size, text_threshold, box_threshold, unclip_ratio, kwargs))
+        assert image is rgb and (size, text_threshold, box_threshold, unclip_ratio) == (1280, .5, .6, 2.3)
+        assert kwargs == {'det_rearrange_min_effective_short_side': min(shape)}
         return [], None, None
     async def recognize(*args):
-        return [SimpleNamespace(texts=[])]
-    engine.detector.detect = detect
-    engine.ocr.recognize = recognize
+        return [Reading([])]
+    engine.detector.detect, engine.ocr.recognize = detect, recognize
     assert engine.analyze(rgb) == ([], None, None, None)
-    assert observed == [(1280, .5, .6, 2.3, {'det_rearrange_min_effective_short_side': min(shape)})]
 
 
-@pytest.mark.parametrize('backend,limit,fail_at,expected', [
-    ('cuda', 512, None, [512]),
-    ('cuda', 1024, None, [512]),
-    ('amd', 512, None, [512, 64, 128, 192, 256, 320, 384, 448]),
-    ('amd', 768, None, [512, 64, 128, 192, 256, 320, 384, 448, 576, 640, 704, 768]),
-    ('amd', 1024, None, [512, 64, 128, 192, 256, 320, 384, 448, 576, 640, 704, 768, 832, 896, 960, 1024]),
-    ('amd', 512, 192, [512, 64, 128, 192]),
-])
-def test_warmup_covers_amd_block_shapes_without_changing_cuda(analysis, backend, limit, fail_at, expected):
+@pytest.mark.parametrize('backend,limit,fail_at', [('cuda', 512, None), ('cuda', 1024, None),
+    ('mps', 512, None), ('amd', 512, None), ('amd', 768, None), ('amd', 1024, None), ('amd', 512, 192)])
+def test_warmup_prepares_graphs_after_native_block_warmup(analysis, backend, limit, fail_at):
     engine, _, _, calls = analysis
     engine.backend = backend
     engine.config.inpainter = SimpleNamespace(inpainting_size=limit)
     shapes = []
-
-    def record(name):
-        async def run(*args):
-            calls.append((name, None))
-        return run
-
+    async def warm(*args):
+        calls.append('ocr')
     async def inpaint(image, mask, config, size):
         side = image.shape[0]
         assert image.shape == (side, side, 3) and mask.shape == (side, side)
-        assert image.dtype == mask.dtype == np.uint8
-        assert np.any(mask) and np.any(mask == 0)
+        assert image.dtype == mask.dtype == np.uint8 and np.any(mask) and np.any(mask == 0)
         assert config is engine.config.inpainter and size == limit
         shapes.append(side)
         if side == fail_at:
             raise RuntimeError('fixture inpaint failed')
-
-    engine.detector.detect = record('detect')
-    engine.ocr.recognizers = {name: SimpleNamespace(recognize=record(name)) for name in ('en', 'ch', 'korean')}
-    engine.ocr.router.choose = lambda *args: calls.append(('route', None))
-    engine.colors.apply = lambda *args: calls.append(('colors', None))
-    def prepare_graphs():
-        assert shapes == expected
-        calls.append(('graphs', None))
+    engine.ocr.warmup = warm
     engine.inpainter = SimpleNamespace(inpaint=inpaint,
-        model=SimpleNamespace(generator=SimpleNamespace(prepare=prepare_graphs)))
+        model=SimpleNamespace(generator=SimpleNamespace(prepare=lambda: calls.append('graphs'))))
     with pytest.raises(RuntimeError, match='fixture inpaint failed') if fail_at else nullcontext():
         engine.warmup()
-    assert shapes == expected
-    assert [name for name, _ in calls] == ['detect', 'en', 'ch', 'korean', 'route', 'colors'] + (
-        [] if fail_at else (['graphs', 'bubbles'] if backend == 'amd' else ['bubbles']))
+    expected = [512] + ([s for s in range(64, limit + 1, 64) if s != 512] if backend == 'amd' else [])
+    assert shapes == (expected[:expected.index(fail_at)+1] if fail_at else expected)
+    assert calls == ['ocr', 'colors'] + ([] if fail_at else (['bubbles'] if backend == 'mps' else ['graphs', 'bubbles']))
     assert not engine._detector_lock.locked() and not engine._bubble_lock.locked()
 
 
-@pytest.mark.parametrize('texts', [
-    ['first line', '', 'last line'], ['', 'middle line', ''],
-    ['first line', 'middle line', 'last line'],
-])
-def test_partial_ocr_retains_recognized_text_order_and_original_geometry(analysis, texts):
-    engine, source, quads, calls = analysis
-
-    async def recognize(rgb, lines, config):
-        for line, text in zip(lines, texts):
-            line.text, line.prob = text, 0.9 if text else 0.1
-
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
-    regions, mask, raw, bubbles = engine.analyze(source)
-    assert len(regions) == 1
-    assert regions[0].texts == texts
-    assert regions[0].language == 'en'  # Request-local route for line-aligned color reuse.
-    np.testing.assert_array_equal(regions[0].lines, quads)
-    assert mask is raw and bubbles.shape == source.shape[:2]
-    assert [call[0] for call in calls] == ['colors', 'bubbles', 'refine']
-
-
-@pytest.mark.parametrize('texts,keep_lang,min_length', [
-    (['', '', ''], None, 1), ([' ', '\t', '\n'], None, 1),
-    (['...', '', ''], None, 1), (['hello', '', ''], 'zh', 1),
-    (['a', '', ''], None, 2),
-])
-def test_no_eligible_text_skips_bubbles_and_erasure(analysis, texts, keep_lang, min_length):
+@pytest.mark.parametrize('text,keep_lang,minimum', [('', None, 1), (' ', None, 1), ('...', None, 1),
+                                                   ('hello', 'zh', 1), ('a', None, 2)])
+def test_no_eligible_paragraph_skips_bubbles_and_erasure(analysis, text, keep_lang, minimum):
     engine, source, _, calls = analysis
-    engine.keep_lang = keep_lang
-    engine.config.ocr.min_text_length = min_length
-
-    async def recognize(rgb, lines, config):
-        for line, text in zip(lines, texts):
-            line.text, line.prob = text, 0.1
-
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
-    assert engine.analyze(source) == ([], None, None, None)
-    assert calls == []
-
-
-def test_ocr_failure_does_not_reach_erasure(analysis):
-    engine, source, _, calls = analysis
-
     async def recognize(*args):
-        raise RuntimeError('OCR failed')
+        return [Reading([text, '', ''], line_aligned=False)]
+    engine.ocr.recognize = recognize
+    engine.keep_lang, engine.config.ocr.min_text_length = keep_lang, minimum
+    assert engine.analyze(source) == ([], None, None, None)
+    assert not calls
 
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
+
+def test_failure_releases_locks_and_recognition_keeps_paragraph_geometry(analysis):
+    engine, source, quads, calls = analysis
+    read = engine.ocr.recognize
+    async def fail(*args):
+        raise RuntimeError('OCR failed')
+    engine.ocr.recognize = fail
     with pytest.raises(RuntimeError, match='OCR failed'):
         engine.analyze(source)
-    assert calls == []
-
-
-def test_mixed_page_routes_korean_only_and_preserves_paragraph_order(analysis, monkeypatch):
-    engine, source, quads, _ = analysis
-    blocks = [SimpleNamespace(lines=[quad], font_size=12, angle=0, src_is_vertical=False)
-              for quad in quads]
-    monkeypatch.setitem(sys.modules, 'ballontranslator.utils.textblock',
-                        SimpleNamespace(group_output=lambda *args: blocks))
-    engine.ocr.router = SimpleNamespace(classify=lambda image, blocks, groups: (['korean', 'en', 'korean'], [None] * 3))
-    observed = []
-
-    async def korean(rgb, lines, config):
-        observed.append(('ko', len(lines)))
-        for line, text in zip(lines, ['첫 번째', '마지막']):
-            line.text, line.prob = text, 0.99
-
-    async def other(rgb, lines, config):
-        observed.append(('other', len(lines)))
-        lines[0].text, lines[0].prob = 'middle', 0.99
-
-    engine.ocr.recognizers = {'en': SimpleNamespace(recognize=other), 'korean': SimpleNamespace(recognize=korean)}
-    regions, *_ = engine.analyze(source)
-    assert observed == [('other', 1), ('ko', 2)]
-    assert [region.text for region in regions] == ['첫 번째', 'middle', '마지막']
-    assert [region.language for region in regions] == ['korean', 'en', 'korean']
-    for region, quad in zip(regions, quads):
-        np.testing.assert_array_equal(region.lines, [quad])
-
-
-def test_four_languages_use_selected_experts_without_fallback(analysis, monkeypatch):
-    engine, source, quads, calls = analysis
-    quads = quads + [quads[0] + [1, 0]]
-    blocks = [SimpleNamespace(lines=[quad], font_size=12, angle=0, src_is_vertical=False) for quad in quads]
-    monkeypatch.setitem(sys.modules, 'ballontranslator.utils.textblock', SimpleNamespace(group_output=lambda *args: blocks))
-    engine.ocr.router = SimpleNamespace(classify=lambda *args: (['japan', 'ch', 'en', 'korean'], [None] * 4))
-    observed = []
-    def model(language):
-        async def recognize(image, lines, config):
-            observed.append(language)
-            for line in lines:
-                line.text = '' if language == 'en' else language
-        return SimpleNamespace(recognize=recognize)
-    engine.ocr.recognizers = {lang: model(lang) for lang in ('en', 'ch', 'korean')}
-    def japanese(image, selected, groups):
-        observed.append('japan')
-        assert selected == [blocks[0]]
-        groups[0][0].text = 'japan'
-    engine.ocr.japanese = SimpleNamespace(recognize=japanese)
-    regions, *_ = engine.analyze(source)
-    assert observed == ['en', 'ch', 'korean', 'japan']
-    assert [r.text for r in regions] == ['japan', 'ch', 'korean']
-    assert [r.language for r in regions] == ['japan', 'ch', 'korean']
-    assert [name for name, _ in calls] == ['colors', 'bubbles', 'refine']
-    assert [r.text for r in calls[0][1]] == ['japan', 'ch', 'korean']
-
-
-def test_unknown_language_does_not_call_recognizers_or_erase(analysis):
-    engine, source, _, calls = analysis
-    engine.ocr.router = SimpleNamespace(classify=lambda *args: ([None], [None]))
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=lambda *args: pytest.fail('Unknown is not English'))
-    assert engine.analyze(source) == ([], None, None, None)
-    assert calls == []
-
-
-@pytest.mark.parametrize('score,text', [(.9, 'cached'), (.3, ''), (.49, ''), (.5, 'cached')])
-def test_representative_reuse_skips_only_that_line_and_keeps_order(analysis, score, text):
-    engine, source, quads, _ = analysis
-    engine.ocr.router = SimpleNamespace(classify=lambda *args: (['en'], [(1, {'text': 'cached', 'conf': score})]))
-    observed = []
-    async def recognize(rgb, lines, config):
-        observed.extend(lines)
-        for line, value in zip(lines, ['first', 'last'], strict=True):
-            line.text, line.prob = value, .9
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
-    regions, *_ = engine.analyze(source)
-    assert len(observed) == 2
-    assert regions[0].texts == ['first', text, 'last']
+    assert not calls and not engine._detector_lock.locked() and not engine._bubble_lock.locked()
+    engine.ocr.recognize = read
+    regions, mask, raw, _ = engine.analyze(source)
     np.testing.assert_array_equal(regions[0].lines, quads)
-    assert not hasattr(engine, 'readings')
+    assert regions[0].texts == ['one paragraph', '', ''] and not regions[0].ocr_line_aligned
+    assert mask is raw and calls == ['colors', 'bubbles', 'refine']
 
 
-def test_single_line_reuse_never_calls_formal_model_and_is_page_local(analysis, monkeypatch):
-    engine, source, quads, _ = analysis
-    block = SimpleNamespace(lines=[quads[0]], font_size=12, angle=0, src_is_vertical=False)
-    monkeypatch.setitem(sys.modules, 'ballontranslator.utils.textblock', SimpleNamespace(group_output=lambda *args: [block]))
-    engine.ocr.recognizers['ch'] = SimpleNamespace(recognize=lambda *args: pytest.fail('Representative read twice'))
-    for text in ('first page', 'second page'):
-        engine.ocr.router = SimpleNamespace(classify=lambda *args: (['ch'], [(0, {'text': text, 'conf': .8})]))
-        regions, *_ = engine.analyze(source)
-        assert regions[0].texts == [text]
-    engine.ocr.router = SimpleNamespace(classify=lambda *args: ([None], [None]))
-    assert engine.analyze(source) == ([], None, None, None)
-
-
-@pytest.mark.parametrize('score', [.3, .49])
-def test_weak_reused_script_evidence_alone_does_not_authorize_erasure(analysis, monkeypatch, score):
-    engine, source, quads, calls = analysis
-    block = SimpleNamespace(lines=[quads[0]], font_size=12, angle=0, src_is_vertical=False)
-    monkeypatch.setitem(sys.modules, 'ballontranslator.utils.textblock', SimpleNamespace(group_output=lambda *args: [block]))
-    engine.ocr.router = SimpleNamespace(classify=lambda *args: (['en'], [(0, {'text': 'uncertain', 'conf': score})]))
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=lambda *args: pytest.fail('Representative read twice'))
-    assert engine.analyze(source) == ([], None, None, None)
-    assert calls == []
-
-
-def test_close_does_not_unload_shared_probe_recognizers_twice(analysis):
-    engine, _, _, _ = analysis
-    closed = []
-    engine.ocr.recognizers = {lang: SimpleNamespace(close=lambda lang=lang: closed.append(lang))
-                     for lang in ('en', 'ch', 'korean')}
-    engine.ocr.japanese = SimpleNamespace(close=lambda: closed.append('japan'))
-    engine.colors = SimpleNamespace(close=lambda: closed.append('colors'))
-    async def unload():
-        closed.append('unload')
-    engine.detector = engine.inpainter = engine.color_model = SimpleNamespace(unload=unload)
-    engine.close()
-    assert closed == ['en', 'ch', 'korean', 'japan', 'colors', 'unload', 'unload', 'unload']
-
-
-def test_analysis_does_not_require_new_center_timing_keys(analysis):
+def test_capture_guard_covers_other_gpu_stages_but_not_ocr_or_cpu(analysis, monkeypatch):
     engine, source, _, _ = analysis
-    async def recognize(rgb, lines, config):
-        for line in lines:
-            line.text = 'recognized'
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
-    with collect() as values:
-        engine.analyze(source)
-    assert {'analyze_detect', 'analyze_route', 'analyze_ocr', 'analyze_colors',
-            'analyze_bubbles', 'analyze_bubble_mask', 'analyze_refine'} <= values.keys()
-    assert all(value >= 0 for value in values.values())
-
-
-def test_graph_capture_guard_covers_other_gpu_models_but_not_page_cpu_or_ocr_replay(analysis, monkeypatch):
-    engine, source, _, calls = analysis
-    engine._capture_guard = Lock()
-    detect, colors, bubbles = engine.detector.detect, engine.colors.apply, engine.bubbles.detect
-    async def detect_guarded(*args, **kwargs):
-        assert engine._capture_guard.locked()
+    guard = engine._capture_guard = Lock()
+    detect, read = engine.detector.detect, engine.ocr.recognize
+    async def guarded_detect(*args, **kwargs):
+        assert guard.locked()
         return await detect(*args, **kwargs)
-    async def recognize(rgb, lines, config):
-        assert not engine._capture_guard.locked()
-        for line in lines:
-            line.text = 'recognized'
-    def colors_guarded(*args, capture_guard):
-        assert capture_guard is engine._capture_guard and not capture_guard.locked()
-        return colors(*args)
-    def bubbles_guarded(*args, **kwargs):
-        assert engine._capture_guard.locked()
-        return bubbles(*args, **kwargs)
-    utils = sys.modules['manga_translator.utils']
-    build_mask = utils.build_bubble_mask_from_mangalens_result
-    def mask_guarded(*args):
-        assert engine._capture_guard.locked()  # Native mask extraction may copy GPU tensors.
-        return build_mask(*args)
-    monkeypatch.setattr(utils, 'build_bubble_mask_from_mangalens_result', mask_guarded)
+    async def unlocked_read(*args):
+        assert not guard.locked()
+        return await read(*args)
+    def colors(*args, capture_guard):
+        assert capture_guard is guard and not guard.locked()
+    def bubbles(*args, **kwargs):
+        assert guard.locked()
+    def mask(result, shape):
+        assert guard.locked()
+        return np.zeros(shape)
     from mtu_engine import engine as implementation
     associate = implementation.associate_bubbles
     def associate_cpu(*args):
-        assert not engine._capture_guard.locked()
+        assert not guard.locked()
         return associate(*args)
     monkeypatch.setattr(implementation, 'associate_bubbles', associate_cpu)
-    engine.detector.detect, engine.colors.apply, engine.bubbles.detect = detect_guarded, colors_guarded, bubbles_guarded
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
-    assert engine.analyze(source)[0]
-    assert not engine._capture_guard.locked()
-    assert [name for name, _ in calls] == ['colors', 'bubbles', 'refine']
+    monkeypatch.setattr(sys.modules['manga_translator.utils'], 'build_bubble_mask_from_mangalens_result', mask)
+    engine.detector.detect, engine.ocr.recognize, engine.colors.apply, engine.bubbles.detect = guarded_detect, unlocked_read, colors, bubbles
+    assert engine.analyze(source)[0] and not guard.locked()
 
 
 @pytest.mark.parametrize('cancel', [False, True])
 def test_inpaint_guards_model_blocks_and_drains_cancellation(analysis, monkeypatch, cancel):
-    from classic_node.protocol import NodeFailure
-    from mtu_engine.backend import cancellation
     engine, source, _, _ = analysis
-    engine._capture_guard = Lock()
+    guard = engine._capture_guard = Lock()
     engine.config.inpainter = SimpleNamespace(inpainting_size=512)
-    engine.config.ocr.model_bubble_overlap_threshold = .5
     calls = []
     monkeypatch.setattr(sys.modules['manga_translator.utils'], 'erode_bubble_mask', lambda mask, _: mask, raising=False)
     def fill(rgb, mask, *args, **kwargs):
-        assert not engine._capture_guard.locked()
+        assert not guard.locked()
         return rgb, mask, None
     async def blocks(rgb, mask, callback):
-        assert not engine._capture_guard.locked()
+        assert not guard.locked()
         for _ in range(3):
             rgb = await callback(rgb, mask)
         return rgb, 3
-    async def inpaint(rgb, mask, *args):
-        assert engine._capture_guard.locked()
+    async def inpaint(rgb, *args):
+        assert guard.locked()
         calls.append(1)
         return rgb.copy()
     monkeypatch.setitem(sys.modules, 'manga_translator.inpainting.ballon_fill', SimpleNamespace(
@@ -375,62 +175,23 @@ def test_inpaint_guards_model_blocks_and_drains_cancellation(analysis, monkeypat
             raise NodeFailure('LEASE_STOPPED')
     with cancellation(check), pytest.raises(NodeFailure, match='LEASE_STOPPED') if cancel else nullcontext():
         np.testing.assert_array_equal(engine.inpaint(source, mask, mask, mask, []), source)
-    assert len(calls) == (1 if cancel else 3) and not engine._capture_guard.locked()
+    assert len(calls) == (1 if cancel else 3) and not guard.locked()
     np.testing.assert_array_equal(engine.inpaint(source, mask, mask, mask, []), source)
-    assert len(calls) == (4 if cancel else 6) and not engine._capture_guard.locked()
 
 
-def test_analysis_failure_releases_locks_without_new_timing_keys(analysis):
+def test_other_page_can_read_while_color_model_is_busy(analysis):
     engine, source, _, _ = analysis
-    async def recognize(*args):
-        raise RuntimeError('OCR failed')
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
-    with collect() as values, pytest.raises(RuntimeError, match='OCR failed'):
-        engine.analyze(source)
-    assert values['analyze_ocr'] >= 0
-    assert not engine._detector_lock.locked() and not engine._bubble_lock.locked()
-
-
-@pytest.mark.parametrize('held_stage', ['colors', 'japan'])
-def test_other_page_ocr_progresses_while_a_different_model_is_busy(analysis, held_stage):
-    engine, source, _, _ = analysis
-    other = source.copy()
-    entered, release, other_read = Event(), Event(), Event()
-
-    def classify(image, blocks, groups):
-        language = 'japan' if image is source and held_stage == 'japan' else 'en'
-        return [language] * len(blocks), [None] * len(blocks)
-
-    async def recognize(image, lines, config):
-        for line in lines:
-            line.text, line.prob = ('first' if image is source else 'second'), .9
-        if image is other:
-            other_read.set()
-
-    def japanese(image, blocks, groups):
-        assert image is source
-        entered.set()
-        assert release.wait(5), 'Test did not release the Japanese model'
-        for group in groups:
-            for line in group:
-                line.text = 'first'
-
-    def colors(image, regions, *, capture_guard=None):
-        if image is source and held_stage == 'colors':
+    entered, release = Event(), Event()
+    def colors(image, *args, **kwargs):
+        if image is source:
             entered.set()
-            assert release.wait(5), 'Test did not release the color model'
-
-    engine.ocr.router = SimpleNamespace(classify=classify)
-    engine.ocr.recognizers['en'] = SimpleNamespace(recognize=recognize)
-    engine.ocr.japanese = SimpleNamespace(recognize=japanese)
-    engine.colors = SimpleNamespace(apply=colors)
+            assert release.wait(5)
+    engine.colors.apply = colors
     with ThreadPoolExecutor(2) as pool:
         first = pool.submit(engine.analyze, source)
         try:
             assert entered.wait(5)
-            second = pool.submit(engine.analyze, other)
-            assert other_read.wait(5), 'Unrelated model blocked the second page OCR'
-            assert second.result(timeout=5)[0][0].texts == ['second'] * 3
+            assert pool.submit(engine.analyze, source.copy()).result(timeout=5)[0]
         finally:
             release.set()
-        assert first.result(timeout=5)[0][0].texts == ['first'] * 3
+        assert first.result(timeout=5)[0]

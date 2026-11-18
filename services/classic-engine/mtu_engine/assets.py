@@ -12,25 +12,24 @@ def file_hash(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def selected_asset(name, ocr_backend):
-    classic = name.startswith(('models/manga/', 'upstream/mot/', 'upstream/manga_ocr/')) or (
-        name.startswith('models/ocr/') and ('PP-OCR' in name or 'ppocr' in name))
-    return ocr_backend == 'classic' or not classic
-
-
-def verify(models, ocr_backend='classic'):
+def verify(models, *, include_hayai=True):
     root = Path(models).resolve().parent
     manifest = json.loads((root / 'mtu-assets.json').read_text(encoding='utf-8'))
     if manifest['upstream'] != LOCK['source']['revision'] or manifest['lock_sha256'] != file_hash(Path(__file__).with_name('upstream.lock.json')):
         raise ValueError('MTU assets do not match the pinned source and models; run tools.prepare_mtu')
     if manifest.get('comic_translate') != LOCK['comic_translate']['revision']:
         raise ValueError('Comic Translate assets do not match the pinned source; run tools.prepare_mtu')
-    manifest['files'] = {name: value for name, value in manifest['files'].items() if selected_asset(name, ocr_backend)}
+    verified = {}
     for name, expected in manifest['files'].items():
         path = (root / name).resolve()
-        if not path.is_relative_to(root) or file_hash(path) != expected:
+        if not path.is_relative_to(root):
+            raise ValueError(f'MTU asset outside bundle: {name}')
+        if not include_hayai and name.startswith('models/hayai/') and path.is_relative_to(root / 'models/hayai'):
+            continue  # Hayai verifies the selected directory against the source lock before import.
+        if file_hash(path) != expected:
             raise ValueError(f'MTU asset checksum mismatch: {name}')
-    return manifest
+        verified[name] = expected
+    return manifest | {'files': verified}
 
 
 def activate(models):

@@ -57,9 +57,3 @@ def crop(image, points, calculate):
 
 def bgr(image):
     return _reuse(('bgr', id(image)), lambda: cv2.cvtColor(image, cv2.COLOR_RGB2BGR), image)
-
-
-def normalized(image, ratio, shape, calculate):
-    # Batch padding is part of the key. Different long-line batches never share
-    # tensors just because the unpadded crop matches.
-    return _reuse(('paddle', id(image), float(ratio), tuple(shape)), calculate, image)

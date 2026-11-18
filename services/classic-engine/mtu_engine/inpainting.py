@@ -1,9 +1,23 @@
-"""Bounded startup-only HIP graphs for the unchanged FP32 LaMa generator."""
+"""Bounded startup-only CUDA/HIP graphs for the unchanged FP32 LaMa generator."""
 from threading import Lock
 
 import torch
 
 from classic_node.timing import record
+from .backend import CUDA_GRAPH_MIN_FREE
+
+
+@torch.inference_mode()
+def cuda_lama_pixels(model, image, mask, device):
+    """Pinned FP32 LaMa Fourier path: transfer bytes in both directions."""
+    pixels = torch.from_numpy(image).to(device).permute(2, 0, 1).unsqueeze(0)
+    # A device FP32 divisor matches CPU division for all 256 input values.
+    pixels = pixels.div(pixels.new_full((), 255, dtype=torch.float32))
+    mask = torch.from_numpy(mask[:, :, 0]).to(device).float()[None, None]
+    # The pinned generator already zeroes masked inputs and blends binary masks.
+    with torch.autocast(device_type='cuda', enabled=False):
+        result = model(pixels, mask)
+    return result[0].permute(1, 2, 0).mul(255).to(torch.uint8).contiguous().cpu().numpy()
 
 
 def tensor_key(*tensors):
@@ -16,6 +30,7 @@ class LamaGraphs(torch.nn.Module):
         self.generator = generator
         self.graphs = {}
         self.lock = Lock()
+        self.finished = None
         self.prepared = False
         self.eval()
 
@@ -27,6 +42,11 @@ class LamaGraphs(torch.nn.Module):
             return
         self.prepared = True
         device = next(self.generator.parameters()).device
+        # Leave room for real detector/OCR pages on smaller or busy NVIDIA cards.
+        if device.type == 'cuda' and torch.version.cuda:
+            if torch.cuda.mem_get_info(device)[0] < CUDA_GRAPH_MIN_FREE:
+                return
+            self.finished = torch.cuda.Event()
         stream = torch.cuda.Stream(device=device)
         caller = torch.cuda.current_stream(device)
         stream.wait_stream(caller)
@@ -59,12 +79,20 @@ class LamaGraphs(torch.nn.Module):
             return self.generator(image, mask, rel_pos, direct)
         graph, static_image, static_mask, output = state
         # Replay beside upstream's input preparation, not on a different stream.
-        # Complete the owned clone before another caller can reuse static buffers.
+        # Order static-buffer reuse after the owned clone, including across streams.
         with self.lock, torch.inference_mode():
-            static_image.copy_(image)
-            static_mask.copy_(mask)
-            graph.replay()
-            result = output.clone()
-            torch.cuda.current_stream(image.device).synchronize()
+            stream = torch.cuda.current_stream(image.device)
+            if self.finished is not None:
+                stream.wait_event(self.finished)
+            try:
+                static_image.copy_(image)
+                static_mask.copy_(mask)
+                graph.replay()
+                result = output.clone()
+            finally:
+                if self.finished is None:
+                    stream.synchronize()
+                else:
+                    self.finished.record(stream)
         record('inpaint_graph_blocks', 1)
         return result

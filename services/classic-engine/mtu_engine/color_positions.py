@@ -1,4 +1,4 @@
-"""Reuse the frozen 48px model's XPOS factors across HIP decoder layers."""
+"""Reuse the frozen 48px model's XPOS factors across CUDA/HIP decoder layers."""
 from functools import lru_cache, partial
 
 import torch

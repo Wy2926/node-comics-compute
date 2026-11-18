@@ -6,6 +6,7 @@ only, not images, paths or private text.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from functools import partial
 import hashlib
 from io import BytesIO
@@ -17,6 +18,8 @@ import platform
 import socket
 import statistics
 import struct
+import subprocess
+from tempfile import TemporaryFile
 import threading
 from time import perf_counter
 
@@ -170,7 +173,30 @@ def sample_processes(processes=None):
     return result
 
 
-def measured(operation):
+@contextmanager
+def _gpu_usage(uuid):
+    if uuid is None:
+        yield {}
+        return
+    usage = {'gpu_busy_percent': None, 'gpu_samples': 0}
+    with TemporaryFile() as samples:
+        try:
+            monitor = subprocess.Popen(['nvidia-smi', f'--id=GPU-{uuid}', '--query-gpu=utilization.gpu',
+                '--format=csv,noheader,nounits', '--loop-ms=200'], stdout=samples, stderr=subprocess.DEVNULL)
+        except OSError:  # Some CUDA containers have the runtime but no management utility.
+            yield usage
+            return
+        try:
+            yield usage
+        finally:
+            monitor.terminate()
+            monitor.wait()
+        samples.seek(0)
+        values = [int(row) for row in samples if row.strip().isdigit() and int(row) <= 100]
+        usage.update(gpu_samples=len(values), gpu_busy_percent=statistics.mean(values) if values else None)
+
+
+def measured(operation, *, nvidia_uuid=None):
     stop, peak = threading.Event(), {'parent': 0, 'children': 0, 'sum': 0}
     root = psutil.Process()
     processes = [root, *root.children(recursive=True)]
@@ -183,22 +209,27 @@ def measured(operation):
     def monitor():
         while not stop.wait(.02):
             sample()
-    sample()
-    before = sample_processes(processes)
-    watcher = threading.Thread(target=monitor, daemon=True)
-    watcher.start()
-    started = perf_counter()
-    try:
-        output = operation()
-        wall = perf_counter() - started
-    finally:
-        stop.set()
-        watcher.join()
-    after = sample_processes(processes)
+    with _gpu_usage(nvidia_uuid) as gpu:
+        sample()
+        before = sample_processes(processes)
+        watcher = threading.Thread(target=monitor, daemon=True)
+        watcher.start()
+        started = perf_counter()
+        try:
+            output = operation()
+            wall = perf_counter() - started
+        finally:
+            stop.set()
+            watcher.join()
+        after = sample_processes(processes)
     sample()
     cpu = {pid: value[0] - before.get(pid, value)[0] for pid, value in after.items()}
-    return output, {'wall_seconds': wall, 'parent_cpu_seconds': cpu.get(os.getpid(), 0),
+    cores = sum(cpu.values()) / wall
+    logical = psutil.cpu_count()
+    return output, {**gpu, 'wall_seconds': wall, 'parent_cpu_seconds': cpu.get(os.getpid(), 0),
                     'children_cpu_seconds': sum(value for pid, value in cpu.items() if pid != os.getpid()),
+                    'cpu_core_equivalents': cores, 'logical_cpus': logical,
+                    'cpu_percent_of_host': 100 * cores / logical if logical else None,
                     'peak_rss_bytes': peak}
 
 

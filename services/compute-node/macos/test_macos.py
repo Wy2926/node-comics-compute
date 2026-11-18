@@ -116,11 +116,13 @@ def test_prepare_resumes_assets_then_reuses_runtime_and_models(tmp_path, monkeyp
     commands = []
     def run(command, **kwargs):
         commands.append(command)
+        if command[0] == 'cp':
+            return subprocess.CompletedProcess(command, 1)  # Exercise the ordinary copy fallback on macOS.
         if '--output' in command:
             assets = Path(command[command.index('--output') + 1])
             for name in installer.ASSETS[:-1]:
                 write(assets, name + '/prepared', '{}')
-            write(assets, 'mtu-assets.json', json.dumps({'lock_sha256': installer.sha256(lock)}))
+            write(assets, 'mtu-assets.json', json.dumps({'lock_sha256': installer.sha256(lock), 'files': {}}))
     monkeypatch.setattr(installer.subprocess, 'run', run)
     monkeypatch.setattr(installer, 'download', lambda *a: pytest.fail('downloaded unchanged environment'))
     installer.prepare(previous)
@@ -132,6 +134,16 @@ def test_prepare_resumes_assets_then_reuses_runtime_and_models(tmp_path, monkeyp
     assert commands[0][-1] == str(previous / 'models')
     assert extra.read_text() == 'keep' and config.read_text() == 'identity'
     assert not (stage / 'runtime').exists() and not (stage / 'models').exists()
+
+    retired = write(previous, 'models/manga/pytorch_model.bin', 'retired')
+    changed = write(previous, 'models/ocr/old-custom.onnx', 'user-modified')
+    write(previous, 'mtu-assets.json', json.dumps({'lock_sha256': installer.sha256(lock), 'files': {
+        'models/manga/pytorch_model.bin': installer.sha256(retired), 'models/ocr/old-custom.onnx': 'old-hash'}}))
+    lock.write_text('new model inventory')
+    installer.prepare(stage, previous)
+    assert not (stage / 'models/manga/pytorch_model.bin').exists() and retired.is_file()
+    assert (stage / 'models/ocr/old-custom.onnx').read_bytes() == changed.read_bytes()
+    assert (stage / 'models/hayai/private').read_bytes() == extra.read_bytes()
 
 
 def test_update_manifest_cannot_replace_private_data(tmp_path):

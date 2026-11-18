@@ -39,6 +39,7 @@ LABEL org.opencontainers.image.title="Node Comics Compute" \
     org.opencontainers.image.version=$VERSION \
     org.opencontainers.image.revision=$REVISION
 ENV PATH=/opt/node/venv/bin:$PATH PYTHONPATH=/opt/node/engine \
+    HF_HOME=/data/cache/huggingface HF_HUB_OFFLINE=1 \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility YOLO_CONFIG_DIR=/tmp/ultralytics
 RUN groupadd --gid 10001 node && useradd --uid 10001 --gid 10001 --no-create-home node \
     && mkdir /data && chown 10001:10001 /data && chmod 700 /data

@@ -51,9 +51,8 @@ def run(args):
     os.environ.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', TOKENIZERS_PARALLELISM='false')
     config = load(args.config)
     if args.batch_size is not None:
-        limit = 8 if config['engine']['ocr_backend'] == 'hayai' else 32
-        if not config['engine'].get('ocr_min_batch_size', 1) <= args.batch_size <= limit:
-            raise ValueError('batch-size is outside the selected OCR backend limits')
+        if not 1 <= args.batch_size <= 8:
+            raise ValueError('Hayai batch-size must be between 1 and 8')
         config['engine']['ocr_batch_size'] = args.batch_size
     # Estimate the same page working buffers as the node before creating models.
     largest = 0
@@ -68,7 +67,9 @@ def run(args):
     runtime = Runtime(config)
     import torch
     gpu = config['engine'].get('gpu', 0)
-    accelerator = config['engine'].get('backend', 'cuda') != 'mps'
+    backend = config['engine'].get('backend', 'cuda')
+    accelerator = backend != 'mps'
+    nvidia_uuid = torch.cuda.get_device_properties(gpu).uuid if backend == 'cuda' else None
     report = {'version': runtime.version, 'ocr': runtime.engine.ocr.identity,
               'settings': execution_settings(config), 'startup_seconds': perf_counter() - started,
               'hardware': {'torch': torch.__version__, 'hip': torch.version.hip, 'cuda': torch.version.cuda,
@@ -86,7 +87,7 @@ def run(args):
             regions, *_ = runtime.engine.analyze(rgb)
         timings['analyze'] = perf_counter() - started
         timings['input_decode'] = decode_seconds
-        timings['ocr_total'] = timings.get('analyze_route', 0) + timings.get('analyze_ocr', 0)
+        timings['ocr_total'] = timings.get('analyze_ocr', 0)
         texts = [region.text for region in regions]
         result = {'file': path.name, 'sha256': file_hash(path), 'regions': len(regions),
                   'text_sha256': digest(texts), 'timings': timings}
@@ -103,12 +104,11 @@ def run(args):
                 for repeat in range(args.repeats):
                     if accelerator:
                         torch.cuda.reset_peak_memory_stats(gpu)
-                    pages, resources = measured(lambda: bounded_pages(pool, page, args.input, concurrency))
+                    pages, resources = measured(lambda: bounded_pages(pool, page, args.input, concurrency),
+                                                nvidia_uuid=nvidia_uuid)
                     if accelerator:
                         resources.update(gpu_peak_allocated_bytes=torch.cuda.max_memory_allocated(gpu),
                                          gpu_peak_reserved_bytes=torch.cuda.max_memory_reserved(gpu))
-                    resources['cpu_core_equivalents'] = (resources['parent_cpu_seconds'] +
-                        resources['children_cpu_seconds']) / resources['wall_seconds']
                     same = all(p['text_sha256'] == expected[p['sha256']] for p in pages)
                     run = {'concurrency': concurrency, 'repeat': repeat, **resources,
                            'pages_per_second': len(pages) / resources['wall_seconds'],

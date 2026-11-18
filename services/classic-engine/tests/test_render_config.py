@@ -182,7 +182,7 @@ def test_page_budget_requires_integer_protocol_limits(tmp_path, field, value):
         load(path)
 
 
-@pytest.mark.parametrize('key', ['ocr_batch_size', 'ocr_min_batch_size', 'color_batch_size', 'detect_batch_size'])
+@pytest.mark.parametrize('key', ['ocr_batch_size', 'color_batch_size', 'detect_batch_size'])
 @pytest.mark.parametrize('value', [0, 33, True, 1.5, '4', None])
 def test_inference_batches_require_bounded_integers(tmp_path, key, value):
     path = tmp_path / 'node.json'
@@ -193,11 +193,12 @@ def test_inference_batches_require_bounded_integers(tmp_path, key, value):
 
 @pytest.mark.parametrize('options', [{'ocr_min_batch_size': 5}, {'ocr_arena_shrinkage': 'true'},
                                     {'ocr_arena_extend_strategy': 'unknown'}])
-def test_inference_memory_policy_rejects_invalid_values(tmp_path, options):
+def test_shipped_ort_settings_do_not_block_upgrade_or_rewrite_private_config(tmp_path, options):
     path = tmp_path / 'node.json'
     path.write_text(json.dumps({**configuration(), 'engine': options}))
-    with pytest.raises(ValueError, match='ocr_'):
-        load(path)
+    original = path.read_bytes()
+    assert not options.keys() & load(path)['engine'].keys()
+    assert path.read_bytes() == original
 
 
 @pytest.mark.parametrize('options', [{'claim_batch_size': 5}, {'claim_batch_size': True},
@@ -216,9 +217,9 @@ def test_performance_configuration_is_independent_and_legacy_defaults_survive(tm
     assert resolved['analysis_workers'] == 6
     assert resolved['engine']['ocr_batch_size'] == resolved['engine']['color_batch_size'] == 4
     resolved.update(analysis_workers=2, claim_batch_size=1, document_control_workers=3)
-    resolved['engine'].update(ocr_batch_size=3, color_batch_size=2, detect_batch_size=1, ocr_arena_shrinkage=False)
+    resolved['engine'].update(ocr_batch_size=3, color_batch_size=2, detect_batch_size=1)
     path.write_text(json.dumps(resolved))
     resolved = load(path)
     assert resolved['download_workers'] == 6 and resolved['analysis_workers'] == 2
     assert resolved['engine']['ocr_batch_size'] == 3 and resolved['engine']['color_batch_size'] == 2
-    assert resolved['engine']['detect_batch_size'] == 1 and not resolved['engine']['ocr_arena_shrinkage']
+    assert resolved['engine']['detect_batch_size'] == 1

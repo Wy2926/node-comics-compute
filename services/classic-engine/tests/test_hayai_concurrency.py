@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from classic_node.timing import collect
-from mtu_engine.ocr.hayai import HayaiOCR, MAX_PATCHES, MAX_TOKENS
+from mtu_engine.ocr.hayai import CudaModelCalls, HayaiOCR, MAX_PATCHES, MAX_TOKENS
 
 
 def test_cancelled_hayai_stops_before_next_crop_batch():
@@ -32,7 +32,8 @@ def test_cancelled_hayai_stops_before_next_crop_batch():
 
 
 @pytest.mark.parametrize('fail_first', [False, True])
-@pytest.mark.parametrize('backend,graph_failed', [('amd', False), ('amd', True), ('cuda', False)])
+@pytest.mark.parametrize('backend,graph_failed', [('amd', False), ('amd', True), ('cuda', False),
+                                                  ('cuda', True), ('mps', False)])
 def test_hayai_prepares_next_page_outside_model_lock_and_keeps_results_local(monkeypatch, fail_first,
                                                                          backend, graph_failed):
     monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(
@@ -41,7 +42,8 @@ def test_hayai_prepares_next_page_outside_model_lock_and_keeps_results_local(mon
     lock = Lock()
     calls = []
     ocr = HayaiOCR.__new__(HayaiOCR)
-    ocr.backend, ocr.gpu, ocr.device = backend, 0, 'cuda:0'
+    ocr.backend, ocr.gpu, ocr.device = backend, 0, 'mps' if backend == 'mps' else 'cuda:0'
+    ocr.capture_lock = None if backend == 'mps' else Lock()
     def acquire():
         if lock.locked():
             attempted.set()
@@ -52,7 +54,7 @@ def test_hayai_prepares_next_page_outside_model_lock_and_keeps_results_local(mon
         def __init__(self, value, kind):
             self.value, self.kind = value, kind
         def to(self, device):
-            assert lock.locked() and device == 'cuda:0'
+            assert lock.locked() and device == ocr.device
             assert self.kind == 'pixels', 'Native metadata should stay on CPU'
             return self
 
@@ -67,7 +69,7 @@ def test_hayai_prepares_next_page_outside_model_lock_and_keeps_results_local(mon
     def run(**kwargs):
         assert lock.locked()
         assert kwargs['max_new'] == MAX_TOKENS
-        assert kwargs['use_graph'] is (backend == 'amd')
+        assert kwargs['use_graph'] is (backend != 'mps')
         value = kwargs['pixel_values'].value
         calls.append(value)
         if value == 11:
@@ -92,7 +94,9 @@ def test_hayai_prepares_next_page_outside_model_lock_and_keeps_results_local(mon
         try:
             assert entered.wait(5)
             second = pool.submit(recognize, 22)
-            assert prepared.wait(5) and attempted.wait(5)
+            assert prepared.wait(5)
+            if backend != 'mps':  # MPS waits on its outer device lock first.
+                assert attempted.wait(5)
             assert calls == [11]
         finally:
             release.set()
@@ -105,7 +109,7 @@ def test_hayai_prepares_next_page_outside_model_lock_and_keeps_results_local(mon
     assert text == ['22'] and calls == [11, 22] and not lock.locked()
     assert timings['ocr_batch_max'] == timings['ocr_batches'] == timings['ocr_output_tokens'] == 1
     assert timings['ocr_truncated'] == 0
-    assert timings['ocr_graph_batches' if backend == 'amd' and not graph_failed else 'ocr_eager_batches'] == 1
+    assert timings['ocr_graph_batches' if backend != 'mps' and not graph_failed else 'ocr_eager_batches'] == 1
     assert timings['ocr_model_lock_wait'] == timings['ocr_lock_wait']
     assert all(timings[name] >= 0 for name in ('ocr_preprocess', 'ocr_transfer', 'ocr_infer', 'ocr_decode'))
 
@@ -113,6 +117,7 @@ def test_hayai_prepares_next_page_outside_model_lock_and_keeps_results_local(mon
 @pytest.mark.parametrize('fail', [False, True])
 def test_graph_capture_waits_for_other_gpu_stage_and_releases_on_failure(fail):
     ocr = HayaiOCR.__new__(HayaiOCR)
+    ocr.backend = 'amd'
     lock = Lock()
     entered, attempted = Event(), Event()
     def acquire():
@@ -141,27 +146,72 @@ def test_graph_capture_waits_for_other_gpu_stage_and_releases_on_failure(fail):
     assert entered.is_set() and not lock.locked()
 
 
-@pytest.mark.skipif(os.environ.get('MTU_TEST_BACKEND') != 'amd' or not os.environ.get('MTU_TEST_HAYAI'),
-                    reason='Requires a prepared Hayai model and the AMD GPU environment')
-def test_hip_graph_lru_retains_fifth_batch_size_only_with_headroom(monkeypatch):
+def test_cuda_capture_drains_overlapping_models_and_reopens_after_failure(monkeypatch):
+    gate = CudaModelCalls()
+    overlap, drain, capturing, resume, late = (Event() for _ in range(5))
+    wait = gate.idle.wait_for
+    def observe(predicate):
+        drain.set()
+        return wait(predicate)
+    monkeypatch.setattr(gate.idle, 'wait_for', observe)
+    def reader(entered, release=None):
+        with gate:
+            entered.set()
+            if release is not None:
+                assert release.wait(5)
+    def writer():
+        with gate.capture():
+            capturing.set()
+            assert resume.wait(5)
+            raise RuntimeError('capture failed')
+    release = Event()
+    with ThreadPoolExecutor(3) as pool:
+        try:
+            with gate:
+                first = pool.submit(reader, overlap, release)
+                assert overlap.wait(5)
+                capture = pool.submit(writer)
+                assert drain.wait(5) and not capturing.is_set()
+                last = pool.submit(reader, late)
+            release.set()
+            assert capturing.wait(5) and not late.is_set()
+        finally:
+            release.set()
+            resume.set()
+        with pytest.raises(RuntimeError, match='capture failed'):
+            capture.result(timeout=5)
+        first.result(timeout=5)
+        last.result(timeout=5)
+    assert late.is_set() and not gate.active
+
+
+@pytest.mark.skipif(os.environ.get('MTU_TEST_BACKEND') not in ('cuda', 'amd') or not (os.environ.get('MTU_TEST_HAYAI') or os.environ.get('MTU_TEST_ASSETS')),
+                    reason='Requires a prepared Hayai model and CUDA/HIP')
+def test_graph_lru_recaptures_evicted_shape_and_preserves_text(monkeypatch):
     import torch
     from PIL import Image, ImageDraw
     free, total = torch.cuda.mem_get_info(0)
-    if free < 10 * 1024**3:
-        pytest.skip('Insufficient headroom to exercise both graph budgets')
+    backend = os.environ['MTU_TEST_BACKEND']
     image = Image.new('RGB', (160, 48), 'white')
     ImageDraw.Draw(image).text((4, 4), 'HELLO WORLD', fill='black', font_size=22)
     outputs = []
-    for available, captures, capacity in ((8 * 1024**3 - 1, 1, 4), (8 * 1024**3, 0, 9)):
+    budgets = [(min(free, (4 if backend == 'cuda' else 8) * 1024**3 - 1), backend == 'amd', 4)]
+    if backend == 'cuda' and free >= 4 * 1024**3:
+        budgets.append((4 * 1024**3, True, 5))
+    if free >= 10 * 1024**3:
+        budgets.append((8 * 1024**3, True, 9))
+    for available, graph, capacity in budgets:
         monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda *_, n=available: (n, total))
-        ocr = HayaiOCR(os.environ['MTU_TEST_HAYAI'], backend='amd', batch_size=8)
+        from pathlib import Path
+        model = os.environ.get('MTU_TEST_HAYAI') or Path(os.environ['MTU_TEST_ASSETS']) / 'models/hayai'
+        ocr = HayaiOCR(model, backend=backend, batch_size=8)
         try:
-            assert ocr.engine.MAX_STATES == capacity
+            assert ocr.engine.MAX_STATES == capacity and ocr.identity['decoder_graph'] is graph
             outputs.append([ocr._recognize([image] * n) for n in range(1, 6)])
             with collect() as timings:
                 assert ocr._recognize([image]) == outputs[-1][0]
-            assert timings['ocr_graph_batches'] == 1
-            assert timings.get('ocr_graph_captures', 0) == captures
+            assert timings['ocr_graph_batches' if graph else 'ocr_eager_batches'] == 1
+            assert timings.get('ocr_graph_captures', 0) == int(graph and capacity < 5)
         finally:
             ocr.close()
-    assert outputs[0] == outputs[1]
+    assert outputs[0][0][0] and outputs[0] == outputs[-1]

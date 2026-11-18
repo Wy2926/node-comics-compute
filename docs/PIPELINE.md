@@ -5,7 +5,7 @@
 | 阶段 | 行为与边界 |
 | --- | --- |
 | 接单与输入 | 按租约、下载并发和页面内存预算接单。校验输入摘要、长度、格式、尺寸及规范化状态；文件先在独立工作区拆页，拆页与单图共用计算预算。 |
-| 检测与识别 | DBNet 长图分块保留原图短边（受 `detect_size` 限制），重叠区概率图合并后统一提框。BallonsTranslator 分组；classic 按语言选模型，Hayai 按段识别，截断文本不授权抹字。 |
+| 检测与识别 | DBNet 长图分块保留原图短边（受 `detect_size` 限制），重叠区概率图合并后统一提框。BallonsTranslator 分组，Hayai 按段识别，截断文本不授权抹字。 |
 | 分析检查点 | 黑白文字跳过颜色模型；彩色段按代表行取色。气泡、CTD 字形细化和源笔画保护生成修复掩膜；尺寸、文字、几何和掩膜一起冻结。无字跳过抹字，计算错误不能作为无字提交。 |
 | 翻译与抹字 | 提交分析后，中心翻译与本地抹字并行，等译文不占计算线程。纯色气泡先填充，剩余块由 FP32 LaMa 修复；取消在模型批次／块间生效。 |
 | 排版与交付 | Qt 根据冻结译文、字体和气泡排版。空译文留白，缺少段 ID 或不支持的字体拒绝渲染。输出无损差分覆盖；长图先完整排版再分块。持久化完成后释放缓冲并上传；未知交付重发冻结结果。 |
@@ -16,7 +16,8 @@
 
 - 下载、分析／抹字、渲染、落盘和交付分别有界。页面、原生掩膜和渲染进程传输缓冲共用 `resident_bytes`。可选参考掩膜每页最多 64 MiB；内存不足不增加并发。文件拆页及 ZIP 另受工作区磁盘预算约束。
 - CUDA／AMD 以 `local_pages` 限制计算并发；MPS 一次派发一项分析／抹字，I/O 和渲染可重叠。`engine.threads`、渲染进程与页面数要一起评估；并发提高吞吐不等于降低单页延迟。
-- AMD Hayai 使用原生 HIP Graph：模型加载时空闲显存不足 8 GiB 保留 4 组状态；足够时保留 8 组，OCR 批量为 8 时上限为 9。仅捕获与其他 GPU 模型调用互斥；捕获失败退回原生 eager。AMD 取色复用位置系数，LaMa 在启动期准备固定形状的图。缓存不跨页复用识别结果。
+- Hayai 在 CUDA／AMD 上使用上游解码图。按模型加载时空闲显存：NVIDIA 不足 4 GiB 走 eager，4 至不足 8 GiB 最多保留 5 组图；AMD 不足 8 GiB 保留 4 组。两者达 8 GiB 都保留最多 8 组（OCR 批量为 8 时为 9 组）。捕获受跨模型锁保护，失败退回 eager；静态填充可能改变识别结果。
+- CUDA／AMD 取色复用有界的位置系数。FP32 LaMa 只在预热时为 64 至 512 的八种正方形建图，其他输入走 eager；NVIDIA 预热时空闲显存不足 4 GiB 跳过建图。缓存不跨页复用识别结果。
 
 ## 调优依据
 
@@ -43,13 +44,50 @@ GPU 忙碌率取 Windows 进程最忙引擎。空 MIOpen 缓存、完成节点�
 
 专机连续处理这类页可用 `local_pages=3`、`render_workers=2`、`engine.threads=4`、4 GiB 页面预算。真实本地调度、模拟中心的四轮热测中，`max_leases` 从 4 增到 8，20 页由 7.52 降到 **7.16 s（2.79 页/s）**，GPU 最忙引擎均值由 47.8% 升到 51.7%；领单到本地结果就绪的单页中位数由 1.32 增至 2.30 s。重吞吐选 8，重单页响应选 4。
 
+### NVIDIA CUDA：RTX 4060 Laptop 8 GiB
+
+Windows，驱动 566.07、PyTorch 2.13.0+cu126，i9-13980HX（32 个逻辑核）。基线 `7edcbdb`，输入为 6 张 `835×1200`、2 张 `690×1600` 普通页，长图另测一张 `930×28007`。同一份校验过的模型/字体、固定英文译文、检测／OCR／取色批量 `1/4/4`、CPU 4 线程、参考掩膜缓存 64 MiB；每种形状先预热。墙钟含解码、分析、抹字、渲染和结果校验。
+
+| 同一负载，基线 → 优化（默认 FP32 检测） | 墙钟 s | 页/s | 整卡忙碌率 | 节点 CPU 占整机 |
+| --- | ---: | ---: | ---: | ---: |
+| Hayai，8 页串行 | 13.52 → 7.36 | 0.59 → 1.09 | 30.3% → 48.8% | 8.5% → 9.8% |
+| Hayai，8 页双路 | 12.64 → 6.46 | 0.63 → 1.24 | 29.6% → 52.7% | 11.9% → 15.1% |
+| Hayai，单张长图 | 17.82 → 15.60 | 0.056 → 0.064 | 34.2% → 35.4% | 5.6% → 5.4% |
+
+表中 Hayai 各测 3 轮取中位数，渲染在本进程。串行 OCR 推理 4.95 → 1.15 s；双路时 CPU 总耗时 48.58 → 31.23 CPU·s，PyTorch 峰值已分配 / 保留显存 1.69 / 2.35 → 1.79 / 3.14 GiB。
+
+真实本地调度、模拟中心另测 2 轮：`local_pages=2`、`render_workers=2`、4 GiB 页面预算，每轮 8 页全部交付，无残留租约。基线 / 优化为 **13.06 / 6.85 s**，GPU 28.7% / 50.1%，CPU 12.8% / 14.6%。处理类似普通页可从这组并发开始调。
+
+Hayai 的 8 张普通页和长图共 90 段，FP32 对照三轮文字及行框均一致；7/8 普通页的成品像素每轮都与基线相同。单独逐像素复测另 1 张及长图：修复掩膜和气泡掩膜相同，成品分别只有 1、3 个像素不同，最大通道差 1/255。
+
+仅在这张长图显式设置 `detect_precision=fp16`，检测 3.06 → 1.28 s、整页 15.60 → 14.00 s、峰值已分配显存 2.20 → 1.42 GiB，38 段文字和行框一致、成品像素有变化。因此保留 FP32 默认值。
+
+- **滤波已经覆盖 NVIDIA。** `1408×2025` 单页在这张卡上命中两条 OpenCL 条带；4 线程 CPU / GPU 滤波中位数为 275.1 / 13.0 ms，分条和整页 GPU 结果逐像素相同。
+- **解码图容量。** 8 张普通页实际用到 5 种形状。同进程交错测试，保留第 5 组让每轮重复捕获由 3 次降到 0，OCR 推理由 1.29 降至 1.17 s，PyTorch 峰值已分配显存多约 40 MiB。
+- **抹字图。** 对 64 至 512 的八种方块各跑 4 次，交错三轮：eager / 重放中位数 2.05 / 1.65 s，整卡忙碌率 78.2% / 90.0%。建图约 1.56 s，单模型额外保留 232 MiB 显存；掩膜外字节一致，掩膜内个别通道差 1/255，原生重复运行也有这种差异。
+- **取色。** 固定长图的 16 条代表行交错复测，启用系数缓存前后为 433 / 426 ms，段颜色一致；在这张长图上收益较小。
+
+### Hayai 单后端：进一步降低 CUDA 耗时
+
+在上节**已经启用 CUDA 图的 Hayai 版本**上再做对照。使用同一台 4060、同一批输入、权重、FP32 检测与固定译文。普通页和长图分别测 5 轮取中位数；模拟中心的本地调度测 3 轮（双路计算，`--pipeline --total 8 --resident-mib 4096 --render-workers 2`）。
+
+| 同一负载 | 墙钟：优化前 → 后 | 整卡忙碌率 | 节点 CPU 占整机 |
+| --- | ---: | ---: | ---: |
+| 8 页双路，本进程渲染 | 6.48 → **5.49 s** | 53.6% → 58.1% | 15.0% → 9.4% |
+| 8 页，本地调度至交付 | 6.09 → **5.67 s** | 56.5% → 59.4% | 16.3% → 10.6% |
+| `930×28007` 长图串行 | 16.16 → **11.50 s** | 36.2% → 43.8% | 5.3% → 4.3% |
+
+- **模型等待与传输：** 只有 Hayai 捕获时才排空其他 CUDA 调用。LaMa 的 RGB 和二值掩膜按 uint8 上传、在卡上做 FP32 归一化和输出量化，静态缓冲用流事件保护。双路 8 页的抹字跨模型等锁累计由 1.22 s 降至不足 1 ms，CPU 时间由 31.06 降至 16.41 CPU·s；PyTorch 峰值已分配显存均约 1.80 GiB。
+- **长图输出：** 实际变化稀疏，原来的高条带在大片透明区域上编码。按最高 512 行分块并快速无损编码，超大网格保留粗分块，继续校验 alpha、摘要和大小上限。该页编码从 2.84 降至 0.69 s，实测覆盖层由 1.96 增至 1.99 MB。优化后长图主要耗时为 Qt 排版约 2.94 s、DBNet 检测约 2.80 s。
+- **效果：** 五轮 9 张输入、90 段的文字及行框均与上版 Hayai 相同。单独逐像素复测中所有修复／气泡掩膜一致，8 张成品逐像素相同，另 1 张仅 1 个像素的通道差 1/255。这不是对已移除的分语种 OCR 的准确率评估。
+
 ## 诊断与复测
 
 `state_dir/logs/node.log` 的 `event=page_stage` 和 `event=document_page_stage` 记录本地阶段秒数。先分清排队（`*_queue`）、等模型锁（`*_lock_wait`）和计算，再看以下字段。嵌套耗时不能相加，并发页耗时之和不等于墙钟时间。
 
 | 排查项 | 主要字段 |
 | --- | --- |
-| 检测／OCR | `analyze_detect`、`detect_filter`；`detect_filter_opencl_chunks` 和 `detect_filter_cpu_pages` 分别计 GPU 条带和 CPU 页数；另有 `analyze_group`、`analyze_route`、`analyze_ocr`、`ocr_preprocess`、`ocr_infer`、`ocr_decode`、`ocr_capture` |
+| 检测／OCR | `analyze_detect`、`detect_filter`；`detect_filter_opencl_chunks` 和 `detect_filter_cpu_pages` 分别计 GPU 条带和 CPU 页数；另有 `analyze_group`、`analyze_ocr`、`ocr_preprocess`、`ocr_infer`、`ocr_decode`、`ocr_capture` |
 | 分析后处理 | `analyze_colors`、`analyze_color_gate`、`color_model_lines`、`analyze_bubbles`、`analyze_bubble_mask`、`analyze_refine`、`analyze_checkpoint` |
 | 抹字与排版 | `inpaint_solid_fill`、`inpaint_blocks`、`inpaint_lama`、`inpaint_model`；`render_layout`、`render_diff`、`render_encode`、`persist` |
 
@@ -57,7 +95,10 @@ GPU 忙碌率取 Windows 进程最忙引擎。空 MIOpen 缓存、完成节点�
 
 ```sh
 python -m tools.benchmark_ocr --config node.local.json --input page.webp --concurrency 1 --repeats 5 --output ocr.json
-python -m tools.benchmark_pages --backend amd --models <assets>/models --hayai-model <hayai> --input <pages> --output long.json --threads 4 --render-workers 1 --detect-batch-size 1 --ocr-batch-size 8 --color-batch-size 16 --cache-mib 64 --repeats 5
+python -m tools.benchmark_pages --backend amd --models <assets>/models --input <pages> --output long.json --threads 4 --render-workers 1 --detect-batch-size 1 --ocr-batch-size 8 --color-batch-size 16 --cache-mib 64 --repeats 5
+python -m tools.benchmark_pages --backend cuda --models <assets>/models --input <pages> --output cuda.json --threads 4 --concurrency 2 --render-workers 1 --detect-batch-size 1 --ocr-batch-size 4 --color-batch-size 4 --cache-mib 64 --repeats 3
 ```
 
-`benchmark_pages` 的 `first_pass` 与 `runs` 区分首次处理和热运行，同时报告文字、坐标、像素及输出摘要。`--pipeline` 可验证真实调度与本地模拟中心；`tools.validate_render_output` 单独验证 CPU／Qt 输出。模型和字体实机回归须指定 `MTU_TEST_ASSETS`，普通单测不能证明 GPU 性能或中心连通。
+`benchmark_pages` 的 `warmup_seconds`、`first_pass` 与 `runs` 分别记录节点预热、首次处理和热运行，同时报告文字、坐标、像素及输出摘要。`--pipeline` 可验证真实调度与本地模拟中心；`tools.validate_render_output` 单独验证 CPU／Qt 输出。实机回归指定 `MTU_TEST_ASSETS`；测 NVIDIA 图重放再设 `MTU_TEST_BACKEND=cuda`。
+
+CUDA 下 `benchmark_pages` 和 `benchmark_ocr` 在每轮热测期间按设备 UUID 调用 `nvidia-smi`，每 200 ms 采样一次整卡忙碌率（含其他进程）。报告记录 `gpu_busy_percent` 均值与 `gpu_samples`；工具不可用或没有读数时分别为 `null`、`0`。`cpu_core_equivalents` 是节点及已启动子进程的 CPU 秒数除以墙钟秒数；`cpu_percent_of_host` 再按主机逻辑核数折算，不含其他程序。

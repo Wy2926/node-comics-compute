@@ -11,7 +11,7 @@ HOST = ENGINE.parent / 'compute-node'
 sys.path.insert(0, str(ENGINE))
 sys.path.insert(0, str(HOST))
 from build_support import download, sha256
-from mtu_engine.assets import LOCK, selected_asset
+from mtu_engine.assets import LOCK
 
 
 def apply_source_patches(upstream, source='source'):
@@ -29,7 +29,7 @@ def apply_source_patches(upstream, source='source'):
         path.write_text(text, encoding='utf-8', newline='\n')
 
 
-def prepare(output, cache, ocr_backend='classic'):
+def prepare(output, cache):
     output, cache = Path(output).resolve(), Path(cache).resolve()
     output.mkdir(parents=True, exist_ok=True)
     if (output / 'node.json').exists() or (output / 'state').exists():
@@ -74,18 +74,14 @@ def prepare(output, cache, ocr_backend='classic'):
         directory = output / 'upstream' / relative
         directory.mkdir(parents=True, exist_ok=True)
         (directory / '.node-prepared').write_text('Prepared for paragraph grouping imports.\n', encoding='utf-8')
-    for asset in LOCK['support']:
-        if not selected_asset(asset['file'], ocr_backend):
-            continue
-        print(f'Preparing support: {asset["file"]}', flush=True)
-        target = (output / asset['file']).resolve()
-        if not target.is_relative_to(output / 'upstream'):
-            raise ValueError('Unsafe upstream support path')
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(download(asset['url'], asset['sha256'], cache / asset['sha256']), target)
+    hayai = output / 'models/hayai'
+    for folder, spec in LOCK['hayai'].items():
+        (hayai / folder).mkdir(parents=True)
+        for name, checksum in spec['files'].items():
+            url = f'https://huggingface.co/{spec["repo"]}/resolve/{spec["revision"]}/{name}'
+            shutil.copyfile(download(url, checksum, cache / checksum), hayai / folder / name)
+    (hayai / 'source.json').write_text(json.dumps(LOCK['hayai'], indent=2) + '\n', encoding='utf-8', newline='\n')
     for asset in LOCK['models']:
-        if not selected_asset('models/' + asset['file'], ocr_backend):
-            continue
         print(f'Preparing model: {asset["file"]}', flush=True)
         cached = download(asset['url'], asset['sha256'], cache / asset['sha256'])
         if 'archive' in asset:
@@ -151,6 +147,5 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ENGINE / '.assets')
     parser.add_argument('--cache', type=Path, default=HOST / '.build/downloads')
-    parser.add_argument('--ocr-backend', choices=('classic', 'hayai'), default='classic')
     args = parser.parse_args()
-    prepare(args.output, args.cache, args.ocr_backend)
+    prepare(args.output, args.cache)

@@ -30,7 +30,7 @@ def configuration(detect_size=1280, inpainting_size=512):
     return Config.model_validate({
         'detector': {'detector': 'default', 'detection_size': detect_size,
                      'text_threshold': 0.5, 'box_threshold': 0.6, 'unclip_ratio': 2.3},
-        'ocr': {'ocr': 'paddleocr', 'prob': 0.50, 'limit_mask_dilation_to_bubble_mask': True},
+        'ocr': {'limit_mask_dilation_to_bubble_mask': True},
         'inpainter': {'inpainter': 'lama_large', 'inpainting_size': inpainting_size,
                       'inpainting_precision': 'fp32', 'force_use_torch_inpainting': True,
                       'solid_fill_pure_bubbles': True, 'per_block_inpainting': True},
@@ -248,9 +248,8 @@ class Renderer:
 
 class Engine:
     def __init__(self, models, font, gpu=0, threads=2, detect_size=1280, inpainting_size=512, keep_lang=None,
-                 ocr_batch_size=None, ocr_min_batch_size=None, color_batch_size=None, detect_batch_size=None,
-                 ocr_arena_extend_strategy=None, ocr_arena_shrinkage=None, backend='cuda',
-                 ocr_backend='classic', ocr_model=None, detect_precision='auto'):
+                 ocr_batch_size=None, color_batch_size=None, detect_batch_size=None, backend='cuda',
+                 ocr_model=None, detect_precision='auto'):
         from classic_node.config import ENGINE_DEFAULTS
         import cv2
         import torch
@@ -280,7 +279,7 @@ class Engine:
         from manga_translator.inpainting.inpainting_lama_mpe import LamaLargeInpainter
         from manga_translator.ocr.model_48px import Model48pxOCR
         from .colors import Colors
-        from .ocr import create as create_ocr
+        from .ocr.hayai import HayaiOCR
         # Select only the upstream PyTorch checkpoint; do not fetch an unused CPU
         # ONNX model just to satisfy the upstream multi-backend download map.
         class TorchLama(LamaLargeInpainter):
@@ -308,21 +307,17 @@ class Engine:
             self.detector.model.register_forward_pre_hook(check_cancelled)
             self.detector_settings = {'dtype': str(next(self.detector.model.parameters()).dtype),
                                       'opencl_filter': self.detector.opencl_filter}
-            if backend == 'amd':
+            if backend in ('cuda', 'amd'):
                 from .color_positions import prepare_color_positions
                 prepare_color_positions(self.color_model.model)
             self.colors = Colors(self.color_model, color_batch_size)
-            options = {'batch_size': ocr_batch_size, 'min_batch_size': ocr_min_batch_size,
-                       'arena_extend_strategy': ocr_arena_extend_strategy, 'arena_shrinkage': ocr_arena_shrinkage}
-            options = {key: ENGINE_DEFAULTS['ocr_' + key] if value is None else value for key, value in options.items()}
             self.bubbles = MangaLensBubbleDetector(
                 model_path=self.models / 'detection/mangalens.pt', device=self.device,
                 imgsz=768, conf=0.25, iou=0.7, auto_download=False, auto_load=True)
-            self.ocr = create_ocr(ocr_backend, self.models, gpu, threads, backend=backend,
-                                  model=ocr_model, **options)
-        self._capture_guard = (self.ocr.capture_lock if backend == 'amd' and ocr_backend == 'hayai'
-                               else nullcontext())
-        if backend == 'amd':
+            self.ocr = HayaiOCR(ocr_model or self.models / 'hayai', gpu, backend=backend,
+                                batch_size=ENGINE_DEFAULTS['ocr_batch_size'] if ocr_batch_size is None else ocr_batch_size)
+        self._capture_guard = self.ocr.capture_lock or nullcontext()
+        if backend in ('cuda', 'amd'):
             from .inpainting import LamaGraphs
             self.inpainter.model.generator = LamaGraphs(self.inpainter.model.generator)
         # Upstream imports can disable OpenCV threading. Apply the node's CPU
@@ -351,13 +346,14 @@ class Engine:
                 # Warm their HIP kernels before accepting pages, not on first use.
                 for side in range(64, c.inpainter.inpainting_size + 1, 64):
                     if side == 512:
-                        continue  # Already exercised above; keep CUDA unchanged.
+                        continue  # Already exercised above.
                     sample = np.full((side, side, 3), 255, dtype=np.uint8)
                     sample_mask = np.zeros((side, side), dtype=np.uint8)
                     center = side // 2
                     sample_mask[center - 15:center + 15, center - 15:center + 15] = 255
                     await self.inpainter.inpaint(sample, sample_mask, c.inpainter,
                                                 c.inpainter.inpainting_size)
+            if self.backend in ('cuda', 'amd'):
                 self.inpainter.model.generator.prepare()
         with device_context(self.backend, self.gpu), self._detector_lock, self._bubble_lock:
             asyncio.run(run())
@@ -388,7 +384,7 @@ class Engine:
             for block, reading in zip(blocks, readings, strict=True):
                 if not reading.texts:
                     continue
-                region = TextBlock(lines=block.lines, texts=reading.texts, language=reading.language,
+                region = TextBlock(lines=block.lines, texts=reading.texts, language=None,
                     font_size=block.font_size, angle=block.angle,
                     direction='v' if block.src_is_vertical else 'h',
                     default_stroke_width=c.render.stroke_width, adjust_bg_color=False)
@@ -475,6 +471,8 @@ class Engine:
     def close(self):
         # Node shutdown joins the compute pool before unloading model weights.
         with device_context(self.backend, self.gpu), self._detector_lock, self._bubble_lock:
+            if self.backend == 'cuda' and self.inpainter.model.generator.finished is not None:
+                self.inpainter.model.generator.finished.synchronize()
             for model in (self.ocr, self.colors):
                 model.close()
             for model in (self.detector, self.inpainter, self.color_model):

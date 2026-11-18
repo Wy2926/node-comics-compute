@@ -4,10 +4,10 @@ from threading import Barrier
 import numpy as np
 
 from classic_node.timing import collect
-from mtu_engine.page_cache import _current, bgr, crop, normalized, page_images
+from mtu_engine.page_cache import _current, bgr, crop, page_images
 
 
-def test_native_crop_conversion_and_exact_padding_reuse():
+def test_native_color_crop_and_conversion_reuse():
     source = np.zeros((200, 100, 3), np.uint8)
     points = np.arange(8).reshape(4, 2)
     calls = []
@@ -19,15 +19,9 @@ def test_native_crop_conversion_and_exact_padding_reuse():
         assert crop(source, points.astype(float), native) is first
         blue = bgr(first)
         assert bgr(first) is blue and blue[0, 0].tolist() == [3, 2, 1]
-        def prepare():
-            calls.append('prepare')
-            return np.ones((3, 48, 30), np.float32)
-        padded = normalized(blue, 2., (3, 48, 320), prepare)
-        assert normalized(blue, 2., (3, 48, 320), prepare) is padded
-        assert normalized(blue, 3., (3, 48, 320), prepare) is not padded
-        assert not first.flags.writeable and not padded.flags.writeable
-    assert calls == ['crop', 'prepare', 'prepare']
-    assert metrics['analysis_image_cache_hits'] == 3
+        assert not first.flags.writeable and not blue.flags.writeable
+    assert calls == ['crop']
+    assert metrics['analysis_image_cache_hits'] == 2
     assert _current.get() is None
 
 

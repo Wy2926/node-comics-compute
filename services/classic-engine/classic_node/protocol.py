@@ -69,7 +69,13 @@ def pack_result(final, original, alpha, version, analysis, translated, *, allow_
     if allow_tiles and large_page:
         record('render_diff', perf_counter() - started)
         with stage('render_encode'):
-            return _pack_tiled(final, original, alpha, result, output_workers)
+            try:
+                return _pack_tiled(final, original, alpha, result, output_workers)
+            except NodeFailure as error:
+                if error.code != 'CLASSIC_OUTPUT_TOO_LARGE':
+                    raise
+            # Release the failed bodies before retrying the previous compact encoding.
+            return _pack_tiled(final, original, alpha, result, output_workers, compact=True)
     changed, bounds = _visible_diff(final, original, alpha)
     if bounds is None:
         record('render_diff', perf_counter() - started)
@@ -114,12 +120,15 @@ def pack_full_image(final, alpha, *, max_bytes):
         'width': width, 'height': height, 'mime': 'image/png'}}}
 
 
-def _pack_tiled(final, original, alpha, result, workers):
+def _pack_tiled(final, original, alpha, result, workers, *, compact=False):
     import numpy as np
     height, width = final.shape[:2]
     alpha = np.asarray(alpha) if alpha is not None else None
-    positions = [(x, y, min(width, x + 2048), min(height, y + 4096))
-                 for y in range(0, height, 4096) for x in range(0, width, 2048)]
+    # Sparse replacements need smaller bounding boxes; keep the coarse grid on
+    # huge canvases so the finer grid cannot exhaust the manifest budget.
+    step = 512 if not compact and ((width + 2047) // 2048) * ((height + 511) // 512) <= 1024 else 4096
+    positions = [(x, y, min(width, x + 2048), min(height, y + step))
+                 for y in range(0, height, step) for x in range(0, width, 2048)]
     workers = max(1, min(int(workers), len(positions)))
 
     def encode(position):
@@ -133,7 +142,7 @@ def _pack_tiled(final, original, alpha, result, workers):
         left, top, end_x, end_y = bounds
         diff_seconds = perf_counter() - tick
         tick = perf_counter()
-        data = encode_patch(pixels[top:end_y, left:end_x], changed[top:end_y, left:end_x])
+        data = encode_patch(pixels[top:end_y, left:end_x], changed[top:end_y, left:end_x], fast=not compact)
         tile = {'x': x + left, 'y': y + top, 'width': end_x - left, 'height': end_y - top,
                 'sha256': hashlib.sha256(data).hexdigest(), 'byte_size': len(data)}
         return tile, data, diff_seconds, perf_counter() - tick

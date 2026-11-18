@@ -9,12 +9,12 @@ from classic_node import runtime
 def prepare(monkeypatch, tmp_path, covers):
     font = tmp_path / 'font.fixture'
     font.write_bytes(b'font identity')
-    monkeypatch.setattr(runtime, 'verify', lambda *args: {'files': {}})
+    monkeypatch.setattr(runtime, 'verify', lambda *args, **kwargs: {'files': {}})
     monkeypatch.setattr(runtime, 'package_version', lambda *args: 'test')
     monkeypatch.setattr(runtime, 'Engine', lambda **kwargs: SimpleNamespace(
         renderer=SimpleNamespace(covers=covers, font_ids=['comic-relief']),
         detector_settings={'dtype': 'torch.float32', 'opencl_filter': False},
-        ocr=SimpleNamespace(identity={'backend': kwargs.get('ocr_backend', 'classic')}), close=lambda: None))
+        ocr=SimpleNamespace(identity={'backend': 'hayai'}), close=lambda: None))
     return {'engine': {'models': 'unused', 'gpu': 0, 'font': [str(font)]}}
 
 
@@ -41,39 +41,28 @@ def test_language_default_mapping_changes_runtime_fingerprint(monkeypatch, tmp_p
     assert runtime.Runtime(config).version != first
 
 
-def test_backend_identity_queries_only_its_own_ort_distribution(monkeypatch, tmp_path):
+def test_gpu_backend_remains_part_of_runtime_identity(monkeypatch, tmp_path):
     config = prepare(monkeypatch, tmp_path, str.isascii)
-    packages = []
-    monkeypatch.setattr(runtime, 'package_version', lambda name: (packages.append(name), 'test')[1])
     cuda = runtime.Runtime(config)
     assert cuda.version.startswith('mtu-cuda-v1-')
-    assert 'onnxruntime-gpu' in packages and 'onnxruntime-directml' not in packages
-    packages.clear()
     config['engine']['backend'] = 'amd'
     amd = runtime.Runtime(config)
     assert amd.version.startswith('mtu-amd-v1-') and amd.version != cuda.version
-    assert 'onnxruntime-directml' in packages and 'onnxruntime-gpu' not in packages
 
 
 def test_hayai_identity_needs_no_classic_packages_and_ignores_install_paths(monkeypatch, tmp_path):
     config = prepare(monkeypatch, tmp_path, str.isascii)
-    config['engine'].update(backend='mps', ocr_backend='hayai', ocr_model='weights')
+    config['engine'].update(backend='mps', ocr_model='weights')
     packages = []
     monkeypatch.setattr(runtime, 'package_version', lambda name: (packages.append(name), 'test')[1])
     first = runtime.Runtime(config).version
     assert not {'onnxruntime', 'onnxruntime-gpu', 'onnxruntime-directml', 'manga-ocr', 'rapidocr'} & set(packages)
     config['engine'].update(ocr_model='moved/weights')
     assert runtime.Runtime(config).version == first
-    config['engine'].update(ocr_min_batch_size=99, ocr_arena_shrinkage=False)
-    assert runtime.Runtime(config).version == first
-    config['engine']['ocr_backend'] = 'classic'
-    assert runtime.Runtime(config).version != first
 
 
 def test_resolved_cpu_settings_start_only_cpu_pool_and_do_not_change_identity(monkeypatch, tmp_path):
     config = prepare(monkeypatch, tmp_path, str.isascii)
-    from classic_node.config import engine_options
-    assert 'threads' not in engine_options(config['engine'])
     config.update(render_workers=1, _render_threads=2)
     config['engine']['threads'] = 2
     direct = runtime.Runtime(config)
