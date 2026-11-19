@@ -21,7 +21,6 @@
     "gpu": 0,
     "threads": "auto",
     "ocr_batch_size": 4,
-    "color_batch_size": 4,
     "detect_batch_size": 4,
     "detect_size": 1280,
     "detect_precision": "auto",

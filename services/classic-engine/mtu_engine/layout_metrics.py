@@ -41,6 +41,22 @@ def measured_ink(text, *args):
     return _measured(_line_ink_geometry, _ink_bounds, text, args)
 
 
+def _block(text, size, horizontal, spacing, stroke, letters):
+    from manga_translator.rendering import text_render
+    return text_render.measure_rich_text_metrics(size, text, horizontal, spacing,
+                                                stroke_width=stroke, letter_spacing=letters)
+
+
+def block_metrics(size, text, horizontal, spacing, *, config, stroke_width, letter_spacing):
+    from manga_translator.rendering import text_render
+    from manga_translator.rendering.text_render._render import _resolve_stroke_ratio
+    if isinstance(text, str) and _current.get() is not None:
+        stroke = _resolve_stroke_ratio(config, stroke_width)
+        return _measured(_block, dict.copy, text, (size, horizontal, spacing, stroke, letter_spacing))
+    return text_render.measure_rich_text_metrics(size, text, horizontal, spacing, config=config,
+                                                stroke_width=stroke_width, letter_spacing=letter_spacing)
+
+
 def _advances(text, size, spacing):
     from manga_translator.rendering.auto_linebreak import _vert_char_advance
     return (_vert_char_advance(size, char, letter_spacing=spacing) for char in text)

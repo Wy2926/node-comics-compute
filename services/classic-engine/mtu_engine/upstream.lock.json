@@ -151,7 +151,7 @@
         },
         {
           "before": "def find_largest_inscribed_rect(mask: np.ndarray) -> tuple:\n    \"\"\"Return the largest axis-aligned rectangle fully covered by ``mask``.\n\n    The previous implementation started from the largest inscribed circle and\n    greedily expanded four sides.  That finds a locally convenient rectangle,\n    not the maximum-area rectangle; narrow or irregular bubbles could therefore\n    produce a small near-square budget.  This uses the standard histogram/stack\n    maximal-rectangle algorithm and evaluates every foreground rectangle.\n    \"\"\"\n    binary = np.asarray(mask) > 0\n    if binary.ndim != 2 or not np.any(binary):\n        return 0, 0, 0, 0\n\n    height, width = binary.shape\n    heights = np.zeros(width, dtype=np.int32)\n    best_area = 0\n    best_rect = (0, 0, 0, 0)\n\n    for y in range(height):\n        heights = np.where(binary[y], heights + 1, 0)\n        stack: list[int] = []\n        for x in range(width + 1):\n            current_height = int(heights[x]) if x < width else 0\n            while stack and current_height < int(heights[stack[-1]]):\n                bar_x = stack.pop()\n                rect_height = int(heights[bar_x])\n                left = stack[-1] + 1 if stack else 0\n                rect_width = x - left\n                area = rect_width * rect_height\n                if area <= best_area:\n                    continue\n                best_area = area\n                best_rect = (\n                    left,\n                    y - rect_height + 1,\n                    rect_width,\n                    rect_height,\n                )\n            stack.append(x)\n\n    return best_rect\n\n\n",
-          "after": "def find_largest_inscribed_rect(mask: np.ndarray) -> tuple:\n    return cached_largest_inscribed_rect(mask, _find_largest_inscribed_rect)\n\n\ndef _find_largest_inscribed_rect(mask: np.ndarray) -> tuple:\n    \"\"\"Return the largest axis-aligned rectangle fully covered by ``mask``.\n\n    The previous implementation started from the largest inscribed circle and\n    greedily expanded four sides.  That finds a locally convenient rectangle,\n    not the maximum-area rectangle; narrow or irregular bubbles could therefore\n    produce a small near-square budget.  This uses the standard histogram/stack\n    maximal-rectangle algorithm and evaluates every foreground rectangle.\n    \"\"\"\n    # Reuse exact component bounds instead of rediscovering them over the page.\n    bounds = reference_mask_bounds(mask)\n    if bounds is None:\n        binary = np.asarray(mask) > 0\n        if binary.ndim != 2 or not np.any(binary):\n            return 0, 0, 0, 0\n        bounds = cv2.boundingRect(binary.view(np.uint8))\n    origin_x, origin_y, width, height = bounds\n    binary = np.asarray(mask)[origin_y:origin_y + height, origin_x:origin_x + width] > 0\n    heights = np.zeros(width, dtype=np.int32)\n    best_area = 0\n    best_rect = (0, 0, 0, 0)\n\n    for y in range(height):\n        heights = np.where(binary[y], heights + 1, 0)\n        stack: list[int] = []\n        for x in range(width + 1):\n            current_height = int(heights[x]) if x < width else 0\n            while stack and current_height < int(heights[stack[-1]]):\n                bar_x = stack.pop()\n                rect_height = int(heights[bar_x])\n                left = stack[-1] + 1 if stack else 0\n                rect_width = x - left\n                area = rect_width * rect_height\n                if area <= best_area:\n                    continue\n                best_area = area\n                best_rect = (\n                    origin_x + left,\n                    origin_y + y - rect_height + 1,\n                    rect_width,\n                    rect_height,\n                )\n            stack.append(x)\n\n    return best_rect\n\n\n"
+          "after": "def find_largest_inscribed_rect(mask: np.ndarray) -> tuple:\n    return cached_largest_inscribed_rect(mask, _find_largest_inscribed_rect)\n\n\ndef _find_largest_inscribed_rect(mask: np.ndarray) -> tuple:\n    from mtu_engine.inscribed_rect import largest_rectangle\n    return largest_rectangle(mask, reference_mask_bounds(mask))\n\n\n"
         },
         {
           "before": "    is_rich_text_document,\n    plain_equivalent_text,\n",
@@ -160,6 +160,26 @@
         {
           "before": "        text = (text or '').strip()\n        if not text:\n            return 1\n\n    def _fits(fs: int) -> bool:\n",
           "after": "        text = (text or '').strip()\n        if not text:\n            return 1\n        # Normalize stable text once, not on every candidate font measurement.\n        text = legacy_line_breaks_to_document(text)\n\n    def _fits(fs: int) -> bool:\n"
+        },
+        {
+          "before": "    metrics = text_render.measure_rich_text_metrics(\n        base_font, text, is_horizontal, line_spacing,\n",
+          "after": "    from mtu_engine.layout_metrics import block_metrics\n    metrics = block_metrics(\n        base_font, text, is_horizontal, line_spacing,\n"
+        },
+        {
+          "before": "    dst_points_list = []\n    anchor_modes: List[Optional[str]] = [None] * len(text_regions)\n",
+          "after": "    has_center_mask = center_check_mask is not None and np.any(center_check_mask)\n    dst_points_list = []\n    anchor_modes: List[Optional[str]] = [None] * len(text_regions)\n"
+        },
+        {
+          "before": "            if apply_bubble_centering and center_check_mask is not None and np.count_nonzero(center_check_mask) > 0:\n                _rm = _build_region_reference_mask(region, center_check_mask, center_check_label_map)\n                apply_bubble_centering = np.count_nonzero(_rm) > 0\n",
+          "after": "            center_reference = None\n            if apply_bubble_centering and has_center_mask:\n                center_reference = _build_region_reference_mask(region, center_check_mask, center_check_label_map)\n                apply_bubble_centering = bool(np.any(center_reference))\n"
+        },
+        {
+          "before": "                    if balloon_fill_mask is not None and np.count_nonzero(balloon_fill_mask) > 0:\n                        region_bubble_mask = _build_region_reference_mask(\n                            region, balloon_fill_mask, balloon_fill_label_map\n                        )\n                    lines_fully_enclosed = (\n                        np.count_nonzero(region_bubble_mask) > 0\n",
+          "after": "                    if center_reference is not None:\n                        region_bubble_mask = center_reference\n                        has_reference = apply_bubble_centering\n                    elif balloon_fill_label_map is not None:\n                        region_bubble_mask = _build_region_reference_mask(region, balloon_fill_mask, balloon_fill_label_map)\n                        has_reference = bool(np.any(region_bubble_mask))\n                    else:\n                        has_reference = False\n                    lines_fully_enclosed = (\n                        has_reference\n"
+        },
+        {
+          "before": "                            region_bubble_mask is not None\n                            and np.count_nonzero(region_bubble_mask) > 0\n                            and lines_fully_enclosed\n",
+          "after": "                            lines_fully_enclosed\n"
         },
         {
           "before": "                        and _region_lines_fully_inside_mask(region, region_bubble_mask)\n",
@@ -331,39 +351,6 @@
     "sha256": "a6e46a259693f508f4746868eb04260be4dc485b4119f1b9228484e062156cac",
     "license": "GPL-3.0"
   },
-  "comic_translate": {
-    "repository": "https://github.com/ogkalu2/comic-translate",
-    "revision": "8977b91a4f7a40c3917c5a268e9e7d78e1d818da",
-    "url": "https://codeload.github.com/ogkalu2/comic-translate/zip/8977b91a4f7a40c3917c5a268e9e7d78e1d818da",
-    "sha256": "db8ccb74697ee66f81af983642227b642c098eb0025e8a24e6a0ea4e6518509f",
-    "license": "Apache-2.0",
-    "patches": {
-      "modules/utils/language_utils.py": [
-        {
-          "before": "from PySide6.QtCore import Qt\n",
-          "after": "from __future__ import annotations\n"
-        },
-        {
-          "before": "def get_layout_direction(language: str) -> Qt.LayoutDirection:\n",
-          "after": "def get_layout_direction(language: str) -> Qt.LayoutDirection:\n    # Node Comics: image-only utilities must not load a second Qt binding.\n    from PySide6.QtCore import Qt\n"
-        }
-      ],
-      "modules/detection/script_detection.py": [
-        {
-          "before": "import onnxruntime as ort\n",
-          "after": ""
-        },
-        {
-          "before": "def _make_session_options():\n    so = ort.SessionOptions()",
-          "after": "def _make_session_options():\n    import onnxruntime as ort\n    so = ort.SessionOptions()"
-        },
-        {
-          "before": "    def initialize(self) -> None:\n        if self.session is not None:",
-          "after": "    def initialize(self) -> None:\n        import onnxruntime as ort\n        if self.session is not None:"
-        }
-      ]
-    }
-  },
   "hyphenation": {
     "url": "https://files.pythonhosted.org/packages/7b/1f/c2142d2edf833a90728e5cdeb10bdbdc094dde8dbac078cee0cf33f5e11b/pyphen-0.17.2-py3-none-any.whl",
     "sha256": "3a07fb017cb2341e1d9ff31b8634efb1ae4dc4b130468c7c39dd3d32e7c3affd",
@@ -371,18 +358,6 @@
     "note": "Only bundled LibreOffice dictionaries and their notices; rendering uses upstream MTU and libhyphen."
   },
   "models": [
-    {
-      "url": "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/ocr_ar_48px.ckpt",
-      "sha256": "29daa46d080818bb4ab239a518a88338cbccff8f901bef8c9db191a7cb97671d",
-      "file": "ocr/ocr_ar_48px.ckpt",
-      "license": "GPL-3.0"
-    },
-    {
-      "url": "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/alphabet-all-v7.txt",
-      "sha256": "f5722368146aa0fbcc9f4726866e4efc3203318ebb66c811d8cbbe915576538a",
-      "file": "ocr/alphabet-all-v7.txt",
-      "license": "GPL-3.0"
-    },
     {
       "url": "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/detect-20241225.ckpt",
       "sha256": "67ce1c4ed4793860f038c71189ba9630a7756f7683b1ee5afb69ca0687dc502e",

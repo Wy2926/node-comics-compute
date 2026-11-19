@@ -1,5 +1,4 @@
 """Pinned maximal-rectangle search: exact geometry, bounded per-render reuse."""
-import ast
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import SimpleNamespace
@@ -37,8 +36,7 @@ def helpers(tmp_path, monkeypatch):
     exec(compile(rectangle['before'], render_path, 'exec'), baseline)
     return SimpleNamespace(rect=render['find_largest_inscribed_rect'],
         original=baseline['find_largest_inscribed_rect'], cache=bubble['reference_mask_cache'],
-        build=bubble['build_region_reference_mask'], render=render, bubble=bubble,
-        source=rectangle)
+        build=bubble['build_region_reference_mask'], render=render, bubble=bubble)
 
 
 @pytest.mark.parametrize('dtype', [np.bool_, np.uint8, np.int16, np.float32])
@@ -74,28 +72,28 @@ def test_disconnected_components_holes_and_equal_area_order(helpers):
     assert helpers.rect(mask) == helpers.original(mask)
 
 
-def test_long_page_only_runs_native_row_loop_on_nonempty_bounds(helpers):
+def test_cancellation_during_histogram_search_leaves_mask_reusable(helpers):
+    from mtu_engine.backend import cancellation
+    mask = np.ones((180, 9), np.uint8)
+    calls = []
+
+    def cancel():
+        if calls:
+            raise InterruptedError
+        calls.append(True)
+
+    with cancellation(cancel), pytest.raises(InterruptedError):
+        helpers.rect(mask)
+    assert helpers.rect(mask) == (0, 0, 9, 180)
+
+
+def test_long_page_uses_component_bounds_and_preserves_page_coordinates(helpers, monkeypatch):
+    from mtu_engine import inscribed_rect
     mask = np.zeros((34545, 690), np.uint8)
     mask[33700:33740, 120:190] = 255
-    native_range, row_counts = range, []
-
-    def traced_range(*args):
-        if len(args) == 1 and args[0] == 40:
-            row_counts.append(args[0])
-        assert args[0] not in (34545, 691)
-        return native_range(*args)
-
-    helpers.render['range'] = traced_range
+    monkeypatch.setitem(helpers.render, 'reference_mask_bounds', lambda _: (120, 33700, 70, 40))
+    monkeypatch.setattr(inscribed_rect.cv2, 'boundingRect', lambda _: pytest.fail('Rescanned full page'))
     assert helpers.rect(mask) == (120, 33700, 70, 40)
-    assert row_counts == [40]
-    # The histogram/stack loop remains verbatim, apart from coordinate rebasing.
-    old = ast.parse(helpers.source['before']).body[0]
-    new = ast.parse(helpers.source['after']).body[1]
-    old_loop = next(node for node in old.body if isinstance(node, ast.For))
-    new_loop = next(node for node in new.body if isinstance(node, ast.For))
-    rebased = ast.unparse(new_loop).replace('origin_x + left', 'left').replace(
-        'origin_y + y - rect_height + 1', 'y - rect_height + 1')
-    assert rebased == ast.unparse(old_loop)
 
 
 def reference(helpers, mask, left=3):

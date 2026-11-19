@@ -137,7 +137,8 @@ def test_backend_dependency_locks_do_not_mix_gpu_runtimes():
     amd_names = {p['name'] for p in amd['package']}
     macos = tomllib.loads((root / 'environments/macos/uv.lock').read_text(encoding='utf-8'))
     all_names = cuda_names | amd_names | {p['name'] for p in macos['package']}
-    assert not all_names.intersection({'onnxruntime-gpu', 'onnxruntime', 'onnxruntime-directml', 'manga-ocr', 'rapidocr'})
+    assert not all_names.intersection({'onnxruntime-gpu', 'onnxruntime', 'onnxruntime-directml',
+                                       'manga-ocr', 'rapidocr', 'mahotas', 'pyside6-essentials', 'shiboken6'})
     assert not any(n.startswith(('rocm', 'amd-torch')) for n in cuda_names)
     assert not any(n.startswith('nvidia-') for n in amd_names)
     assert {'amd-torch-device-gfx1030', 'rocm-sdk-device-gfx1030'} <= amd_names

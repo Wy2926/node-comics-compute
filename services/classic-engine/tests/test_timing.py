@@ -93,11 +93,11 @@ def test_production_ocr_details_are_numeric_local_diagnostics_only():
         record('ocr_infer', .125)
         record('ocr_batches', 3)
         record('ocr_output_tokens', 42)
-        record('color_model_lines', 18)
-        record('analyze_color_gate', .019)
+        record('color_sample_regions', 18)
+        record('analyze_colors', .019)
         record('unlisted', 1)
     assert OCR_FIELDS <= LOCAL_TIMINGS
-    assert values['color_model_lines'] == 18
+    assert values['color_sample_regions'] == 18
     assert safe_timings(values | {'source': 'private text', 'ocr_decode': float('nan'),
                                  'ocr_transfer': -1, 'ocr_preprocess': 'private text'}) == values
     assert {key: value for key, value in values.items() if key in WIRE_FIELDS} == {}

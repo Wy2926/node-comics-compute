@@ -17,6 +17,8 @@ Windows 便携包使用 `data/node.json`；Linux 挂载 `node.local.json`。模�
 
 OCR 仅使用 Hayai，`engine.ocr_batch_size` 为 1–8。升级时先排空，配套更新运行环境和资产；原来显式设置 `engine.ocr_backend=classic` 的节点需删除该字段再 `check`。旧示例中的 `ocr_min_batch_size`、`ocr_arena_*` 已无效，可删除。没有指定 OCR 后端的旧配置会直接使用随包的 `models/hayai`。
 
+CUDA、AMD 和 MPS 均从原图采样取色。旧 `engine.color_batch_size` 会被忽略，可直接沿用私有配置；恢复中的页继续使用检查点保存的颜色。
+
 `engine.detect_precision` 仅控制 DBNet。`fp16` 先在 FP32 权重上折叠卷积与 BatchNorm，再转 FP16 推理，输出概率图仍为 FP32。`auto` 在 MPS 选择这条路径，在 AMD/CUDA 使用 FP32。精度和批量可能改变 OCR、颜色或掩膜，选择依据见[流水线实测](PIPELINE.md#调优依据)。对照 CPU 双边滤波时，可在进程启动前设置 `OPENCV_OPENCL_RUNTIME=disabled`。
 
 ## 中心连接与调度

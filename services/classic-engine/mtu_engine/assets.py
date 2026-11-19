@@ -17,8 +17,6 @@ def verify(models, *, include_hayai=True):
     manifest = json.loads((root / 'mtu-assets.json').read_text(encoding='utf-8'))
     if manifest['upstream'] != LOCK['source']['revision'] or manifest['lock_sha256'] != file_hash(Path(__file__).with_name('upstream.lock.json')):
         raise ValueError('MTU assets do not match the pinned source and models; run tools.prepare_mtu')
-    if manifest.get('comic_translate') != LOCK['comic_translate']['revision']:
-        raise ValueError('Comic Translate assets do not match the pinned source; run tools.prepare_mtu')
     verified = {}
     for name, expected in manifest['files'].items():
         path = (root / name).resolve()
@@ -35,11 +33,10 @@ def verify(models, *, include_hayai=True):
 def activate(models):
     """Import the verified upstream bundle, including checksum-pinned source edits."""
     root = Path(models).resolve().parent / 'upstream'
-    for package, directory in (('manga_translator', root), ('ballontranslator', root),
-                               ('modules', root / 'comic_translate'), ('imkit', root / 'comic_translate')):
+    for package in ('manga_translator', 'ballontranslator'):
         existing = sys.modules.get(package)
-        if existing is not None and Path(existing.__file__).resolve().parent != directory / package:
+        if existing is not None and Path(existing.__file__).resolve().parent != root / package:
             raise RuntimeError(f'A different {package} source is already loaded in this process')
-        if str(directory) not in sys.path:
-            sys.path.insert(0, str(directory))
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
     return root

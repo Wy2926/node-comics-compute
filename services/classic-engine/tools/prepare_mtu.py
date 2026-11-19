@@ -14,10 +14,10 @@ from build_support import download, sha256
 from mtu_engine.assets import LOCK
 
 
-def apply_source_patches(upstream, source='source'):
+def apply_source_patches(upstream):
     """Apply exact, reviewable lockfile edits; fail if the pinned source drifts."""
     upstream = Path(upstream).resolve()
-    for relative, patches in LOCK[source].get('patches', {}).items():
+    for relative, patches in LOCK['source']['patches'].items():
         path = (upstream / relative).resolve()
         if not path.is_relative_to(upstream):
             raise ValueError('Unsafe upstream patch path')
@@ -43,8 +43,7 @@ def prepare(output, cache):
         if directory.exists():
             shutil.rmtree(directory)
     for key, repository, modules in (('source', 'manga-translator-ui', ('manga_translator',)),
-                                    ('ballons', 'BallonsTranslator', ('ballontranslator', 'resources')),
-                                    ('comic_translate', 'comic-translate', ('modules', 'imkit'))):
+                                    ('ballons', 'BallonsTranslator', ('ballontranslator', 'resources'))):
         source = LOCK[key]
         print(f'Preparing source: {repository}', flush=True)
         archive = download(source['url'], source['sha256'], cache / source['sha256'])
@@ -59,8 +58,6 @@ def prepare(output, cache):
                     continue
                 if key == 'ballons' and '/' not in relative:
                     relative = repository + '-' + relative
-                if key == 'comic_translate':
-                    relative = 'comic_translate/' + relative
                 target = (output / 'upstream' / relative).resolve()
                 if not target.is_relative_to(output / 'upstream'):
                     raise ValueError('Unsafe upstream archive path')
@@ -68,7 +65,6 @@ def prepare(output, cache):
                 with package.open(info) as src, target.open('wb') as dst:
                     shutil.copyfileobj(src, dst)
     apply_source_patches(output / 'upstream')
-    apply_source_patches(output / 'upstream/comic_translate', 'comic_translate')
     # The native paragraph grouping imports BallonsTranslator's text types.
     for relative in ('config/textstyles', 'data'):
         directory = output / 'upstream' / relative
@@ -132,7 +128,6 @@ def prepare(output, cache):
     manifest = {
         'upstream': LOCK['source']['revision'],
         'ballons': LOCK['ballons']['revision'],
-        'comic_translate': LOCK['comic_translate']['revision'],
         'lock_sha256': sha256(ENGINE / 'mtu_engine/upstream.lock.json'),
         'files': {path.relative_to(output).as_posix(): sha256(path)
                   for directory in ('upstream', 'models', 'fonts', 'licenses', 'hyphenation')

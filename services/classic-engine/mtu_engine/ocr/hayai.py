@@ -121,8 +121,7 @@ class HayaiOCR:
                 with stage('ocr_crop'):
                     crops = [Image.fromarray(image[t:b, l:r]) for l, t, r, b in (boxes[i] for i in owners)]
                 for i, text in zip(owners, self._recognize(crops), strict=True):
-                    results[i] = Reading([text] + [''] * (len(blocks[i].lines) - 1),
-                                         line_aligned=len(blocks[i].lines) == 1)
+                    results[i] = Reading([text] + [''] * (len(blocks[i].lines) - 1))
         return results
 
     def _recognize(self, images):

@@ -28,7 +28,7 @@ def analysis(monkeypatch):
     async def detect(*args, **kwargs):
         return [SimpleNamespace(pts=q) for q in quads], np.ones(source.shape[:2]), None
     async def recognize(*args):
-        return [Reading(['one paragraph', '', ''], line_aligned=False)]
+        return [Reading(['one paragraph', '', ''])]
     async def refine(regions, rgb, raw, **kwargs):
         calls.append('refine')
         return raw
@@ -43,7 +43,7 @@ def analysis(monkeypatch):
         ocr=SimpleNamespace(min_text_length=1, model_bubble_overlap_threshold=.5), mask_dilation_offset=0, kernel_size=3)
     engine.detector = SimpleNamespace(detect=detect)
     engine.ocr = SimpleNamespace(recognize=recognize)
-    engine.colors = SimpleNamespace(apply=lambda *a, **kw: calls.append('colors'))
+    monkeypatch.setattr('mtu_engine.engine.sample_colors', lambda *a: calls.append('colors'))
     engine.bubbles = SimpleNamespace(detect=lambda *a, **kw: calls.append('bubbles'))
     return engine, source, quads, calls
 
@@ -87,7 +87,7 @@ def test_warmup_prepares_graphs_after_native_block_warmup(analysis, backend, lim
         engine.warmup()
     expected = [512] + ([s for s in range(64, limit + 1, 64) if s != 512] if backend == 'amd' else [])
     assert shapes == (expected[:expected.index(fail_at)+1] if fail_at else expected)
-    assert calls == ['ocr', 'colors'] + ([] if fail_at else (['bubbles'] if backend == 'mps' else ['graphs', 'bubbles']))
+    assert calls == ['ocr'] + ([] if fail_at else (['bubbles'] if backend == 'mps' else ['graphs', 'bubbles']))
     assert not engine._detector_lock.locked() and not engine._bubble_lock.locked()
 
 
@@ -96,7 +96,7 @@ def test_warmup_prepares_graphs_after_native_block_warmup(analysis, backend, lim
 def test_no_eligible_paragraph_skips_bubbles_and_erasure(analysis, text, keep_lang, minimum):
     engine, source, _, calls = analysis
     async def recognize(*args):
-        return [Reading([text, '', ''], line_aligned=False)]
+        return [Reading([text, '', ''])]
     engine.ocr.recognize = recognize
     engine.keep_lang, engine.config.ocr.min_text_length = keep_lang, minimum
     assert engine.analyze(source) == ([], None, None, None)
@@ -115,7 +115,7 @@ def test_failure_releases_locks_and_recognition_keeps_paragraph_geometry(analysi
     engine.ocr.recognize = read
     regions, mask, raw, _ = engine.analyze(source)
     np.testing.assert_array_equal(regions[0].lines, quads)
-    assert regions[0].texts == ['one paragraph', '', ''] and not regions[0].ocr_line_aligned
+    assert regions[0].texts == ['one paragraph', '', '']
     assert mask is raw and calls == ['colors', 'bubbles', 'refine']
 
 
@@ -129,8 +129,8 @@ def test_capture_guard_covers_other_gpu_stages_but_not_ocr_or_cpu(analysis, monk
     async def unlocked_read(*args):
         assert not guard.locked()
         return await read(*args)
-    def colors(*args, capture_guard):
-        assert capture_guard is guard and not guard.locked()
+    def colors(*args):
+        assert not guard.locked()
     def bubbles(*args, **kwargs):
         assert guard.locked()
     def mask(result, shape):
@@ -142,8 +142,9 @@ def test_capture_guard_covers_other_gpu_stages_but_not_ocr_or_cpu(analysis, monk
         assert not guard.locked()
         return associate(*args)
     monkeypatch.setattr(implementation, 'associate_bubbles', associate_cpu)
+    monkeypatch.setattr(implementation, 'sample_colors', colors)
     monkeypatch.setattr(sys.modules['manga_translator.utils'], 'build_bubble_mask_from_mangalens_result', mask)
-    engine.detector.detect, engine.ocr.recognize, engine.colors.apply, engine.bubbles.detect = guarded_detect, unlocked_read, colors, bubbles
+    engine.detector.detect, engine.ocr.recognize, engine.bubbles.detect = guarded_detect, unlocked_read, bubbles
     assert engine.analyze(source)[0] and not guard.locked()
 
 
@@ -179,14 +180,14 @@ def test_inpaint_guards_model_blocks_and_drains_cancellation(analysis, monkeypat
     np.testing.assert_array_equal(engine.inpaint(source, mask, mask, mask, []), source)
 
 
-def test_other_page_can_read_while_color_model_is_busy(analysis):
+def test_other_page_can_read_while_sampling_colors(analysis, monkeypatch):
     engine, source, _, _ = analysis
     entered, release = Event(), Event()
     def colors(image, *args, **kwargs):
         if image is source:
             entered.set()
             assert release.wait(5)
-    engine.colors.apply = colors
+    monkeypatch.setattr('mtu_engine.engine.sample_colors', colors)
     with ThreadPoolExecutor(2) as pool:
         first = pool.submit(engine.analyze, source)
         try:

@@ -13,7 +13,8 @@ def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cach
     output, cache = tmp_path / 'prepared', tmp_path / 'download-cache'
     stale = ('models/retired/weights.bin', 'upstream/retired/module.py',
              'upstream/retired/LICENSE', 'licenses/retired-model.txt',
-             'fonts/RetiredFont.ttf', 'licenses/RetiredFont-OFL.txt')
+             'fonts/RetiredFont.ttf', 'licenses/RetiredFont-OFL.txt',
+             'models/ocr/ocr_ar_48px.ckpt', 'models/ocr/alphabet-all-v7.txt', 'upstream/comic_translate/LICENSE')
     for name in stale:
         path = output / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,7 +37,6 @@ def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cach
     for key, repository, modules in (
         ('source', 'manga-translator-ui', ('manga_translator',)),
         ('ballons', 'BallonsTranslator', ('ballontranslator', 'resources')),
-        ('comic_translate', 'comic-translate', ('modules', 'imkit')),
     ):
         source = LOCK[key]
         prefix = repository + '-' + source['revision'] + '/'
@@ -81,8 +81,6 @@ def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cach
     assert json.loads((output / 'models/hayai/source.json').read_text()) == LOCK['hayai']
     for folder, spec in LOCK['hayai'].items():
         assert all(f'models/hayai/{folder}/{name}' in manifest['files'] for name in spec['files'])
-    assert 'models/ocr/ocr_ar_48px.ckpt' in manifest['files']
-    assert 'models/ocr/alphabet-all-v7.txt' in manifest['files']
     assert not any(name.startswith('samples/') for name in manifest['files'])
     image_files = verify(output / 'models', include_hayai=False)['files']
     assert set(manifest['files']) - set(image_files) == {p for p in manifest['files'] if p.startswith('models/hayai/')}

@@ -18,7 +18,7 @@ WIRE_FIELDS = frozenset(('download', 'download_queue', 'analyze', 'analyze_queue
 OCR_FIELDS = frozenset(('analyze_detect', 'detect_filter', 'detect_filter_opencl_chunks', 'detect_filter_cpu_pages',
     'analyze_group', 'analyze_ocr',
     'analyze_colors', 'analyze_bubbles', 'analyze_bubble_mask', 'analyze_refine', 'analyze_checkpoint',
-    'analyze_color_gate', 'color_fast_regions', 'color_model_lines', 'color_batches', 'color_batch_max',
+    'color_sample_regions',
     'ocr_crop', 'ocr_preprocess', 'ocr_transfer', 'ocr_infer', 'ocr_decode', 'ocr_lock_wait', 'ocr_model_lock_wait',
     'ocr_paragraphs', 'ocr_batches', 'ocr_batch_max', 'ocr_output_tokens', 'ocr_truncated',
     'ocr_graph_batches', 'ocr_eager_batches', 'ocr_capture_wait', 'ocr_capture', 'ocr_graph_captures'))

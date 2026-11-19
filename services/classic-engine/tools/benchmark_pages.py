@@ -26,6 +26,8 @@ from tools.validate_render_output import measured, reconstruct
 
 
 def run(args):
+    if args.inpaint_slots is not None and (not args.pipeline or not 1 <= args.inpaint_slots <= args.concurrency):
+        raise ValueError('--inpaint-slots requires --pipeline and cannot exceed --concurrency')
     os.environ['HF_HUB_OFFLINE'] = '1'
     os.environ['TRANSFORMERS_OFFLINE'] = '1'
     os.environ['TQDM_DISABLE'] = '1'
@@ -145,12 +147,13 @@ def run(args):
             with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
                 list(pool.map(page, paths))
             report['pipeline_resident_bytes'] = args.resident_mib * 1024 ** 2
+            report['pipeline_inpaint_slots'] = args.inpaint_slots or args.concurrency
             report['cache_bytes_per_page'] = None
             for repeat in range(args.repeats):
                 with TemporaryDirectory(prefix='long-pipeline-') as directory:
                     result, resources = measure(lambda: exercise(Path(directory), 'throughput', runtime,
                         total=args.total, timeout=600, local_pages=args.concurrency, inputs=inputs,
-                        local={'resident_bytes': args.resident_mib * 1024 ** 2,
+                        local={'resident_bytes': report['pipeline_resident_bytes'], 'inpaint_slots': report['pipeline_inpaint_slots'],
                                'engine': {'backend': backend, 'gpu': gpu}, 'render_workers': args.render_workers}))
                 report['runs'].append({**resources, **result})
                 output.parent.mkdir(parents=True, exist_ok=True)
@@ -188,12 +191,13 @@ if __name__ == '__main__':
     parser.add_argument('--threads', type=int, choices=range(1, 33), default=3)
     parser.add_argument('--cache-mib', type=int, choices=range(0, 2049), default=512)
     parser.add_argument('--pipeline', action='store_true', help='Use the real node scheduling and memory gate')
+    parser.add_argument('--inpaint-slots', type=int, choices=range(1, 9), help='Pipeline inpaint limit (default: concurrency)')
     parser.add_argument('--resident-mib', type=int, choices=range(512, 65537), default=8192)
-    parser.add_argument('--total', type=int, choices=range(8, 65), default=12)
+    parser.add_argument('--total', type=int, choices=range(1, 65), default=12)
     parser.add_argument('--auto-cpu', action='store_true', help='Exercise the node CPU resource planner')
     parser.add_argument('--reserve-vram-mib', type=int, choices=range(0, 16385), default=0, metavar='0..16384',
                         help='Reserve test-only CUDA memory to simulate a smaller GPU; never use on a busy device')
-    for key in ('ocr_batch_size', 'color_batch_size', 'detect_batch_size'):
+    for key in ('ocr_batch_size', 'detect_batch_size'):
         parser.add_argument('--' + key.replace('_', '-'), type=int, choices=range(1, 9 if key == 'ocr_batch_size' else 33),
                             default=ENGINE_DEFAULTS[key])
     run(parser.parse_args())

@@ -6,7 +6,7 @@
 | --- | --- |
 | 接单与输入 | 按租约、下载并发和页面内存预算接单。校验输入摘要、长度、格式、尺寸及规范化状态；文件先在独立工作区拆页，拆页与单图共用计算预算。 |
 | 检测与识别 | DBNet 长图分块保留原图短边（受 `detect_size` 限制），重叠区概率图合并后统一提框。BallonsTranslator 分组，Hayai 按段识别，截断文本不授权抹字。 |
-| 分析检查点 | 黑白文字跳过颜色模型；彩色段按代表行取色。气泡、CTD 字形细化和源笔画保护生成修复掩膜；尺寸、文字、几何和掩膜一起冻结。无字跳过抹字，计算错误不能作为无字提交。 |
+| 分析检查点 | 每段在第一行四边形内采样 16×16 个 RGB 像素，估计字色与底色；近纯色时按亮度选黑白。气泡、CTD 字形细化和源笔画保护生成修复掩膜。颜色、文字、几何和掩膜一起冻结；无字跳过抹字，计算错误不能作为无字提交。 |
 | 翻译与抹字 | 提交分析后，中心翻译与本地抹字并行，等译文不占计算线程。纯色气泡先填充，剩余块由 FP32 LaMa 修复；取消在模型批次／块间生效。 |
 | 排版 | Qt 按气泡换行或分栏，字号增量不超过原字号的 25%，最多加 4 px。独占气泡优先居中，共用气泡先给各段留位；无可用气泡时按原文框排版。空译文留白，缺少段 ID 或字体不受支持时拒绝渲染。 |
 | 交付 | 完整排版后输出无损差分覆盖，长图分块。结果落盘后释放缓冲并上传；交付状态未知时重发冻结结果。 |
@@ -18,11 +18,11 @@
 - 下载、分析／抹字、渲染、落盘和交付分别有界。页面、原生掩膜和渲染进程传输缓冲共用 `resident_bytes`。可选参考掩膜每页最多 64 MiB；内存不足不增加并发。文件拆页及 ZIP 另受工作区磁盘预算约束。
 - CUDA／AMD 以 `local_pages` 限制计算并发；MPS 一次派发一项分析／抹字，I/O 和渲染可重叠。`engine.threads`、渲染进程与页面数要一起评估；并发提高吞吐不等于降低单页延迟。
 - Hayai 在 CUDA／AMD 上使用上游解码图。按模型加载时空闲显存：NVIDIA 不足 4 GiB 走 eager，4 至不足 8 GiB 最多保留 5 组图；AMD 不足 8 GiB 保留 4 组。两者达 8 GiB 都保留最多 8 组（OCR 批量为 8 时为 9 组）。捕获受跨模型锁保护，失败退回 eager；静态填充可能改变识别结果。
-- 三个后端的 48px 取色模型都复用有界的位置系数。CUDA／AMD 的 FP32 LaMa 只在预热时为 64 至 512 的八种正方形建图，其他输入走 eager；NVIDIA 预热时空闲显存不足 4 GiB 跳过建图。缓存不跨页复用识别结果。
+- 三个后端共用 CPU 取色，不占用 GPU 模型锁。CUDA／AMD 的 FP32 LaMa 只在预热时为 64 至 512 的八种正方形建图，其他输入走 eager；NVIDIA 预热时空闲显存不足 4 GiB 跳过建图。缓存不跨页复用识别结果。
 
 ## 调优依据
 
-RX 6900 XT 16 GiB / Ryzen 7 5800X，`720×14400` 彩色 WebP，Hayai、FP32 检测、CPU 4 线程。按相同形状预热后各测 5 次。分析包括检查点编码，不含下载、翻译和排版。
+以下含「取色批量」的数据均为移除 48px 模型前的历史对照；现行版本的整批对照见[快速取色](#快速取色)。RX 6900 XT 16 GiB / Ryzen 7 5800X，`720×14400` 彩色 WebP，Hayai、FP32 检测、CPU 4 线程。按相同形状预热后各测 5 次。分析包括检查点编码，不含下载、翻译和排版。
 
 | 本地指标 | 基线 `60bc66a` | 优化后，原批量 | 优化后，长图批量 |
 | --- | ---: | ---: | ---: |
@@ -33,7 +33,7 @@ RX 6900 XT 16 GiB / Ryzen 7 5800X，`720×14400` 彩色 WebP，Hayai、FP32 检�
 
 GPU 忙碌率取 Windows 进程最忙引擎。空 MIOpen 缓存、完成节点预热后的首张分析由 32.07 s 降到 13.58 s。保留 `data/cache/miopen` 可复用卷积选型。相同批量时完整分析及固定译文成品字节一致；长图批量保留 28 个区域的文字、行框、修复和气泡掩膜，5 个区域颜色最多差 2/255，原始检测掩膜有 3 个像素差 1/255。
 
-这类长图建议 `engine.detect_batch_size=1`、`engine.ocr_batch_size=8`、`engine.color_batch_size=16`、`engine.threads=4`。增加至 8 或 16 线程未缩短单页延迟；1、2、3 路同图吞吐分别为 0.212、0.251、0.259 页/s。普通短页应另测：21 个混合输入的调度对照中，2 路计算、OCR 批量 4 更合适。批量和 FP16 都可能改变识别或像素，参数并非通用默认值。Apple Silicon 31 页实测融合 FP16 比 FP32 图像阶段少耗时约 12%，OCR 一致但像素不逐点等价；以上均不是线上翻译耗时。
+当时长图最快一档用检测批量 1、OCR 批量 8、4 个引擎线程。增加至 8 或 16 线程未缩短单页延迟；1、2、3 路同图吞吐分别为 0.212、0.251、0.259 页/s。普通短页应另测：21 个混合输入的调度对照中，2 路计算、OCR 批量 4 更合适。批量和 FP16 都可能改变识别或像素，参数并非通用默认值。Apple Silicon 31 页实测融合 FP16 比 FP32 图像阶段少耗时约 12%，OCR 一致但像素不逐点等价；以上均不是线上翻译耗时。
 
 ### 高清普通页
 
@@ -99,6 +99,128 @@ Hayai 的 8 张普通页和长图共 90 段，FP32 对照三轮文字及行框�
 - **设备差异：** AMD 的 FP32 LaMa 也按 uint8 搬运图像与掩膜；MPS 的取色也复用冻结的位置系数，仍使用单设备锁。以上改动没有本轮 AMD/MPS 实机测速；AMD 图重放同步、MPS eager 解码仍按各自后端执行。
 - **没有照搬的预热：** 显式 `inpainting_size=1024` 时，在 4060 上试了 AMD 的额外 576–1024 方块预热。预热多花 2.43 s，新计算线程首次处理这八种形状只省 0.08–0.60 s，热运行无明显变化，走完这些形状后分配器保留约 6.67 GiB；CUDA 不默认预热这些大块。
 
+### Colab L4
+
+以下只针对单张 L4（约 22.5 GiB 显存）、12 vCPU、约 53 GiB 系统内存的实测实例，代码为 `a819791`。Colab 的 CPU 配额探测不完整时，`engine.threads=auto` 会保守退到 1；先核对实例分配的 CPU，再显式配置线程。`local_pages` 是同时进行分析或抹字的**页数**，不拆分单张长图；`render_workers` 也不会把同一页的 Qt 排版拆成多路。
+
+保留 `detect_size=1280` 与 `inpainting_size=512`，避免把缩小输入或改变抹字尺寸混入性能对照。`detect_precision=fp16` 只切换 DBNet，LaMa 抹字仍用 FP32。比较 OCR、行框和输出完整性，不要求 FP16 与 FP32 成品像素逐点一致。复测用相同图片、模型和固定译文，预热后运行；`--pipeline` 测本地页调度，不计实际中心、对象存储和文字翻译耗时，也不含 ZIP 拆包与打包。
+
+首轮长图对照各热测两次：原 FP32／单线程配置墙钟 16.10 s，FP16／3 线程／2 排版进程配置 14.40 s，DBNet 检测 2.55 → 1.10 s。38 段 OCR 与行框一致，成品像素不逐点等价。
+
+| `930×28007` 长图（FP16，预热后） | 对照 |
+| --- | --- |
+| 检测批量 1／2／4／8（固定 3 线程，各 2 轮） | 检测中位数 1.085／1.099／1.104／1.213 s；分析峰值张量显存 1.36／1.36／1.73／2.86 GiB |
+| 引擎线程 1／2／3／4／6／8（固定检测批量 1、单渲染器） | 本地整页 13.84／13.10／12.67／12.46／12.40／12.44 s；2、3 线程各 1 轮，其余各 2 轮取中位数 |
+| OCR 批量 4 → 8（取色 4，探索性单轮） | OCR 0.75 → 0.51 s，38 段文字与行框一致；整批复测反而变慢，见下文 |
+| 取色批量 4 → 16（探索性单轮） | 预测颜色有变化，取色未加快；保留 4 |
+
+长图扫参从解码后计时，不含重建整幅输出，与首轮墙钟口径不同。优先用检测批量 1；4 个引擎线程已接近单图性能上限，6–8 线程差异不超过 0.5%，Qt 布局本身仍约 5.6 s。
+
+| 24 页 `835×1200`（FP16，首轮热测） | 批次墙钟 |
+| --- | --- |
+| 1／2／3／4／5 路计算，2 引擎线程、2 排版进程 | 12.77／9.79／9.37／9.19／9.44 s |
+| 4／6 路计算，1 引擎线程、2 排版进程 | 9.34／9.18 s |
+| 6 路计算、1 引擎线程，1／2／3／4 排版进程 | 17.43／9.18／9.40／9.39 s |
+
+复测前三档，`4 路 × 1 线程`、`4 路 × 2 线程`、`6 路 × 1 线程`两轮中位数分别为 9.26、9.34、9.39 s。除单路固定 1 路抹字，其余固定 2 路；在 6 路计算下把抹字改成 1／2／3 路，分别耗时 9.75／9.18／9.59 s。每组 24 页都完成，22 页产生有效叠图，2 页保持原图。批量已接近吞吐上限时，整卡均值仍约 57–61%，节点用约 3 个 CPU 核；不为提高利用率而超配，也不依此推断其它页型的上限。
+
+固定 `4 路 × 1 线程`、双排版、双抹字，分别用 OCR 批量 4 和 8 加载预热，24 页各测三轮。批量 8 让单张长图由 14.03 s 降到 13.42 s，但 24 页中位数由 9.33 s 升至 16.34 s，两页文字或行框发生变化。通用档保留 OCR 批量 4。
+
+**部署推荐（兼顾普通页吞吐和长图延迟）：** 4 路、2 线程方案独立加载预热后，24 页三轮中位数 **9.29 s**（约 155 页／分），初版 3 路、3 线程为 10.88 s。相对 4 路、1 线程的 9.33 s，普通页吞吐近似，长图从 14.03 s 降到 13.44 s。整卡忙碌率约 59%，节点用约 3.15 个 CPU 核，峰值张量显存 1.43 GiB；24 页全部完成，三轮未出现 OCR 截断。
+
+将以下字段合并到节点配置，保留现有身份、凭据和路径：
+
+```json
+{
+  "local_pages": 4,
+  "inpaint_slots": 2,
+  "render_workers": 2,
+  "max_leases": 8,
+  "resident_bytes": 28431650816,
+  "download_workers": 6,
+  "analysis_workers": 6,
+  "delivery_workers": 4,
+  "claim_batch_size": 4,
+  "document_control_workers": 2,
+  "engine": {
+    "backend": "cuda",
+    "threads": 2,
+    "detect_size": 1280,
+    "detect_precision": "fp16",
+    "detect_batch_size": 1,
+    "ocr_batch_size": 4,
+    "inpainting_size": 512
+  }
+}
+```
+
+`resident_bytes` 是同时在途页面的缓冲上限，不是预分配、进程总内存或显存。这台 L4 的 `MemTotal` 为 56,863,301,632 字节，节点 cgroup 没有更低的内存上限；部署值取一半，即 **28,431,650,816 字节（26.48 GiB）**。换机器时按实际内存和容器有效硬限制中较小者重新计算。8 页普通图在途只用约 0.45 GiB，多张长图的对照见下表。
+
+普通页为主可把引擎改为 1 线程，保留 4 路计算；仅优化单张长图延迟，则用 4 引擎线程，计算／抹字／排版各 1 路。容器部署保留 Compose 默认的 2 GB 共享内存供排版进程使用；出现 `render_local_fallback` 先查共享内存和页缓冲。文件控制只有心跳和同步两个并行操作，保留 2 个线程。
+
+部署时保留各节点独立身份和恢复目录。先暂停领取、排空旧进程，用同一套锁定资产执行 `python -m classic_node check --config <配置> --bundle-root <资产目录>`；切换后确认注册、心跳和文件能力。`max_leases` 是最大在途数，不是计算路数；中心 `execution_slots` 低于 8 时达不到本表的在途窗口。测试节点的无沙箱解析例外不随配置复制，Linux 部署保持默认沙箱。
+
+从 `services/classic-engine` 复测，每组使用新报告文件；输入仅放在私有目录。长图先固定线程比较检测批量，再固定批量比较线程；批量页用同一组规范化图片比较计算和排版并发：
+
+```sh
+uv run python -m tools.benchmark_pages --models "$MODELS" --input "$LONG_PAGES" --output long.json \
+  --detect-precision fp16 --detect-batch-size 1 --threads 4 --concurrency 1 --render-workers 1 --cache-mib 64 --repeats 3
+uv run python -m tools.benchmark_pages --models "$MODELS" --input "$NORMALIZED_PAGES" --output pages.json \
+  --detect-precision fp16 --detect-batch-size 1 --threads 2 --concurrency 4 --render-workers 2 \
+  --pipeline --total 24 --inpaint-slots 2 --resident-mib 4096 --repeats 3
+```
+
+#### 8 张长图：排版与硬件占用
+
+用同一张 `930×28007` 长图作为 8 个独立任务，每张都重新检测、OCR、抹字、排版和交付，没有跨页结果缓存。L4／12 vCPU，固定英文译文、FP16 检测、2 引擎线程、4 路计算、2 路抹字、2 个渲染进程。预热后各跑两轮；墙钟含模拟中心调度、编码、落盘和交付校验，不含线上翻译与网络。
+
+| 版本／页缓冲预算 | 8 张墙钟 | 张／分钟 | GPU 平均忙碌率 | CPU 核数／整机占比 |
+| --- | ---: | ---: | ---: | ---: |
+| `a819791`／4 GiB | 73.43 s | 6.54 | 22.5% | 2.35／19.6% |
+| 排版优化／4 GiB | 61.21 s | 7.84 | 28.0% | 2.51／20.9% |
+| 排版优化／8 GiB | 50.53 s | 9.50 | 35.2% | 2.91／24.2% |
+
+4 GiB 时每轮有 4 页因预算不足退回主进程排版；8 GiB 时两轮均无回退，页缓冲峰值 5.16 GiB。后者吞吐比原版高 45%，进程树 RSS 峰值合计 8.58 GiB（共享页可能重复计数）；显存整卡峰值 6.11／22.5 GiB（27%，含保持在线的空闲节点），其中压测进程 PyTorch 张量峰值 1.63 GiB。GPU 忙碌率按 200 ms 采样，不代表理论算力利用率。单跑 1 张的模拟交付墙钟（4 GiB）为 18.33 → 16.18 s。
+
+同为 8 GiB，改 3 路也是 50.28 s（9.55 张／分），CPU 降到 2.73 核。4 路的页分析中位数约 15–16 s，`ocr_lock_wait` 约 4 s；3 路分别约 11 s、0.13 s。这个计数合并了 Hayai 和 48px 取色的模型锁，单看它不能断定是识别器饱和。只做长图可用 3 路，混跑普通页保留 4 路。
+
+原来的 `render_layout` 包括气泡掩膜搜索，并不全是 Qt 绘字。最大内接矩形现在跳过等高柱段，只在高度变化处入栈；居中与字号试算复用同一个区域掩膜，短纯文本复用本页的 Qt 尺寸。固定相同的抹字像素、38 个区域与气泡掩膜，分别重放新旧渲染器三次：英文排版中位数 **5.74 → 3.40 s**，简中 **2.95 → 1.99 s**。两种译文的字号、换行、位置、重建像素及编码输出均与旧版一致。重新并发运行整条 GPU 流水线时，旧版自身也会产生多个输出摘要，排版等价性以冻结输入的对照为准。升级须按新 `upstream.lock.json` 准备配套资产。
+
+复测上面的批量命令，把输入换为只含一张规范化长图的目录，使用 `--total 8 --inpaint-slots 2 --resident-mib 8192 --repeats 2`。单张调度延迟改用 `--total 1`。源码基线与新版本使用各自校验过的资产目录。
+
+#### 旧取色模型：页缓冲提到半内存后
+
+本机实际部署 `resident_bytes=28431650816`。8 页是同一组固定译文长图，各自完整计算；`max_leases=8`、2 个引擎线程、2 路抹字和 2 个排版进程固定，只改页缓冲和计算路数。预热后正序、逆序各跑一轮。4 路时，8 GiB 对照为 49.97 s，半内存为 49.42 s；两档页缓冲峰值均为 5.16 GiB，无渲染回退。观察不到有意义的内存提速。独立 12 进程短测能用到约 11.9 个 CPU 核。
+
+| 半内存，计算路数 | 8 张墙钟 | 张／分钟 | GPU 均值 | CPU 核数 | 每页等取色锁／检测锁 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 | 49.42 s | 9.71 | 35.5% | 2.96 | 3.79／0.01 s |
+| 6 | 53.71 s | 8.94 | 32.4% | 2.84 | 12.75／2.15 s |
+| 8 | 56.58 s | 8.48 | 31.5% | 2.75 | 18.60／6.25 s |
+
+`local_pages` 增加的是可同时处理的页数，不会复制检测器或取色模型。拆开锁计时后，原先约 4 s 的 `ocr_lock_wait` 主要是 **48px 取色模型**排队，Hayai 文字识别模型的等待接近零。这个样本每页用已有文字做 4 批取色，未走逐字的 beam 解码。4 → 8 路时，首个排版任务反而从约 21 s 推迟到 25 s。各页等待会重叠，不能相加当作可节省的墙钟时间；GPU 忙碌率同样不能直接换算成提速倍数。
+
+固定总计 4 路计算，原先单取色模型为 49.47 s，仅复制取色模型降到 42.81 s，两个独立引擎为 42.36 s。双引擎整卡显存峰值从 6.09 GiB 升到 9.20 GiB。这些对照用于定位瓶颈，部署不需要复制模型。
+
+#### 快速取色
+
+所有后端均使用同一 CPU 采样实现，安装时省去约 195 MiB 的取色权重及字典。采样优先保留纸底与字色的反差，渐变字、花底或多色描边可能与原作不同；排版仍对低于 3:1 的描边反差做黑白修正。
+
+同一台 L4、同一张 `930×28007` 长图作为 8 个独立任务、固定英文译文；沿用半内存、2 个引擎线程、2 路抹字、2 个排版进程和相同的排版优化。各档预热后测两轮。整批按墙钟计，单页取色含等待；每行取两轮中位数。
+
+| 方案／计算路数 | 8 张墙钟 | 张／分钟 | 单页取色 | GPU 忙碌率 | CPU 核数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 旧模型／4 | 49.62 s | 9.67 | 6.65 s | 36.5% | 2.91 |
+| 采样／4 | 38.94 s | 12.33 | 24 ms | 43.2% | 3.28 |
+| 采样／6 | 37.86 s | 12.68 | 29 ms | 43.9% | 3.41 |
+| 采样／8 | 38.94 s | 12.33 | 16 ms | 42.7% | 3.35 |
+
+**部署保留 4 路**：换取色方法后，同并发吞吐提高 **27.4%**；再加到 6 路只多 2.8%，8 路与 4 路持平。页缓冲峰值均为 5.16 GiB，全部交付、无回退、无 OCR 截断。4／6／8 路的单页检测锁等待分别为 0.57／2.24／6.30 s，Hayai 锁等待为 0.13／2.02／1.82 s；Qt 排版仍约 3.5–3.6 s／页。进一步优化优先量检测和排版，CPU 或显存还有余量不代表增加页数就能缩短墙钟。
+
+同图单页逐项核对：38 段 OCR 和行框一致，原始检测、修复及气泡掩膜逐像素一致；抹字图的 26,046,510 个像素中有 9 个像素相差最多 1/255。38 段保存的字色／底色组合都与旧版有差异；成品不以像素等价为目标。以上吞吐不含线上翻译或网络，AMD／MPS 不套用 L4 数值。
+
+复测用 `--resident-mib 27114`（本机半内存向下取整到 MiB），分别设 `--concurrency 4`、`6`、`8`；其余参数与 8 张长图对照相同。现版 `ocr_lock_wait` 只计 Hayai，`analyze_colors` 是实际 CPU 取色耗时。
+
 ## 诊断与复测
 
 `state_dir/logs/node.log` 的 `event=page_stage` 和 `event=document_page_stage` 记录本地阶段秒数。先分清排队（`*_queue`）、等模型锁（`*_lock_wait`）和计算，再看以下字段。嵌套耗时不能相加，并发页耗时之和不等于墙钟时间。
@@ -106,15 +228,15 @@ Hayai 的 8 张普通页和长图共 90 段，FP32 对照三轮文字及行框�
 | 排查项 | 主要字段 |
 | --- | --- |
 | 检测／OCR | `analyze_detect`、`detect_filter`；`detect_filter_opencl_chunks` 和 `detect_filter_cpu_pages` 分别计 GPU 条带和 CPU 页数；另有 `analyze_group`、`analyze_ocr`、`ocr_preprocess`、`ocr_infer`、`ocr_decode`、`ocr_capture` |
-| 分析后处理 | `analyze_colors`、`analyze_color_gate`、`color_model_lines`、`analyze_bubbles`、`analyze_bubble_mask`、`analyze_refine`、`analyze_checkpoint` |
+| 分析后处理 | `analyze_colors`、`color_sample_regions`、`analyze_bubbles`、`analyze_bubble_mask`、`analyze_refine`、`analyze_checkpoint` |
 | 抹字与排版 | `inpaint_solid_fill`、`inpaint_blocks`、`inpaint_lama`、`inpaint_model`；`render_layout`、`render_diff`、`render_encode`、`persist` |
 
 在引擎环境中使用同一组输入、模型、配置和固定译文，报告放在输入目录以外。Windows 工作目录与资产同盘。报告默认只含摘要；`benchmark_ocr --include-text` 才保存识别全文。
 
 ```sh
 python -m tools.benchmark_ocr --config node.local.json --input page.webp --concurrency 1 --repeats 5 --output ocr.json
-python -m tools.benchmark_pages --backend amd --models <assets>/models --input <pages> --output long.json --threads 4 --render-workers 1 --detect-batch-size 1 --ocr-batch-size 8 --color-batch-size 16 --cache-mib 64 --repeats 5
-python -m tools.benchmark_pages --backend cuda --models <assets>/models --input <pages> --output cuda.json --threads 4 --concurrency 2 --render-workers 1 --detect-batch-size 1 --ocr-batch-size 4 --color-batch-size 4 --cache-mib 64 --repeats 3
+python -m tools.benchmark_pages --backend amd --models <assets>/models --input <pages> --output long.json --threads 4 --render-workers 1 --detect-batch-size 1 --ocr-batch-size 8 --cache-mib 64 --repeats 5
+python -m tools.benchmark_pages --backend cuda --models <assets>/models --input <pages> --output cuda.json --threads 4 --concurrency 2 --render-workers 1 --detect-batch-size 1 --ocr-batch-size 4 --cache-mib 64 --repeats 3
 ```
 
 `benchmark_pages` 的 `warmup_seconds`、`first_pass` 与 `runs` 分别记录节点预热、首次处理和热运行，同时报告文字、坐标、像素及输出摘要。`--pipeline` 可验证真实调度与本地模拟中心；`tools.validate_render_output` 单独验证 CPU／Qt 输出。实机回归指定 `MTU_TEST_ASSETS` 和对应的 `MTU_TEST_BACKEND`（`cuda`、`amd` 或 `mps`）。

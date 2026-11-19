@@ -5,4 +5,3 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Reading:
     texts: list[str]
-    line_aligned: bool = False

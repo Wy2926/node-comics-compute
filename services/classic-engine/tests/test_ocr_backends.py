@@ -67,7 +67,6 @@ def test_paragraph_batches_are_bounded_and_restore_geometry_order():
     result = asyncio.run(ocr.recognize(np.zeros((20, 20, 3), np.uint8), regions, None))
     assert batches == [[(2, 2), (3, 4)], [(20, 20)]]
     assert [r.texts for r in result] == [['(20, 20)', '', ''], ['(2, 2)'], ['(3, 4)'], []]
-    assert [r.line_aligned for r in result] == [False, True, True, False]
     assert regions[0].xyxy == (0, 0, 20, 20) and len(regions[0].lines) == 3
 
 

@@ -88,7 +88,10 @@ def test_mps_page_benchmark_uses_metal_memory_and_real_dispatch_limit(tmp_path, 
     monkeypatch.setattr(bench, 'Runtime', lambda _: runtime)
     args = SimpleNamespace(input=inputs, output=tmp_path/'result.json', models=tmp_path/'models', backend='mps',
         detect_precision='auto', auto_cpu=False, threads=2, render_workers=1, cache_mib=0, hayai_model=None,
-        concurrency=2, pipeline=pipeline, total=8, resident_mib=512, repeats=1, reserve_vram_mib=1)
+        concurrency=2, pipeline=pipeline, total=8, resident_mib=512, repeats=1, reserve_vram_mib=1, inpaint_slots=3)
+    with pytest.raises(ValueError, match='--inpaint-slots'):
+        bench.run(args)
+    args.inpaint_slots = 1 if pipeline else None
     with pytest.raises(ValueError, match='CUDA or HIP'):
         bench.run(args)
     args.reserve_vram_mib = 0
@@ -98,6 +101,7 @@ def test_mps_page_benchmark_uses_metal_memory_and_real_dispatch_limit(tmp_path, 
     assert report['gpu'] == 'Apple GPU' and row['mps_current_allocated_bytes'] == 123
     assert 'torch_peak_allocated_bytes' not in row
     if pipeline:
+        assert report['pipeline_inpaint_slots'] == 1
         assert row['completed'] == 8 and row['journal_empty']
         spans = sorted((s['start_s'], s['end_s']) for s in row['stage_spans'] if s['stage'] in {'analyze', 'inpaint'})
         assert len(spans) == 16 and all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))

@@ -153,3 +153,28 @@ def test_page_advances_are_bounded_and_discarded_on_error(assets, offline, monke
     widths(text)
     widths(text)
     assert advance.call_count == 3 * len(text)  # No cache survives the render.
+
+
+def test_block_metrics_cache_preserves_stroke_direction_and_styled_spans(assets, offline, monkeypatch):
+    from mtu_engine.engine import configuration
+    from mtu_engine.layout_metrics import block_metrics, page_measurements
+    Renderer(*assets)
+    from manga_translator.rendering import text_render
+    from manga_translator.rendering.rich_text import legacy_line_breaks_to_document, TextStyle
+    measure = text_render.measure_rich_text_metrics
+    counted = Mock(wraps=measure)
+    monkeypatch.setattr(text_render, 'measure_rich_text_metrics', counted)
+    config, text = configuration(), 'Office[BR]你好'
+    opts = dict(config=config, stroke_width=.14, letter_spacing=1.2)
+    with page_measurements():
+        for disabled, horizontal in ((False, True), (True, True), (False, False)):
+            config.render.disable_font_border = disabled
+            counted.reset_mock()
+            expected = measure(37, text, horizontal, 1.1, **opts)
+            for _ in range(2):
+                assert block_metrics(37, text, horizontal, 1.1, **opts) == expected
+            assert counted.call_count == 1
+        styled = legacy_line_breaks_to_document(text, TextStyle.from_dict({'bold': True}))
+        for _ in range(2):
+            assert block_metrics(37, styled, True, 1.1, **opts) == measure(37, styled, True, 1.1, **opts)
+        assert counted.call_count == 3

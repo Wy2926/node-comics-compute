@@ -7,6 +7,7 @@ docker build -f services/compute-node/linux/Dockerfile -t node-comics-compute:li
 ```
 
 复制本目录 `node.example.json` 为 `node.local.json`，填写独立节点身份与中心 HTTPS 地址；不要提交凭据。
+Colab L4 的线程、并发和检测批量见[实机调优](../../../docs/PIPELINE.md#colab-l4)，不改通用默认值。
 
 ```sh
 docker compose -f services/compute-node/linux/compose.yaml up -d

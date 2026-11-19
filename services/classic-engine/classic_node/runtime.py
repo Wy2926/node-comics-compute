@@ -65,8 +65,7 @@ class Runtime:
             'torch', 'torchvision',
             'ultralytics', 'PyQt6', 'PyQt6-Qt6', 'PyHyphen',
             'numpy', 'opencv-python', 'Pillow', 'networkx', 'shapely',
-            'transformers', 'huggingface-hub', 'tokenizers', 'safetensors',
-            'PySide6-Essentials', 'shiboken6', 'mahotas')
+            'transformers', 'huggingface-hub', 'tokenizers', 'safetensors')
         dependencies = {name: package_version(name) for name in packages}
         self.version = f'mtu-{backend}-v1-' + digest({'upstream': LOCK['source']['revision'],
             'code': code, 'assets': assets, 'dependencies': dependencies, 'ocr': self.engine.ocr.identity,

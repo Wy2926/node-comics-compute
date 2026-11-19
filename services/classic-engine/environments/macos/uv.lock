@@ -357,18 +357,6 @@ wheels = [
 ]
 
 [[package]]
-name = "mahotas"
-version = "1.4.18"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f6/71/bf99df8458c0ca05cb9a16f400e66c09b37b15ea124aaa3becb577555cc5/mahotas-1.4.18.tar.gz", hash = "sha256:e6bd2eea4143a24f381b30c64078503cd8ffa20ca493e39ffa29f9d024d9cf8b", size = 1533222, upload-time = "2024-07-17T21:11:56.204Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1d/84/d325af34ce1c977f71503d5bddb5798cfaddbcdd30047caafcf013b2daf2/mahotas-1.4.18-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:fe05bf5ee3498cd9411adf7c9fb8e6278194a04a1491c1a6d807658d4af36bb4", size = 1795431, upload-time = "2024-07-17T21:10:49.136Z" },
-]
-
-[[package]]
 name = "marisa-trie"
 version = "1.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -446,7 +434,6 @@ dependencies = [
     { name = "httpx", extra = ["socks"] },
     { name = "huggingface-hub" },
     { name = "langcodes" },
-    { name = "mahotas" },
     { name = "natsort" },
     { name = "networkx" },
     { name = "numpy" },
@@ -463,7 +450,6 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyhyphen" },
     { name = "pyqt6" },
-    { name = "pyside6-essentials" },
     { name = "python-docx" },
     { name = "python-dotenv" },
     { name = "python-socks" },
@@ -491,7 +477,6 @@ requires-dist = [
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },
     { name = "huggingface-hub", specifier = "==0.36.0" },
     { name = "langcodes", specifier = "==3.5.0" },
-    { name = "mahotas", specifier = "==1.4.18" },
     { name = "natsort", specifier = "==8.4.0" },
     { name = "networkx", specifier = "==3.5" },
     { name = "numpy", specifier = ">=2,<2.3" },
@@ -508,7 +493,6 @@ requires-dist = [
     { name = "pydantic", specifier = "==2.11.7" },
     { name = "pyhyphen", specifier = "==4.0.4" },
     { name = "pyqt6", specifier = "==6.9.1" },
-    { name = "pyside6-essentials", specifier = "==6.9.2" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
     { name = "python-docx", specifier = "==1.2.0" },
     { name = "python-dotenv", specifier = "==1.2.2" },
@@ -828,17 +812,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pyside6-essentials"
-version = "6.9.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "shiboken6" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/08/21/41960c03721a99e7be99a96ebb8570bdfd6f76f512b5d09074365e27ce28/pyside6_essentials-6.9.2-cp39-abi3-macosx_12_0_universal2.whl", hash = "sha256:713eb8dcbb016ff10e6fca129c1bf2a0fd8cfac979e689264e0be3b332f9398e", size = 133092348, upload-time = "2025-08-26T07:43:57.231Z" },
-]
-
-[[package]]
 name = "pytest"
 version = "8.4.2"
 source = { registry = "https://pypi.org/simple" }
@@ -991,14 +964,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ca/3c/2da625233f4e605155926566c0e7ea8dda361877f48e8b1655e53456f252/shapely-2.1.1.tar.gz", hash = "sha256:500621967f2ffe9642454808009044c21e5b35db89ce69f8a2042c2ffd0e2772", size = 315422, upload-time = "2025-05-19T11:04:41.265Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/aa/fb5f545e72e89b6a0f04a0effda144f5be956c9c312c7d4e00dfddbddbcf/shapely-2.1.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:a9c551f7fa7f1e917af2347fe983f21f212863f1d04f08eece01e9c275903fad", size = 1643018, upload-time = "2025-05-19T11:04:09.343Z" },
-]
-
-[[package]]
-name = "shiboken6"
-version = "6.9.2"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1a/1e/62a8757aa0aa8d5dbf876f6cb6f652a60be9852e7911b59269dd983a7fb5/shiboken6-6.9.2-cp39-abi3-macosx_12_0_universal2.whl", hash = "sha256:8bb1c4326330e53adeac98bfd9dcf57f5173a50318a180938dcc4825d9ca38da", size = 406337, upload-time = "2025-08-26T07:52:39.614Z" },
 ]
 
 [[package]]

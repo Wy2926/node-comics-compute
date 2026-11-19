@@ -1110,156 +1110,26 @@ def test_legacy_checkpoint_retains_black_white_without_color_inference(assets, o
     assert np.count_nonzero(np.all(result == [255, 255, 255], axis=2)) > 20
 
 
-def test_native_representative_color_is_not_divided_by_original_line_count(assets):
-    from mtu_engine.assets import activate
-    models, _ = assets
-    activate(models)
-    from manga_translator.utils import TextBlock
-    from mtu_engine.colors import Colors
-    from types import SimpleNamespace
-    predictor = SimpleNamespace(_get_rotate_crop_image=lambda *args: np.full((48, 100, 3), (180, 30, 40), dtype=np.uint8),
-        _estimate_colors_batch=lambda crops: [(220, 40, 60, 120, 120, 120)] * len(crops))
-    colors = Colors.__new__(Colors)
-    colors.batch_size = ENGINE_DEFAULTS['color_batch_size']
-    colors.predictor = predictor
-    block = TextBlock([[[0, 0], [100, 0], [100, 48], [0, 48]]] * 2, ['first', 'second'],
-                      adjust_bg_color=False)
-    colors.apply(None, [block])
-    assert block.get_font_colors() == ((220., 40., 60.), (120., 120., 120.))
-    assert block.texts == ['first', 'second']
-
-
-@pytest.mark.parametrize('style,skip', [('plain', True), ('colored', False), ('reversed', True),
-    ('gray', True), ('gray_background', True), ('faint_tint', True), ('small_color', False)])
-def test_native_monochrome_color_gate_without_bubble(assets, style, skip):
+@pytest.mark.parametrize('fill,background', [
+    ((200, 20, 40), (245, 240, 230)), ((255, 255, 255), (0, 0, 0)), ((0, 0, 0), (255, 255, 255))])
+def test_sampled_lettering_colors_survive_native_checkpoint(assets, fill, background):
     from PIL import Image, ImageDraw, ImageFont
-    from types import SimpleNamespace
     from mtu_engine.assets import activate
-    from mtu_engine.colors import Colors
-    from classic_node.timing import collect
+    from mtu_engine.colors import sample_colors
     models, _ = assets
     activate(models)
     from manga_translator.utils import TextBlock
-    from manga_translator.ocr.model_paddleocr import ModelPaddleOCR
-    background = {'reversed': 'black', 'gray_background': (160, 160, 160),
-                  'faint_tint': (250, 248, 249)}.get(style, 'white')
     image = Image.new('RGB', (500, 140), background)
     draw = ImageDraw.Draw(image)
     font = ImageFont.truetype(str(models.parent / 'fonts/NotoSans-Regular.ttf'), 48)
-    fill = {'colored': (200, 20, 40), 'reversed': 'white', 'gray': (120, 120, 120)}.get(style, 'black')
     draw.text((35, 30), 'PLAIN TEXT', font=font, fill=fill)
     x1, y1, x2, y2 = draw.textbbox((35, 30), 'PLAIN TEXT', font=font)
-    block = TextBlock([[[x1-4, y1-4], [x2+4, y1-4], [x2+4, y2+4], [x1-4, y2+4]]],
-                      ['PLAIN TEXT'], language='en', adjust_bg_color=False)
-    if style == 'small_color':
-        draw.rectangle((x1+1, y1-3, x1+12, y1-2), fill=(240, 0, 0))
-    calls = []
-    def predict(crops):
-        calls.append(len(crops))
-        return [(90, 60, 30, 200, 210, 220)] * len(crops)
-    colors = Colors.__new__(Colors)
-    colors.batch_size = ENGINE_DEFAULTS['color_batch_size']
-    colors._characters = {}
-    colors.predictor = SimpleNamespace(_get_rotate_crop_image=ModelPaddleOCR()._get_rotate_crop_image,
-                                      _estimate_colors_batch=predict)
-    with collect() as metrics:
-        colors.apply(np.array(image), [block])
-    assert metrics['color_fast_regions'] == int(skip)
-    assert calls == ([] if skip else [1])
-    assert block.get_font_colors() == (((0., 0., 0.), (255., 255., 255.)) if skip else
-                                      ((90., 60., 30.), (200., 210., 220.)))
-    assert block.texts == ['PLAIN TEXT'] and len(block.lines) == 1
-
-
-def test_color_position_cache_matches_native_prefixes_and_keeps_no_image(assets):
-    import torch
-    from mtu_engine.assets import activate
-    from mtu_engine.color_positions import prepare_color_positions
-    activate(assets[0])
-    from manga_translator.ocr.xpos_relative_position import XPOS
-    device = 'mps' if os.environ.get('MTU_TEST_BACKEND') == 'mps' else ('cuda' if torch.cuda.is_available() else 'cpu')
-    layers = torch.nn.ModuleList(torch.nn.Module() for _ in range(3))
-    for layer, base in zip(layers, (320, 320, 512)):
-        layer.xpos = XPOS(80, base).to(device)
-    native = layers[0].xpos
-    with torch.inference_mode():
-        prepare_color_positions(layers)
-        cached = layers[0].xpos
-        assert cached is layers[1].xpos
-        assert type(layers[2].xpos) is XPOS
-        for length, offset, down in [(1, 0, False), (1, 2, False), (7, 4, True),
-                                     (64, 0, True), (1025, 0, True)]:
-            for batch in (1, 5):
-                x = torch.randn(batch, length, 80, device=device)
-                torch.testing.assert_close(cached(x, offset, down), native(x, offset, down), rtol=0, atol=0)
-        assert cached.factors.cache_info().hits == 4  # Batch contents aren't cache keys; oversized shapes bypass.
-        for offset in range(40):
-            cached(x[:, :1], offset, False)
-        assert cached.factors.cache_info().currsize == 32
-
-
-def test_native_48px_colors_reuse_ocr_and_keep_failure_fallback_offline(assets, offline, monkeypatch):
-    import asyncio
-    import torch
-    from PIL import Image, ImageDraw, ImageFont
-    from mtu_engine.colors import Colors
-    from test_color_text_inference import _incremental_colors
-    models, fonts = assets
-    Renderer(models, fonts)
-    from manga_translator.utils import ModelWrapper, TextBlock
-    from manga_translator.ocr.model_48px import Model48pxOCR
-    ModelWrapper._MODEL_DIR = str(models)
-    native = Model48pxOCR()
-    assert native.is_downloaded()
-    device = 'mps' if os.environ.get('MTU_TEST_BACKEND') == 'mps' else ('cuda' if torch.cuda.is_available() else 'cpu')
-    asyncio.run(native.load(device))
-    colors = Colors(native)
-    try:
-        image = Image.new('RGB', (700, 160), (240, 220, 190))
-        draw = ImageDraw.Draw(image)
-        font = ImageFont.truetype(str(models.parent / 'fonts/NotoSans-Regular.ttf'), 48)
-        draw.text((95, 45), 'COLOR TEST', font=font, fill=(235, 35, 60),
-                  stroke_width=4, stroke_fill=(80, 80, 80))
-        x1, y1, x2, y2 = draw.textbbox((95, 45), 'COLOR TEST', font=font, stroke_width=4)
-        block = TextBlock([[[x1-3, y1-3], [x2+3, y1-3], [x2+3, y2+3], [x1-3, y2+3]]],
-                          ['COLOR TEST'], language='en', adjust_bg_color=False)
-        block.ocr_line_aligned = True
-        def failed(*args, **kwargs):
-            raise RuntimeError('Injected color prediction failure')
-        parallel = colors.predictor.color_model._forced_colors
-        compared = []
-
-        def compare(image, widths, tokens):
-            actual = parallel(image, widths, tokens)
-            expected = _incremental_colors(native.model, image, widths, tokens)
-            compared.append((actual, expected))
-            return actual
-
-        with monkeypatch.context() as guarded:
-            guarded.setattr(native.model, 'infer_beam_batch_tensor', failed)
-            guarded.setattr(native.model.pred, 'forward', failed)
-            guarded.setattr(native.model.pred1, 'forward', failed)
-            guarded.setattr(native.model.decoders, 'forward', failed)
-            guarded.setattr(colors.predictor.color_model, '_forced_colors', compare)
-            colors.apply(np.array(image), [block])
-        assert len(compared) == 1
-        for actual, expected in zip(*compared[0], strict=True):
-            assert actual[:2] == expected[:2]
-            for index, (head, reference) in enumerate(zip(actual[2:], expected[2:], strict=True)):
-                torch.testing.assert_close(head.cpu(), reference, atol=2e-5, rtol=2e-5)
-                if index >= 2:
-                    assert torch.equal(head.cpu().argmax(-1), reference.argmax(-1))
-        fg, bg = block.get_font_colors()
-        np.testing.assert_allclose(fg, [235, 35, 60], atol=35, rtol=0)
-        np.testing.assert_allclose(bg, [80, 80, 80], atol=35, rtol=0)
-        assert block.texts == ['COLOR TEST']
-        monkeypatch.setattr(native.model.color_pred1, 'forward', failed)
-        colors.apply(np.array(image), [block])
-        assert block.get_font_colors() == ((0., 0., 0.), (255., 255., 255.))
-        assert block.texts == ['COLOR TEST']
-    finally:
-        colors.close()
-        asyncio.run(native.unload())
+    quad = [[x1-4, y1-4], [x2+4, y1-4], [x2+4, y2+4], [x1-4, y2+4]]
+    block = TextBlock([quad, quad], ['PLAIN TEXT', ''], language='en', adjust_bg_color=False)
+    sample_colors(np.asarray(image), [block])
+    restored = TextBlock(**serialize_region(block))
+    assert restored.get_font_colors() == (fill, background)
+    assert restored.texts == block.texts and np.array_equal(restored.lines, block.lines)
 
 
 def test_cuda_models_warmup_and_local_inpaint_offline(assets, offline, monkeypatch):
@@ -1267,19 +1137,9 @@ def test_cuda_models_warmup_and_local_inpaint_offline(assets, offline, monkeypat
     backend = os.environ.get('MTU_TEST_BACKEND', 'cuda')
     engine = Engine(models, fonts, backend=backend)
     try:
-        color_batches = []
-        estimate_colors = engine.colors.predictor._estimate_colors_batch
-        def predict(crops):
-            color_batches.append(len(crops))
-            return estimate_colors(crops)
-        monkeypatch.setattr(engine.colors.predictor, '_estimate_colors_batch', predict)
         engine.warmup()
-        assert color_batches == [2]  # Both known-text and fallback models were warmed.
         assert engine.ocr.identity['backend'] == 'hayai'
         assert engine.ocr.engine.device.type == ('mps' if backend == 'mps' else 'cuda')
-        assert engine.color_model.use_gpu
-        assert next(engine.color_model.model.parameters()).device == engine.ocr.engine.device
-        assert engine.colors.predictor.color_model.model is engine.color_model.model
         import asyncio
         from types import SimpleNamespace
         from PIL import Image, ImageDraw, ImageFont
@@ -1438,7 +1298,7 @@ def test_long_lines_and_partial_ocr_continue_at_different_positions(assets, offl
     failure = None
     async def incomplete(*args, **kwargs):
         result = await recognize(*args, **kwargs)
-        return [Reading([''] * len(row.texts), line_aligned=row.line_aligned)
+        return [Reading([''] * len(row.texts))
                 if failure == 'all-empty' or (failure and 'evening' in ' '.join(row.texts)) else row
                 for row in result]
     monkeypatch.setattr(engine.ocr, 'recognize', incomplete)

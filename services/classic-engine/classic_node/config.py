@@ -9,7 +9,7 @@ from .resources import resolve_cpu_resources
 ENGINE_DEFAULTS = {'models': '.assets/models', 'gpu': 0, 'threads': 'auto', 'backend': 'cuda',
     'ocr_model': None,
     'font': [], 'detect_size': 1280, 'detect_precision': 'auto', 'inpainting_size': 512, 'keep_lang': None,
-    'ocr_batch_size': 4, 'color_batch_size': 4, 'detect_batch_size': 4}
+    'ocr_batch_size': 4, 'detect_batch_size': 4}
 LOCAL_DEFAULTS = {'local_pages': 2, 'render_workers': 'auto', 'max_leases': 8,
     'download_workers': 4, 'delivery_workers': 4, 'claim_batch_size': 4,
     'document_control_workers': 2, 'document_require_sandbox': True,
@@ -61,8 +61,8 @@ def load(path):
     engine = value.get('engine', {})
     if engine.pop('ocr_backend', 'hayai') != 'hayai':
         raise ValueError('Only Hayai OCR is supported; remove engine.ocr_backend and prepare the new assets')
-    # Previously shipped node.json files include these inactive ORT settings.
-    for key in ('ocr_min_batch_size', 'ocr_arena_extend_strategy', 'ocr_arena_shrinkage'):
+    # Previously shipped node.json files include these retired model settings.
+    for key in ('ocr_min_batch_size', 'ocr_arena_extend_strategy', 'ocr_arena_shrinkage', 'color_batch_size'):
         engine.pop(key, None)
     if set(engine) - set(ENGINE_DEFAULTS):
         raise ValueError('Unknown local engine option')
@@ -112,7 +112,7 @@ def load(path):
         raise ValueError('detect_size must be between 512 and 2048')
     if value['engine']['detect_precision'] not in ('auto', 'fp32', 'fp16'):
         raise ValueError('detect_precision must be auto, fp32 or fp16')
-    for key in ('ocr_batch_size', 'color_batch_size', 'detect_batch_size'):
+    for key in ('ocr_batch_size', 'detect_batch_size'):
         limit = 8 if key == 'ocr_batch_size' else 32
         if type(value['engine'][key]) is not int or not 1 <= value['engine'][key] <= limit:
             raise ValueError(f'engine.{key} must be between 1 and {limit}')

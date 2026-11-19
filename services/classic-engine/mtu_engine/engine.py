@@ -14,11 +14,10 @@ from classic_node.timing import record, stage, waiting_for
 
 from .assets import activate
 from .backend import check_cancelled, device_context, validate_backend
-from .colors import ensure_stroke_contrast
+from .colors import ensure_stroke_contrast, sample_colors
 from .fonts import FONT_CHOICES, font_filename
 from .layout import associate_bubbles, fit_bubbles, fit_source_boxes, resize_unscaled, select_region
 from .layout_metrics import page_measurements
-from .page_cache import page_images
 
 LANGUAGES = {'zh-Hans': 'CHS', 'zh-Hant': 'CHT', 'ja': 'JPN', 'ko': 'KOR', 'en': 'ENG',
              'fr': 'FRA', 'es': 'ESP', 'pt-BR': 'PTB', 'de': 'DEU', 'it': 'ITA', 'ru': 'RUS',
@@ -218,8 +217,7 @@ class Renderer:
 
 class Engine:
     def __init__(self, models, font, gpu=0, threads=2, detect_size=1280, inpainting_size=512, keep_lang=None,
-                 ocr_batch_size=None, color_batch_size=None, detect_batch_size=None, backend='cuda',
-                 ocr_model=None, detect_precision='auto'):
+                 ocr_batch_size=None, detect_batch_size=None, backend='cuda', ocr_model=None, detect_precision='auto'):
         from classic_node.config import ENGINE_DEFAULTS
         import cv2
         import torch
@@ -247,9 +245,6 @@ class Engine:
         ballons_logger.propagate = False
         ballons_logger.setLevel(logging.CRITICAL + 1)
         from manga_translator.inpainting.inpainting_lama_mpe import LamaLargeInpainter
-        from manga_translator.ocr.model_48px import Model48pxOCR
-        from .colors import Colors
-        from .color_positions import prepare_color_positions
         from .ocr.hayai import HayaiOCR
         # Select only the upstream PyTorch checkpoint; do not fetch an unused CPU
         # ONNX model just to satisfy the upstream multi-backend download map.
@@ -260,8 +255,7 @@ class Engine:
             self.detector.max_batch_size = (ENGINE_DEFAULTS['detect_batch_size']
                                            if detect_batch_size is None else detect_batch_size)
             self.inpainter = TorchLama()
-            self.color_model = Model48pxOCR()
-            for model in (self.detector, self.inpainter, self.color_model):
+            for model in (self.detector, self.inpainter):
                 # Keep upstream model diagnostics out of operational logs.
                 model.logger.handlers = [logging.NullHandler()]
                 model.logger.propagate = False
@@ -271,15 +265,13 @@ class Engine:
                 device = 'mps' if backend == 'mps' else 'cuda'
                 if model is self.detector:
                     asyncio.run(model.load(device, precision=detect_precision))
-                elif backend != 'cuda' and model is self.inpainter:
+                elif backend != 'cuda':
                     asyncio.run(model.load(device, force_torch=True))
                 else:
                     asyncio.run(model.load(device))
             self.detector.model.register_forward_pre_hook(check_cancelled)
             self.detector_settings = {'dtype': str(next(self.detector.model.parameters()).dtype),
                                       'opencl_filter': self.detector.opencl_filter}
-            prepare_color_positions(self.color_model.model)
-            self.colors = Colors(self.color_model, color_batch_size)
             self.bubbles = MangaLensBubbleDetector(
                 model_path=self.models / 'detection/mangalens.pt', device=self.device,
                 imgsz=768, conf=0.25, iou=0.7, auto_download=False, auto_load=True)
@@ -294,7 +286,6 @@ class Engine:
         cv2.setNumThreads(threads)
 
     def warmup(self):
-        from manga_translator.utils import TextBlock
         rgb = np.full((512, 512, 3), 255, dtype=np.uint8)
         mask = np.zeros((512, 512), dtype=np.uint8)
         mask[230:260, 230:260] = 255
@@ -303,12 +294,6 @@ class Engine:
             await self.detector.detect(rgb, c.detector.detection_size, c.detector.text_threshold,
                                        c.detector.box_threshold, c.detector.unclip_ratio)
             await self.ocr.warmup(rgb, c.ocr)
-            # Colored input must exercise both model paths, not the gray bypass.
-            color_blocks = [TextBlock(lines=[[[20, 20], [240, 20], [240, 68], [20, 68]]], texts=[text])
-                            for text in ('warmup', '')]
-            for block in color_blocks:
-                block.ocr_line_aligned = True
-            self.colors.apply(np.full_like(rgb, (180, 30, 50)), color_blocks)
             await self.inpainter.inpaint(rgb, mask, c.inpainter, c.inpainter.inpainting_size)
             if self.backend == 'amd':
                 # Native per-block LaMa inputs are square and padded to 64.
@@ -357,18 +342,14 @@ class Engine:
                     font_size=block.font_size, angle=block.angle,
                     direction='v' if block.src_is_vertical else 'h',
                     default_stroke_width=c.render.stroke_width, adjust_bg_color=False)
-                region.ocr_line_aligned = reading.line_aligned
                 regions.append(region)
             regions = [region for region in regions
                        if len(region.text.strip()) >= c.ocr.min_text_length and is_valuable_text(region.text)
                        and (self.keep_lang is None or region.source_lang == self.keep_lang)]
             if not regions:
                 return [], None, None, None
-            # Original pixels and OCR remain untouched. Color selection does
-            # not depend on bubbles; gray text goes straight to default colors.
-            # Checkpoints retain colors; resume/render never predicts again.
             with stage('analyze_colors'):
-                self.colors.apply(rgb, regions, capture_guard=self._capture_guard)
+                sample_colors(rgb, regions)
             with stage('analyze_bubbles'), self._bubble_lock, self._capture_guard:
                 check_cancelled()
                 detected_bubbles = self.bubbles.detect(rgb, device=self.device)
@@ -384,7 +365,7 @@ class Engine:
                                     kernel_size=c.kernel_size, limit_mask_dilation_to_bubble_mask=True,
                                     bubble_mask=bubbles)
             return regions, mask, raw, bubbles
-        with page_images(rgb), device_context(self.backend, self.gpu):
+        with device_context(self.backend, self.gpu):
             return asyncio.run(run())
 
     def inpaint(self, rgb, mask, raw_mask, bubble_mask, regions, *, cache=None):
@@ -442,8 +423,7 @@ class Engine:
         with device_context(self.backend, self.gpu), self._detector_lock, self._bubble_lock:
             if self.backend == 'cuda' and self.inpainter.model.generator.finished is not None:
                 self.inpainter.model.generator.finished.synchronize()
-            for model in (self.ocr, self.colors):
-                model.close()
-            for model in (self.detector, self.inpainter, self.color_model):
+            self.ocr.close()
+            for model in (self.detector, self.inpainter):
                 asyncio.run(model.unload())
             self.bubbles.model = None
