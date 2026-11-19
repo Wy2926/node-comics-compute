@@ -1,4 +1,4 @@
-"""Assemble MTU stages; image algorithms and typesetting live entirely upstream."""
+"""Assemble the node's MTU image and lettering stages."""
 import asyncio
 from contextlib import nullcontext
 import json
@@ -16,7 +16,7 @@ from .assets import activate
 from .backend import check_cancelled, device_context, validate_backend
 from .colors import ensure_stroke_contrast
 from .fonts import FONT_CHOICES, font_filename
-from .layout import associate_bubbles, fit_bubbles
+from .layout import associate_bubbles, fit_bubbles, fit_source_boxes, resize_unscaled, select_region
 from .layout_metrics import page_measurements
 from .page_cache import page_images
 
@@ -111,7 +111,8 @@ class Renderer:
         if font not in self.font_by_name:
             raise ValueError('Translation font is not installed')
         config.render.font_family = self.font_by_name[font]
-        if language not in ('zh-Hans', 'zh-Hant', 'ja'):
+        word_layout = language not in ('zh-Hans', 'zh-Hant', 'ja')
+        if word_layout:
             config.render.direction = Direction.h
             # MTU explicitly supports this word-based layout switch for every
             # language. Preserve words (and Arabic joins) before size search.
@@ -127,12 +128,10 @@ class Renderer:
             block.target_lang = target
             block.font_family = config.render.font_family
             block.default_stroke_width = config.render.stroke_width
-            if language not in ('zh-Hans', 'zh-Hant', 'ja'):
+            if word_layout:
                 block._direction = config.render.direction.value
                 if len(text.split()) == 1:
-                    # MTU's automatic plain-text fallback can split even a
-                    # single word into characters. Its document path preserves
-                    # the paragraph and still fits glyphs to the available box.
+                    # MTU's plain-text fallback can split even a single word.
                     block.set_translation_rich(legacy_line_breaks_to_document(text))
             blocks.append(block)
         if not blocks:
@@ -147,13 +146,13 @@ class Renderer:
                     associate_bubbles(blocks, bubble_mask)
                     bubble_mask = erode_bubble_mask(bubble_mask, 0.02)
             return self._render_blocks(original, cleaned, blocks, language, config, bubble_mask,
-                                       bubble_components, mask_cache_bytes)
+                                       bubble_components, mask_cache_bytes, word_layout)
 
-    def _render_blocks(self, original, cleaned, blocks, language, config, bubble_mask, components, cache_bytes):
-        from manga_translator.rendering import (dispatch, resize_regions_to_font_size,
-            calc_font_from_box, calc_box_from_font, _region_lines_fully_inside_mask,
+    def _render_blocks(self, original, cleaned, blocks, language, config, bubble_mask, components, cache_bytes,
+                       word_layout):
+        from manga_translator.rendering import (dispatch, _region_lines_fully_inside_mask,
             _apply_default_english_line_break_method, _apply_default_english_case_preferences,
-            _resolve_initial_layout_font_size, text_render)
+            _has_explicit_line_breaks, _resolve_initial_layout_font_size)
         from manga_translator.utils import build_region_reference_mask
         from manga_translator.utils.bubble import reference_mask_cache, cached_bubble_labels
         with reference_mask_cache(cache_bytes, bubble_mask=bubble_mask, components=components, record=record):
@@ -163,83 +162,54 @@ class Renderer:
                 # Reuse the same native 2% inset and labels as solid-fill.
                 labels = cached_bubble_labels(bubble_mask)
             for block in blocks:
+                # Also retain the source scale for break-only paragraphs that MTU skips measuring.
+                block.original_font_size = _resolve_initial_layout_font_size(block, cleaned, config)
                 # Ownership uses the original mask, not its inset for padding.
                 # Legacy/direct prepared inputs without metadata stay strict.
-                inside = block.bubble_enclosed if block.bubble_enclosed is not None else (
-                    labels is not None and _region_lines_fully_inside_mask(
-                        block, build_region_reference_mask(block, bubble_mask, labels)))
-                (enclosed if inside else free).append(block)
+                inside = block.bubble_enclosed
+                if inside is None and labels is not None:
+                    inside = _region_lines_fully_inside_mask(block,
+                        build_region_reference_mask(block, bubble_mask, labels))
+                (enclosed if inside and labels is not None else free).append(block)
             enclosed_texts = [block.translation for block in enclosed]
-            if language not in ('zh-Hans', 'zh-Hant', 'ja'):
-                # The automatic word-break branch keeps the source font size;
-                # its preliminary geometry is discarded before the actual fit.
-                # Prepare only those breaks for free text, retaining native
-                # prelayout for rich/explicit-break inputs and enclosed blocks.
-                prelayout = list(enclosed)
-                for block in free:
-                    config._current_region = block
-                    text_render.set_font(block.font_family)
+            free_texts = [block.translation for block in free]
+            rewrap = word_layout and any(not b.translation_rich and not _has_explicit_line_breaks(b.translation)
+                                         for b in enclosed)
+            if word_layout:
+                prelayout = []
+                for block in blocks:
+                    if block.translation_rich or _has_explicit_line_breaks(block.translation):
+                        continue
+                    select_region(block, config)
                     _apply_default_english_case_preferences(block, config)
                     if not _apply_default_english_line_break_method(
-                            block, _resolve_initial_layout_font_size(block, cleaned, config), None, config):
+                            block, block.original_font_size, None, config):
                         prelayout.append(block)
-                scale = config.render.font_scale_ratio
-                config.render.font_scale_ratio = 1.0
                 if prelayout:
-                    resize_regions_to_font_size(cleaned, prelayout, config, None, skip_text_replacements=True)
-                config.render.font_scale_ratio = scale
-            points = resize_regions_to_font_size(cleaned, free, config, None, skip_text_replacements=True)
-            height, width = cleaned.shape[:2]
-            for block, polygon in zip(free, points):
-                if polygon is None:
-                    continue
-                vertices = np.asarray(polygon).reshape(-1, 2)
-                left, top = vertices.min(axis=0)
-                right, bottom = vertices.max(axis=0)
-                if left >= 2 and top >= 2 and right <= width - 2 and bottom <= height - 2:
-                    continue
-                # Map the upstream rotated render rectangle to the available
-                # canvas budget. MTU still measures glyphs and searches the font;
-                # this adapter supplies image bounds, never new word/box rules.
-                cx, cy = block.center
-                extent = np.maximum([cx - left, right - cx, cy - top, bottom - cy], 1)
-                budget = np.maximum([cx - 2, width - 2 - cx, cy - 2, height - 2 - cy], 1)
-                ratio = min(1.0, float(np.min(budget / extent)))
-                text_render.set_font(block.font_family)
-                options = dict(text=block.translation, is_horizontal=block.horizontal,
-                    line_spacing=block.line_spacing, config=config, target_lang=block.target_lang,
-                    letter_spacing=block.letter_spacing, stroke_width=block.stroke_width)
-                box_width, box_height, _, _ = calc_box_from_font(block.font_size, **options)
-                block.font_size = min(block.font_size, calc_font_from_box(
-                    box_width * ratio, box_height * ratio, **options))
+                    resize_unscaled(cleaned, prelayout, config)
             rendered = cleaned.copy()
             if free:
+                points = fit_source_boxes(cleaned, free, free_texts, config, [b.min_rect for b in enclosed])
                 rendered = asyncio.run(dispatch(rendered, free, config, None,
-                    skip_font_scaling=True, skip_text_replacements=True))
+                    skip_font_scaling=True, skip_text_replacements=True, layout_points=points))
             if enclosed:
                 config.render.layout_mode = 'balloon_fill'
-                # CJK keeps native column breaking; the optional inscribed-box
-                # reflow adds full-mask scans without improving this constraint.
-                config.render.balloon_fill_mask_layout = language not in ('zh-Hans', 'zh-Hant', 'ja')
-                if config.render.balloon_fill_mask_layout:
-                    # Manga2Eng initially wraps at the source CJK font size.
-                    # Feed MTU's mask-fitted size back to its word layout once:
-                    # otherwise the final pass only shrinks those narrow lines.
-                    scale = config.render.font_scale_ratio
-                    config.render.font_scale_ratio = 1.0
-                    resize_regions_to_font_size(rendered, enclosed, config, original,
-                        bubble_mask=bubble_mask, skip_text_replacements=True)
-                    config.render.font_scale_ratio = scale
+                config.render.balloon_fill_mask_layout = word_layout
+                unscaled_points = None
+                if rewrap:
+                    # Feed the fitted size back to MTU's word wrapper once.
+                    unscaled_points = resize_unscaled(rendered, enclosed, config, original, bubble_mask)
                     for block, text in zip(enclosed, enclosed_texts):
+                        previous_breaks = block.translation
                         block.translation = text
-                        text_render.set_font(block.font_family)
+                        select_region(block, config)
                         _apply_default_english_line_break_method(
                             block, round(block.font_size), None, config)
+                        if block.translation != previous_breaks:
+                            unscaled_points = None  # A changed wrap also invalidates its neighbours' fit.
                 enclosed, points = fit_bubbles(rendered, original, enclosed, enclosed_texts, config,
                                                bubble_mask, labels, [block.dst_points for block in free],
-                                               language=language)
-                # Layout and final scale are already resolved. Native painting
-                # uses those exact sizes/anchors without a second fit or scale.
+                                               language=language, unscaled_points=unscaled_points)
                 rendered = asyncio.run(dispatch(rendered, enclosed, config, original,
                     bubble_mask=bubble_mask, skip_font_scaling=True, skip_text_replacements=True,
                     layout_points=points))

@@ -1,5 +1,6 @@
-"""Bounded bubble recovery using MTU's geometry, line breaking and font search."""
+"""Fit translated text to source boxes and bubbles with MTU's glyph measurements."""
 from copy import copy
+from math import hypot, sqrt
 import unicodedata
 
 import numpy as np
@@ -42,6 +43,166 @@ def _wrap_words(text, font_size, width, letter_spacing):
     return '[BR]'.join(lines)
 
 
+def _points_at(block, size, config):
+    from manga_translator.rendering import _calc_region_dst_points_for_font
+    return _calc_region_dst_points_for_font(region=block, font_size=size,
+        render_horizontally=block.horizontal, line_spacing_multiplier=block.line_spacing,
+        letter_spacing_multiplier=block.letter_spacing, config=config, anchor_mode='center')
+
+
+def select_region(block, config):
+    from manga_translator.rendering import text_render
+    config._current_region = block
+    text_render.set_font(block.font_family)
+
+
+def resize_unscaled(image, blocks, config, original=None, mask=None):
+    from manga_translator.rendering import resize_regions_to_font_size
+    scale = config.render.font_scale_ratio
+    config.render.font_scale_ratio = 1.0
+    try:
+        return resize_regions_to_font_size(image, blocks, config, original, bubble_mask=mask,
+                                           skip_text_replacements=True)
+    finally:
+        config.render.font_scale_ratio = scale
+
+
+def _reserve_source_size(block, polygon, config, *, unscaled=False):
+    from manga_translator import rendering as native
+
+    base = min(block.original_font_size, block.font_size) if unscaled else block.original_font_size
+    maximum = native._apply_final_font_constraints(base, config)
+    if block.font_size <= maximum:
+        return polygon
+    block.font_size = maximum
+    select_region(block, config)
+    resized = _points_at(block, maximum, config)
+    return resized if resized is not None else polygon
+
+
+def grow_into_space(block, text, polygon, width, height, config, fits, center=None):
+    """Try one reflow; text=None keeps the breaks of a recovered layout."""
+    from manga_translator import rendering as native
+
+    if polygon is None or min(width, height) <= 0:
+        return block, polygon
+    corners = polygon.reshape(4, 2)
+    ink_w, ink_h = hypot(*(corners[1] - corners[0])), hypot(*(corners[2] - corners[1]))
+    if not (ink_w > 0 and ink_h > 0):
+        return block, polygon
+    fixed = text is None or block.translation_rich or native._has_explicit_line_breaks(text)
+    # Reflow can use the whole area; fixed breaks must fit in both dimensions.
+    scale = min(width / ink_w, height / ink_h) if fixed else sqrt(width * height / (ink_w * ink_h))
+    capacity = native._apply_final_font_constraints(min(block.font_size * scale, max(width, height), 8192), config)
+    source = block.original_font_size
+    # Use a quarter of the spare size for legibility, at most one small type step.
+    extra = min(4, source / 4, max(0, capacity - source) / 4)
+    target = min(capacity, source + int(extra))
+    if target <= block.font_size:
+        return block, polygon
+
+    candidate = copy(block)
+    select_region(candidate, config)
+    if not fixed:
+        # Balance the aspect ratio only when the paragraph needs shrinking.
+        span = width if block.horizontal else height
+        if target < source:
+            span *= target / (block.font_size * scale)
+        if block.horizontal:
+            candidate.translation = _wrap_words(text, target, max(1, span), block.letter_spacing)
+        elif _can_stack_text(text):
+            from manga_translator.rendering.auto_linebreak import _layout_vertical
+            lines, _ = _layout_vertical(target, text, max(1, span), config, block.letter_spacing)
+            candidate.translation = '[BR]'.join(lines)
+
+    # Try the target first, then bisect only sizes better than the drawable baseline.
+    lo, hi, size = int(block.font_size) + 1, target, target
+    best = None
+    while lo <= hi:
+        points = _points_at(candidate, size, config)
+        at = block.center
+        if points is not None and center is not None and fits(centered := points + (center - at)):
+            points, at = centered, center
+        elif points is not None and not fits(points):
+            points = None
+        if points is not None:
+            best = size, at, points
+            lo = size + 1
+        else:
+            hi = size - 1
+        size = (lo + hi) // 2
+    if best is None:
+        return block, polygon
+    candidate.font_size, candidate.center, points = best
+    return candidate, points
+
+
+def _inside_source_box(polygon, source):
+    import cv2
+    return all(cv2.pointPolygonTest(source, tuple(map(float, pt)), False) >= 0 for pt in polygon.reshape(-1, 2))
+
+
+def _grow_in_source_box(block, text, polygon, shape, config, obstacles):
+    from manga_translator.rendering import _layout_regions_conflict
+    height, width = shape[:2]
+    source = block.min_rect[0].astype(np.float32)
+
+    def fits(p):
+        corners = p.reshape(-1, 2)
+        return ((corners >= (2, 2)).all() and (corners <= (width-2, height-2)).all()
+            and _inside_source_box(p, source)
+            and not _layout_regions_conflict(p, None, obstacles))
+
+    return grow_into_space(block, text, polygon, *block.unrotated_size, config, fits)
+
+
+def _bounds(polygon):
+    vertices = np.asarray(polygon).reshape(-1, 2)
+    return np.concatenate((vertices.min(axis=0), vertices.max(axis=0)))
+
+
+def _neighbours(polygons, boxes, index, bounds):
+    left, top, right, bottom = bounds
+    nearby = (boxes[:, 0] < right) & (boxes[:, 2] > left) & (boxes[:, 1] < bottom) & (boxes[:, 3] > top)
+    nearby[index] = False
+    return [(polygons[i], None) for i in np.flatnonzero(nearby)]
+
+
+def fit_source_boxes(image, blocks, texts, config, occupied):
+    from manga_translator import rendering as native
+
+    points = native.resize_regions_to_font_size(image, blocks, config, None, skip_text_replacements=True)
+    points = [_reserve_source_size(b, p, config) for b, p in zip(blocks, points)]
+    reserved = [b.min_rect if p is None else p for b, p in zip(blocks, points)] + occupied
+    boxes = np.array([_bounds(p) for p in reserved])
+    height, width = image.shape[:2]
+    for i, (block, text, polygon) in enumerate(zip(blocks, texts, points)):
+        if polygon is None:
+            continue
+        obstacles = _neighbours(reserved, boxes, i, _bounds(block.min_rect))
+        block, polygon = _grow_in_source_box(block, text, polygon, image.shape, config, obstacles)
+        bounds = _bounds(polygon)
+        left, top, right, bottom = bounds
+        if not (left >= 2 and top >= 2 and right <= width - 2 and bottom <= height - 2):
+            # Scale the rotated glyph box to the page margins, then measure it once at the final size.
+            cx, cy = block.center
+            extent = np.maximum([cx - left, right - cx, cy - top, bottom - cy], 1)
+            budget = np.maximum([cx - 2, width - 2 - cx, cy - 2, height - 2 - cy], 1)
+            ratio = min(1.0, float(np.min(budget / extent)))
+            select_region(block, config)
+            options = dict(text=block.get_translation_for_rendering(), is_horizontal=block.horizontal,
+                line_spacing=block.line_spacing, config=config, target_lang=block.target_lang,
+                letter_spacing=block.letter_spacing, stroke_width=block.stroke_width)
+            w, h, _, _ = native.calc_box_from_font(block.font_size, **options)
+            block.font_size = min(block.font_size, native.calc_font_from_box(w * ratio, h * ratio, **options))
+            resized, _ = native.calc_box_from_font(block.font_size, center=block.center, angle=block.angle, **options)
+            polygon = resized if resized is not None else block.min_rect
+            bounds = _bounds(polygon)
+        blocks[i], boxes[i] = block, bounds
+        points[i] = reserved[i] = polygon
+    return points
+
+
 def associate_bubbles(blocks, mask):
     has_mask = mask is not None and np.any(mask)
     if has_mask:
@@ -52,49 +213,46 @@ def associate_bubbles(blocks, mask):
                 _region_lines_fully_inside_mask(block, mask))
 
 
-def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(), *, language):
-    """Keep native layout; reuse one safe rectangle for bounded recovery.
-
-    Source lines/checkpoints are immutable. Only a layout copy's native anchor
-    and wrap budget change; Qt still measures, breaks, sizes and paints the text.
-    """
+def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(), *, language, unscaled_points=None):
+    """Reserve all paragraphs before recovery and growth; never move their source lines."""
     import cv2
     from manga_translator import rendering as native
     from manga_translator.utils import build_region_reference_mask
     from manga_translator.utils.bubble import reference_mask_bounds
 
-    def cap_source_font(block, polygon):
-        # Do this before reserving pending layouts: balloon-fill can otherwise
-        # double a short paragraph's size and starve its neighbour of space.
-        maximum = native._apply_final_font_constraints(block.original_font_size, config)
-        if block.font_size <= maximum:
-            return polygon
-        block.font_size = maximum
-        config._current_region = block
-        native.text_render.set_font(block.font_family)
-        return native._calc_region_dst_points_for_font(
-            region=block, font_size=maximum, render_horizontally=block.horizontal,
-            line_spacing_multiplier=block.line_spacing,
-            letter_spacing_multiplier=block.letter_spacing, config=config, anchor_mode='center')
-
-    points = native.resize_regions_to_font_size(image, blocks, config, original,
-        bubble_mask=mask, skip_text_replacements=True)
-    points = [cap_source_font(block, polygon) for block, polygon in zip(blocks, points)]
-    # Bubble segmentation is a layout hint, not a condition for publishing text.
-    # MTU already falls back to the source box when no usable mask is present.
+    points = unscaled_points
+    if points is None:
+        points, pending = [None] * len(blocks), []
+        for i, block in enumerate(blocks):
+            # A fitting native single line needs no balloon search for its baseline.
+            if (not config.render.balloon_fill_mask_layout and native.should_force_no_wrap_single_region(block)
+                    and not native._has_explicit_line_breaks(texts[i])):
+                size = native._apply_final_font_constraints(block.original_font_size, config)
+                select_region(block, config)
+                polygon = _points_at(block, size, config)
+                source = block.min_rect[0].astype(np.float32)
+                if polygon is not None and _inside_source_box(polygon, source):
+                    block.font_size, points[i] = size, polygon
+                    continue
+            pending.append(i)
+        if pending:
+            fitted = native.resize_regions_to_font_size(image, [blocks[i] for i in pending], config, original,
+                bubble_mask=mask, skip_text_replacements=True)
+            for i, polygon in zip(pending, fitted):
+                points[i] = polygon
+    points = [_reserve_source_size(block, polygon, config, unscaled=unscaled_points is not None)
+              for block, polygon in zip(blocks, points)]
     if mask is None or labels is None:
         return blocks, points
     height, width = image.shape[:2]
-    boxes = np.array([np.concatenate((np.asarray(p).reshape(-1, 2).min(axis=0),
-                                     np.asarray(p).reshape(-1, 2).max(axis=0)))
-                      for p in [*points, *occupied]])
+    reserved = [*points, *occupied]
+    boxes = np.array([_bounds(p) for p in reserved])
 
     def safe(polygon, reference):
         if polygon is None:
             return False
         vertices = np.asarray(polygon).reshape(-1, 2)
-        # Native mask membership clips polygons; it cannot alone prove that
-        # rotated glyphs/outline fit on the physical page.
+        # MTU clips polygons to the mask, so check the physical page first.
         return bool(np.isfinite(vertices).all() and
             (vertices >= (1, 1)).all() and (vertices <= (width - 1, height - 1)).all() and
             native._polygon_fully_inside_mask(vertices, reference))
@@ -102,14 +260,11 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
     def avoid(block, polygon, reference, obstacles):
         if polygon is None:
             return None
-        config._current_region = block
-        native.text_render.set_font(block.font_family)
+        select_region(block, config)
         options = dict(region=block, min_font_size=1, render_horizontally=block.horizontal,
             line_spacing_multiplier=block.line_spacing, letter_spacing_multiplier=block.letter_spacing,
             config=config, anchor_mode='center', bubble_mask=reference)
         if not safe(polygon, reference):
-            # Collision fitting alone does not check bubble containment. Reuse
-            # MTU's bounded mask search before avoiding neighbouring paragraphs.
             size, polygon = native._binary_search_font_for_bubble_mask(
                 start_font_size=block.font_size, **options)
             if size is None:
@@ -122,8 +277,8 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
                 block.font_size = size
         return polygon if safe(polygon, reference) else None
 
-    def available_space(reference, obstacles):
-        x, y, w, h = reference_mask_bounds(reference) or cv2.boundingRect(reference)
+    def available_space(reference, bounds, obstacles):
+        x, y, w, h = bounds
         available = reference[y:y+h, x:x+w].copy()
         if w and h:
             if x == 0:
@@ -136,7 +291,14 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
                 available[-1, :] = 0
             for polygon, _ in obstacles:
                 cv2.fillPoly(available, [np.rint(np.asarray(polygon).reshape(-1, 2) - (x, y)).astype(np.int32)], 0)
-        return x, y, available
+        return available
+
+    def reset_text(block, text):
+        candidate = copy(block)
+        candidate.translation = text
+        candidate.translation_rich = block.translation_rich
+        candidate.font_size = block.original_font_size
+        return candidate
 
     def fit_rectangle(block, text, rect, reference, obstacles, *, recover, best, cell=None):
         chosen, chosen_points = best
@@ -144,32 +306,23 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
         if rw <= 2 or rh <= 2:
             return best
         vertical = recover and _can_stack_text(text)
-        # Native hyphenation can fall back to code-point splits too; complex
-        # graphemes and bidi text must keep Qt's shaping and word wrapping.
+        # Stacking and native hyphenation both split code points.
         hyphenate = (vertical and not block.translation_rich and
                      native.text_render.select_hyphenator(language) is not None)
         modes = ('horizontal', 'vertical', 'columns') if vertical else ('horizontal',)
-        # Shared cells can trade width for height. Compare Qt word wrapping
-        # with the existing dictionary breaks, rather than forcing hyphenation.
         if cell is not None and hyphenate:
             modes = ('words', *modes)
         for mode in modes:
             stack = mode in ('vertical', 'columns')
             if stack and chosen_points is not None and chosen.font_size >= .75 * block.original_font_size:
                 break
-            candidate = copy(block)
+            candidate = reset_text(block, text)
             candidate.center = np.array([rx + rw / 2, ry + rh / 2])
             candidate.unrotated_size = (rw - 2, rh - 2)
-            rich = block.translation_rich
-            candidate.translation = text
-            candidate.translation_rich = rich
-            candidate.font_size = block.original_font_size
-            # In a shared cell, reuse a healthy paragraph's already fitted
-            # size for wrapping, rather than freezing breaks at its larger OCR size.
+            # Preserve a healthy shared paragraph's wrap size.
             seed = round(block.font_size if cell is not None and
                 block.font_size >= .75 * block.original_font_size else block.original_font_size)
-            native.text_render.set_font(candidate.font_family)
-            config._current_region = candidate
+            select_region(candidate, config)
             mask_layout = config.render.balloon_fill_mask_layout
             english_layout = config.render.bubble_layout_english
             config.render.balloon_fill_mask_layout = False
@@ -199,7 +352,7 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
                     lines, _ = _layout_horizontal_eng(seed, text, rw - 2,
                         language=language, hyphenate=True, letter_spacing=candidate.letter_spacing)
                     candidate.translation = '[BR]'.join(lines)
-                elif not stack and recover and not rich:
+                elif not stack and recover and not block.translation_rich:
                     candidate.translation = _wrap_words(text, seed,
                         rw - 2, candidate.letter_spacing)
                 else:
@@ -209,7 +362,7 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
             finally:
                 config.render.balloon_fill_mask_layout = mask_layout
                 config.render.bubble_layout_english = english_layout
-            polygon = avoid(candidate, cap_source_font(candidate, polygon), reference, obstacles)
+            polygon = avoid(candidate, _reserve_source_size(candidate, polygon, config), reference, obstacles)
             if polygon is not None and cell is not None:
                 origin, budget = cell
                 vertices = np.asarray(polygon).reshape(-1, 2) - origin
@@ -221,65 +374,85 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
                 chosen, chosen_points = candidate, polygon
         return chosen, chosen_points
 
+    def neighbours(index, bounds):
+        x, y, w, h = bounds
+        return _neighbours(reserved, boxes, index, (x, y, x+w, y+h))
+
+    def place(index, block, polygon):
+        blocks[index] = block
+        points[index] = reserved[index] = polygon
+        boxes[index] = _bounds(polygon)
+
+    def grow(index, text, bounds, reference, obstacles):
+        block = blocks[index]
+        x, y, w, h = bounds
+        room_w, room_h = w - 1, h - 1
+        center = np.array([x + room_w / 2, y + room_h / 2])
+        if obstacles:
+            cx, cy = block.center
+            room_w, room_h = 2 * min(cx - x, x + w - 1 - cx), 2 * min(cy - y, y + h - 1 - cy)
+            center = None
+        elif max(abs(center - block.center)) < 1:
+            center = None
+
+        def fits(p):
+            nonlocal reference
+            if reference is None:
+                reference = build_region_reference_mask(block, mask, labels)
+            return safe(p, reference) and not native._layout_regions_conflict(p, reference, obstacles)
+
+        chosen, polygon = grow_into_space(block, text, points[index], room_w, room_h, config, fits, center)
+        if chosen is not block:
+            place(index, chosen, polygon)
+
+    shared = []
     for index, block in enumerate(blocks):
         reference = build_region_reference_mask(block, mask, labels)
-        x, y, w, h = reference_mask_bounds(reference) or cv2.boundingRect(reference)
-        # Reserve both already chosen layouts and pending native layouts. A
-        # moved paragraph must not occupy another paragraph's eventual glyphs.
-        # Cheap bounds reject unrelated bubbles before native polygon checks.
-        nearby = np.flatnonzero((boxes[:, 0] < x+w) & (boxes[:, 2] > x) &
-                                (boxes[:, 1] < y+h) & (boxes[:, 3] > y))
-        all_points = [*points, *occupied]
-        obstacles = [(all_points[i], None) for i in nearby if i != index]
+        bounds = reference_mask_bounds(reference) or cv2.boundingRect(reference)
+        x, y, w, h = bounds
+        obstacles = neighbours(index, bounds)
         collision = native._layout_regions_conflict(points[index], reference, obstacles)
-        # A wide shared bubble can still contain a narrow vertical paragraph.
-        # Recover unused height before accepting severe width-limited shrink;
-        # ordinary layouts and explicit breaks retain the native fast path.
+        # Try the unused height of a narrow paragraph before accepting severe shrink.
         source_width, source_height = block.unrotated_size
         recover = (config.render.balloon_fill_mask_layout and block.horizontal and
             (h > w or source_height > source_width) and
             block.font_size < .75 * block.original_font_size and
             2 * (boxes[index, 3] - boxes[index, 1]) < h and
             not native._has_explicit_line_breaks(texts[index]))
-        if (safe(points[index], reference) and not collision and
-                native._polygon_fully_inside_mask(block.min_rect[0], reference) and not recover):
-            continue
-        chosen = copy(block)
-        chosen_points = avoid(chosen, points[index], reference, obstacles)
-
-        # Work on this component's ROI, not another full-page mask. The native
-        # maximal-rectangle search keeps holes; pending/placed boxes are holes
-        # too. Reuse this one ROI for horizontal recovery, then the existing
-        # vertical layout and (only if still undersized) native column fitting.
-        # No extra mask/rectangle search; keep a better single-column result.
-        x, y, available = available_space(reference, obstacles)
-        if w and h:
-            rx, ry, rw, rh = native.find_largest_inscribed_rect(available)
-            chosen, chosen_points = fit_rectangle(block, texts[index], (x+rx, y+ry, rw, rh),
-                reference, obstacles, recover=recover, best=(chosen, chosen_points))
-        if chosen_points is None:
-            # A bad mask can reduce the native candidate to one-pixel text.
-            # Refit the original text/size to its source box without that mask.
+        if (recover or collision or not safe(points[index], reference) or
+                not native._polygon_fully_inside_mask(block.min_rect[0], reference)):
             chosen = copy(block)
-            rich = chosen.translation_rich
-            chosen.translation = texts[index]
-            chosen.translation_rich = rich
-            chosen.font_size = block.original_font_size
-            mode = config.render.layout_mode
-            config.render.layout_mode = 'smart_scaling'
-            try:
-                chosen_points = native.resize_regions_to_font_size(image, [chosen], config, None,
-                    skip_text_replacements=True)[0]
-            finally:
-                config.render.layout_mode = mode
-            chosen_points = cap_source_font(chosen, chosen_points)
-        blocks[index], points[index] = chosen, chosen_points
-        vertices = np.asarray(chosen_points).reshape(-1, 2)
-        boxes[index] = np.concatenate((vertices.min(axis=0), vertices.max(axis=0)))
+            chosen_points = avoid(chosen, points[index], reference, obstacles)
 
-    # A safe large paragraph can leave its neighbour only a narrow strip.
-    # Retry shared pairs as a unit, using the same native fitting in two cells.
-    # Source geometry orders the cells; paragraph IDs and source data never move.
+            if w and h:
+                rx, ry, rw, rh = native.find_largest_inscribed_rect(available_space(reference, bounds, obstacles))
+                chosen, chosen_points = fit_rectangle(block, texts[index], (x+rx, y+ry, rw, rh),
+                    reference, obstacles, recover=recover, best=(chosen, chosen_points))
+            if chosen_points is None:
+                # A bad mask is only a hint: paint the translation in its source box.
+                chosen = reset_text(block, texts[index])
+                mode = config.render.layout_mode
+                config.render.layout_mode = 'smart_scaling'
+                try:
+                    chosen_points = native.resize_regions_to_font_size(image, [chosen], config, None,
+                        skip_text_replacements=True)[0]
+                finally:
+                    config.render.layout_mode = mode
+                chosen_points = _reserve_source_size(chosen, chosen_points, config)
+                obstacles = neighbours(index, cv2.boundingRect(chosen.min_rect[0].astype(np.float32)))
+                chosen, chosen_points = _grow_in_source_box(chosen, texts[index], chosen_points, image.shape,
+                                                           config, obstacles)
+                place(index, chosen, chosen_points)
+                continue
+            place(index, chosen, chosen_points)
+        text = None if recover else texts[index]
+        if obstacles:
+            # Let every neighbour finish recovery before spending any shared space.
+            shared.append((index, text, bounds))
+        else:
+            grow(index, text, bounds, reference, obstacles)
+
+    # An undersized pair can share space more fairly when fitted together in source order.
     if config.render.balloon_fill_mask_layout and any(
             block.font_size < .75 * block.original_font_size for block in blocks):
         from manga_translator.utils.bubble import _region_labels
@@ -292,18 +465,16 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
             if len(indices) != 2 or any(not blocks[i].horizontal or blocks[i].translation_rich or
                     native._has_explicit_line_breaks(texts[i]) for i in indices):
                 continue
-            ratios = [blocks[i].font_size / blocks[i].original_font_size for i in indices]
-            score = min(ratios)
+            score = min(blocks[i].font_size / blocks[i].original_font_size for i in indices)
             if score >= .75:
                 continue
             reference = build_region_reference_mask(blocks[indices[0]], mask, labels)
-            obstacles = [(p, None) for i, p in enumerate([*points, *occupied]) if i not in indices]
-            x, y, available = available_space(reference, obstacles)
+            obstacles = [(p, None) for i, p in enumerate(reserved) if i not in indices]
+            bounds = reference_mask_bounds(reference) or cv2.boundingRect(reference)
+            x, y = bounds[:2]
+            available = available_space(reference, bounds, obstacles)
             origin = np.array([x, y])
-            centers = {}
-            for i in indices:
-                source = np.asarray(blocks[i].lines).reshape(-1, 2)
-                centers[i] = (source.min(axis=0) + source.max(axis=0)) / 2
+            centers = {i: _bounds(blocks[i].lines).reshape(2, 2).mean(axis=0) for i in indices}
 
             def fit_pair(axis, split):
                 order = sorted(indices, key=lambda i: centers[i][axis])
@@ -315,8 +486,7 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
                     excluded = [slice(None), slice(None)]
                     excluded[1-axis] = slice(split, None) if side == 0 else slice(None, split)
                     budget[tuple(excluded)] = 0
-                    # Feed the cell boundary to the existing collision fitter,
-                    # so an outline crossing it slightly is shrunk, not lost.
+                    # Treat the divider as an obstacle so an outline can shrink to fit.
                     low, high = origin.copy(), origin + available.shape[::-1]
                     if side == 0:
                         low[axis] += split - 1
@@ -343,13 +513,14 @@ def fit_bubbles(image, original, blocks, texts, config, mask, labels, occupied=(
                 if pair is None:
                     continue
                 candidate_score = min(b.font_size / b.original_font_size for _, b, _ in pair)
-                # Compare output sizes with output constraints, including the
-                # existing final scale and integer rounding, just like the cap.
+                # Compare sizes after the same final scale and integer rounding.
                 if (candidate_score > score and all(b.font_size >= min(blocks[i].font_size,
                         native._apply_final_font_constraints(.75 * b.original_font_size, config))
                         for i, b, _ in pair)):
                     score, best_pair = candidate_score, pair
             if best_pair is not None:
                 for i, block, polygon in best_pair:
-                    blocks[i], points[i] = block, polygon
+                    place(i, block, polygon)
+    for index, text, bounds in shared:
+        grow(index, text, bounds, None, neighbours(index, bounds))
     return blocks, points
