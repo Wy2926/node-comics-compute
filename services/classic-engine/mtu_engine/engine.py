@@ -349,7 +349,7 @@ class Engine:
             if not regions:
                 return [], None, None, None
             with stage('analyze_colors'):
-                sample_colors(rgb, regions)
+                sample_colors(rgb, regions, raw)
             with stage('analyze_bubbles'), self._bubble_lock, self._capture_guard:
                 check_cancelled()
                 detected_bubbles = self.bubbles.detect(rgb, device=self.device)

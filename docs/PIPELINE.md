@@ -6,7 +6,7 @@
 | --- | --- |
 | 接单与输入 | 按租约、下载并发和页面内存预算接单。校验输入摘要、长度、格式、尺寸及规范化状态；文件先在独立工作区拆页，拆页与单图共用计算预算。 |
 | 检测与识别 | DBNet 长图分块保留原图短边（受 `detect_size` 限制），重叠区概率图合并后统一提框。BallonsTranslator 分组，Hayai 按段识别，截断文本不授权抹字。 |
-| 分析检查点 | 每段在第一行四边形内采样 16×16 个 RGB 像素，估计字色与底色；近纯色时按亮度选黑白。气泡、CTD 字形细化和源笔画保护生成修复掩膜。颜色、文字、几何和掩膜一起冻结；无字跳过抹字，计算错误不能作为无字提交。 |
+| 分析检查点 | 每段最多抽查首、中、末三行。近灰文字直接估计深浅及正反色；彩色段可复用 DBNet 原始掩膜区分字芯与描边。气泡、CTD 字形细化和源笔画保护生成修复掩膜。颜色、文字、几何和掩膜一起冻结；无字跳过抹字，计算错误不能作为无字提交。 |
 | 翻译与抹字 | 提交分析后，中心翻译与本地抹字并行，等译文不占计算线程。纯色气泡先填充，剩余块由 FP32 LaMa 修复；取消在模型批次／块间生效。 |
 | 排版 | Qt 按气泡换行或分栏，字号增量不超过原字号的 25%，最多加 4 px。独占气泡优先居中，共用气泡先给各段留位；无可用气泡时按原文框排版。空译文留白，缺少段 ID 或字体不受支持时拒绝渲染。 |
 | 交付 | 完整排版后输出无损差分覆盖，长图分块。结果落盘后释放缓冲并上传；交付状态未知时重发冻结结果。 |
@@ -206,7 +206,7 @@ uv run python -m tools.benchmark_pages --models "$MODELS" --input "$NORMALIZED_P
 
 所有后端均使用同一 CPU 采样实现，安装时省去约 195 MiB 的取色权重及字典。采样优先保留纸底与字色的反差，渐变字、花底或多色描边可能与原作不同；排版仍对低于 3:1 的描边反差做黑白修正。
 
-同一台 L4、同一张 `930×28007` 长图作为 8 个独立任务、固定英文译文；沿用半内存、2 个引擎线程、2 路抹字、2 个排版进程和相同的排版优化。各档预热后测两轮。整批按墙钟计，单页取色含等待；每行取两轮中位数。
+下表的采样为 `604b781` 的单行 16×16 版本。同一台 L4、同一张 `930×28007` 长图作为 8 个独立任务、固定英文译文；沿用半内存、2 个引擎线程、2 路抹字、2 个排版进程和相同的排版优化。各档预热后测两轮。整批按墙钟计，单页取色含等待；每行取两轮中位数。
 
 | 方案／计算路数 | 8 张墙钟 | 张／分钟 | 单页取色 | GPU 忙碌率 | CPU 核数 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -221,6 +221,17 @@ uv run python -m tools.benchmark_pages --models "$MODELS" --input "$NORMALIZED_P
 
 复测用 `--resident-mib 27114`（本机半内存向下取整到 MiB），分别设 `--concurrency 4`、`6`、`8`；其余参数与 8 张长图对照相同。现版 `ocr_lock_wait` 只计 Hayai，`analyze_colors` 是实际 CPU 取色耗时。
 
+**按颜色细测。** 每行先取 8×8 个原图像素。近灰段到此结束；有颜色且检测掩膜可用时，每段只对一行细取 64×24 个点，从笔画内部估字色，从边缘估描边。颜色不参与 OCR 或掩膜生成，不整页上传、重跑模型或获取 GPU 锁；仍只保存一组字色／描边，不能还原渐变和多重描边。
+
+与 `604b781` 比较，命中指预测与已知原色的 RGB 三通道各差不超过 24/255（排版对比度修正前）：
+
+| 已知配色样张／真实检测框和掩膜 | 字色命中 | 有描边的样张：描边命中 |
+| --- | ---: | ---: |
+| 48 段，L4 FP16 检测 | 32 → 47 / 48 | 0 → 16 / 20 |
+| 另 48 段，换文本与字体、含偏转和更强 JPEG 压缩，CPU FP32 检测 | 30 → 35 / 48 | 1 → 9 / 20 |
+
+本地 CPU 在同一张 `930×28007` 真实长图的 39 个检测段上，冻结检测结果、交错测 32 轮：**仅取色**从 0.94 到 3.01 ms，16 段进入细测；用同一几何和掩膜转灰度后从 0.88 到 0.70 ms，0 段进入细测。这不代表 L4 整批吞吐；部署前应以上面相同的 4 路、8 张长图交错比较，以整批墙钟增加不超过 3% 为验收线。
+
 ## 诊断与复测
 
 `state_dir/logs/node.log` 的 `event=page_stage` 和 `event=document_page_stage` 记录本地阶段秒数。先分清排队（`*_queue`）、等模型锁（`*_lock_wait`）和计算，再看以下字段。嵌套耗时不能相加，并发页耗时之和不等于墙钟时间。
@@ -228,7 +239,7 @@ uv run python -m tools.benchmark_pages --models "$MODELS" --input "$NORMALIZED_P
 | 排查项 | 主要字段 |
 | --- | --- |
 | 检测／OCR | `analyze_detect`、`detect_filter`；`detect_filter_opencl_chunks` 和 `detect_filter_cpu_pages` 分别计 GPU 条带和 CPU 页数；另有 `analyze_group`、`analyze_ocr`、`ocr_preprocess`、`ocr_infer`、`ocr_decode`、`ocr_capture` |
-| 分析后处理 | `analyze_colors`、`color_sample_regions`、`analyze_bubbles`、`analyze_bubble_mask`、`analyze_refine`、`analyze_checkpoint` |
+| 分析后处理 | `analyze_colors`、`color_sample_regions`（总段数）、`color_detail_regions`（进入细测的段数）、`analyze_bubbles`、`analyze_bubble_mask`、`analyze_refine`、`analyze_checkpoint` |
 | 抹字与排版 | `inpaint_solid_fill`、`inpaint_blocks`、`inpaint_lama`、`inpaint_model`；`render_layout`、`render_diff`、`render_encode`、`persist` |
 
 在引擎环境中使用同一组输入、模型、配置和固定译文，报告放在输入目录以外。Windows 工作目录与资产同盘。报告默认只含摘要；`benchmark_ocr --include-text` 才保存识别全文。

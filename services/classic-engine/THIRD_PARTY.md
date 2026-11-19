@@ -74,7 +74,7 @@ The lock also records the DBNet checkpoint from [manga-image-translator](https:/
 
 On NVIDIA, explicit FP16 DBNet inference stores the folded convolution weights in PyTorch's `channels_last` format at load time to match the existing NHWC-backed image tensors. Checkpoint files and the FP32 path are unchanged.
 
-The node's [RGB sampler](mtu_engine/colors.py) sets fill and outline via MTU's `TextBlock.set_font_colors`. It uses NumPy on the CPU on every backend; no color checkpoint, dictionary or additional OCR inference is required.
+The node's [RGB sampler](mtu_engine/colors.py) sets fill and outline via MTU's `TextBlock.set_font_colors`. It reuses DBNet's existing stroke mask. Near-gray regions use a sparse NumPy probe; color regions use OpenCV's CPU distance transform on one small grid. All backends share this path; no color weights or additional inference are required.
 
 The LaMa adapter in [inpainting.py](mtu_engine/inpainting.py) wraps the pinned
 upstream FP32 generator with PyTorch CUDA/HIP graphs, captured only during startup for

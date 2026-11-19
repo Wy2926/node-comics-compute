@@ -52,6 +52,59 @@ def test_uniform_clipped_line_selects_legible_defaults(gray, fg):
     assert tuple(block.fg_colors) == (fg,) * 3 and tuple(block.bg_colors) == (255 - fg,) * 3
 
 
+@pytest.mark.parametrize('ink,paper', [(0, 255), (255, 0), (59, 225)])
+def test_achromatic_text_keeps_polarity_without_entering_detail(ink, paper, monkeypatch):
+    rgb = np.full((50, 200, 3), paper, np.uint8)
+    mask = np.zeros(rgb.shape[:2], np.uint8)
+    rgb[8:42, 20:45] = rgb[8:42, 80:105] = ink
+    mask[8:42, 20:45] = mask[8:42, 80:105] = 255
+    rgb[12, 28] = (180, 34, 45)  # A speck shouldn't send a gray paragraph down the color path.
+    monkeypatch.setattr('mtu_engine.colors._masked', lambda *args: pytest.fail('unnecessary color pass'))
+    block = region([[[0, 0], [199, 0], [199, 49], [0, 49]]])
+    with collect() as timings:
+        sample_colors(rgb, [block], mask)
+    assert block.fg_colors == (ink,) * 3 and block.bg_colors == (paper,) * 3
+    assert timings['color_detail_regions'] == 0
+
+
+def test_masked_color_finds_letter_fill_and_outline_on_later_rotated_line():
+    from PIL import Image, ImageDraw, ImageFont
+    paper, rim, ink = (227, 223, 193), (20, 20, 25), (211, 60, 92)
+    image = Image.new('RGB', (400, 150), paper)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=46)
+    draw.text((20, 60), 'HELLO', fill=ink, font=font, stroke_fill=rim, stroke_width=3)
+    x, y, right, bottom = draw.textbbox((20, 60), 'HELLO', font=font, stroke_width=3)
+    rgb = np.array(image)
+    mask = np.where(np.any(rgb != paper, axis=-1), 255, 0).astype(np.uint8)
+    rgb[:40] = 255
+    rgb[10:30, 16:60] = 0
+    mask[10:30, 16:60] = 255
+    lines = np.array([[[0, 0], [115, 0], [115, 40], [0, 40]],
+                      [[x-4, y-4], [right+4, y-4], [right+4, bottom+4], [x-4, bottom+4]]])
+    # Rotate the entire page and preserve the native clockwise quad order.
+    lines = np.stack((lines[..., 1], rgb.shape[1]-1-lines[..., 0]), axis=-1)
+    lines = np.roll(lines, -1, axis=1)
+    block = region(lines.copy())
+    rgb, mask = np.rot90(rgb), np.rot90(mask)
+    rgb.flags.writeable = mask.flags.writeable = False
+    with collect() as timings:
+        sample_colors(rgb, [block], mask)
+    np.testing.assert_allclose(block.fg_colors, ink, atol=8, rtol=0)
+    np.testing.assert_allclose(block.bg_colors, rim, atol=12, rtol=0)
+    np.testing.assert_array_equal(block.lines, lines)
+    assert block.texts == ['original OCR'] and timings['color_detail_regions'] == 1
+
+
+@pytest.mark.parametrize('shape,value', [((8, 12), 255), ((40, 180), 0), ((40, 180), 255)])
+def test_unusable_mask_falls_back_to_observed_pixels(shape, value):
+    rgb = np.full((40, 180, 3), (235, 243, 239), np.uint8)
+    rgb[5:35, 30:75] = (41, 99, 193)
+    block = region([[[0, 0], [179, 0], [179, 39], [0, 39]]])
+    sample_colors(rgb, [block], np.full(shape, value, np.uint8))
+    assert tuple(block.fg_colors) == (41, 99, 193) and tuple(block.bg_colors) == (235, 243, 239)
+
+
 def test_bad_geometry_falls_back_and_cancellation_stops_between_regions():
     blocks = [region([]), region([np.full((4, 2), np.nan)]), region([])]
     def stop():

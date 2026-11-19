@@ -1126,7 +1126,9 @@ def test_sampled_lettering_colors_survive_native_checkpoint(assets, fill, backgr
     x1, y1, x2, y2 = draw.textbbox((35, 30), 'PLAIN TEXT', font=font)
     quad = [[x1-4, y1-4], [x2+4, y1-4], [x2+4, y2+4], [x1-4, y2+4]]
     block = TextBlock([quad, quad], ['PLAIN TEXT', ''], language='en', adjust_bg_color=False)
-    sample_colors(np.asarray(image), [block])
+    rgb = np.asarray(image)
+    mask = np.any(rgb != background, axis=2).astype(np.uint8) * 255
+    sample_colors(rgb, [block], mask)
     restored = TextBlock(**serialize_region(block))
     assert restored.get_font_colors() == (fill, background)
     assert restored.texts == block.texts and np.array_equal(restored.lines, block.lines)
