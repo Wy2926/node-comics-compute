@@ -10,7 +10,7 @@ from PIL import Image
 import pytest
 
 from classic_node.config import execution_settings, load
-from mtu_engine.ocr.crops import line_context_boxes
+from mtu_engine.ocr.crops import line_context_boxes, paragraph_crop
 from mtu_engine.ocr.hayai import HayaiOCR, complete_texts
 
 
@@ -53,7 +53,8 @@ def test_direct_hayai_load_rejects_oversize_batches_before_loading_weights():
 
 
 def block(box, lines=1):
-    return SimpleNamespace(xyxy=box, lines=[object()] * lines)
+    l, t, r, b = box
+    return SimpleNamespace(xyxy=box, lines=[[(l, t), (r, t), (r, b), (l, b)]] * lines)
 
 
 def test_paragraph_batches_are_bounded_and_restore_geometry_order():
@@ -86,6 +87,35 @@ def test_line_context_stays_on_page_and_outside_neighboring_paragraphs():
 def test_short_vertical_context_cannot_read_another_line_or_expand_a_long_caption():
     boxes = [(10, 10, 30, 66), (12, 72, 32, 128), (70, 5, 90, 150)]
     assert line_context_boxes(boxes, [block(b) for b in boxes], range(3), 100, 160) == boxes
+
+
+@pytest.mark.parametrize('paper,crowded', [((255, 255, 255), False), ((25, 35, 45), False), ((25, 35, 45), True)])
+def test_overlapping_paragraph_crop_hides_only_foreign_ink_and_preserves_shared_pixels(paper, crowded):
+    from classic_node.protocol import MAX_REGIONS
+    page = np.full((44, 58, 3), paper, np.uint8)
+    outer, other = block((3, 2, 50, 42)), block((10, 15, 26, 20))
+    outer.lines = [block((3, 2, 14, 22)).lines[0], block((16, 30, 50, 42)).lines[0]]
+    page[16, 12] = 17  # Shared intersection stays with the source line.
+    page[16, 22] = 33  # Other paragraph inside the outer one's rectangular crop.
+    page.flags.writeable = False
+    blocks = [outer] + [other] * (MAX_REGIONS if crowded else 1)
+    boxes = [b.xyxy for b in blocks]
+    result = np.asarray(paragraph_crop(page, 0, boxes, blocks, range(len(blocks))))
+    assert result[14, 9, 0] == 17 and page[16, 22, 0] == 33
+    np.testing.assert_array_equal(result[14, 19], paper)
+    np.testing.assert_array_equal(result[22, 8], paper)
+    assert boxes[:2] == [outer.xyxy, other.xyxy]
+
+
+def test_horizontal_context_keeps_canvas_whitespace_but_excludes_an_undetected_next_row():
+    page = np.full((52, 110, 3), (20, 32, 40), np.uint8)
+    page[16:29, 28:49] = 242  # Detector clips the bottom three rows of the glyphs.
+    page[30:37, 28:49] = (250, 80, 90)
+    owner = block((20, 12, 92, 26))
+    boxes = line_context_boxes([owner.xyxy], [owner], [0], 110, 52)
+    crop = np.asarray(paragraph_crop(page, 0, boxes, [owner], [0]))
+    assert crop.shape == (42, 104, 3) and np.all(crop[28, 25] == 242)
+    assert np.all(crop[30:] == (20, 32, 40))
 
 
 def test_empty_paragraphs_cannot_authorize_erasure_and_count_mismatch_fails():

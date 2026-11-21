@@ -70,6 +70,8 @@ def resize_unscaled(image, blocks, config, original=None, mask=None):
 def _reserve_source_size(block, polygon, config, *, unscaled=False):
     from manga_translator import rendering as native
 
+    if polygon is None:
+        polygon = block.min_rect
     base = min(block.original_font_size, block.font_size) if unscaled else block.original_font_size
     maximum = native._apply_final_font_constraints(base, config)
     if block.font_size <= maximum:
@@ -168,17 +170,68 @@ def _neighbours(polygons, boxes, index, bounds):
     return [(polygons[i], None) for i in np.flatnonzero(nearby)]
 
 
+def _avoid_free_collision(block, polygon, config, reserved, boxes, index, width, height, *, last_pass):
+    from manga_translator.rendering import _layout_regions_conflict
+
+    def collides(points):
+        return _layout_regions_conflict(points, None, _neighbours(reserved, boxes, index, _bounds(points)))
+
+    if not collides(polygon):
+        return polygon
+    # Try the source center, then actual source lines; an empty corner may belong to a neighbour.
+    source = block.min_rect[0]
+    centers = [block.center, *(np.mean(block.lines[i], axis=0) for i in
+               dict.fromkeys((0, len(block.lines) // 2, len(block.lines) - 1))),
+               *((source + block.center) / 2)]
+    # Tight, overlapping source boxes may need a one-character nudge off the baseline.
+    step = min(block.original_font_size, *block.unrotated_size)
+    centers.extend(block.center + step * np.array(offset) for offset in ((-1, 0), (1, 0), (0, -1), (0, 1)))
+    select_region(block, config)
+    best = fallback = None
+    least_overlap = float('inf')
+    lo, hi = 1, int(block.font_size)
+    size = hi
+    while lo <= hi:
+        measured = polygon if size == block.font_size else _points_at(block, size, config)
+        placement = None
+        if measured is not None:
+            for center in centers:
+                candidate = measured + (center - block.center)
+                if not ((candidate >= (1, 1)).all() and (candidate <= (width - 1, height - 1)).all()):
+                    continue
+                if not collides(candidate):
+                    placement = size, center, candidate
+                    break
+                if last_pass and size == block.font_size:
+                    # If no size clears, keep the fitted size at the least-covered local position.
+                    bounds = _bounds(candidate)
+                    shared = np.minimum(boxes[:, 2:], bounds[2:]) - np.maximum(boxes[:, :2], bounds[:2])
+                    shared[index] = 0
+                    area = np.maximum(shared, 0).prod(axis=1).sum()
+                    if area < least_overlap:
+                        least_overlap, fallback = area, (size, center, candidate)
+        if placement is None:
+            hi = size - 1
+        else:
+            best = placement
+            lo = size + 1
+        size = (lo + hi) // 2
+    best = best or fallback
+    if best is None:
+        return polygon if last_pass else None
+    block.font_size, block.center, polygon = best
+    return polygon
+
+
 def fit_source_boxes(image, blocks, texts, config, occupied):
     from manga_translator import rendering as native
 
     points = native.resize_regions_to_font_size(image, blocks, config, None, skip_text_replacements=True)
     points = [_reserve_source_size(b, p, config) for b, p in zip(blocks, points)]
-    reserved = [b.min_rect if p is None else p for b, p in zip(blocks, points)] + occupied
+    reserved = points + occupied
     boxes = np.array([_bounds(p) for p in reserved])
     height, width = image.shape[:2]
     for i, (block, text, polygon) in enumerate(zip(blocks, texts, points)):
-        if polygon is None:
-            continue
         obstacles = _neighbours(reserved, boxes, i, _bounds(block.min_rect))
         block, polygon = _grow_in_source_box(block, text, polygon, image.shape, config, obstacles)
         bounds = _bounds(polygon)
@@ -200,6 +253,25 @@ def fit_source_boxes(image, blocks, texts, config, occupied):
             bounds = _bounds(polygon)
         blocks[i], boxes[i] = block, bounds
         points[i] = reserved[i] = polygon
+    if len(blocks) > 1:
+        # Balloon source boxes were growth hints; their final layout will reserve these free polygons.
+        reserved, boxes = reserved[:len(blocks)], boxes[:len(blocks)]
+        # Move the paragraph spanning several neighbours before shrinking those neighbours.
+        area = (boxes[:, 2:] - boxes[:, :2]).prod(axis=1)
+        pending = np.argsort(-area, kind='stable')
+        for last_pass in (False, True):  # A pending neighbour may vacate this source box on the first pass.
+            blocked = []
+            for i in pending:
+                candidate = _avoid_free_collision(blocks[i], points[i], config, reserved, boxes, i, width, height,
+                                                  last_pass=last_pass)
+                if candidate is None:
+                    blocked.append(i)
+                else:
+                    points[i] = reserved[i] = candidate
+                    boxes[i] = _bounds(candidate)
+            if not blocked:
+                break
+            pending = blocked
     return points
 
 

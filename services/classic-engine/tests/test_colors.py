@@ -134,6 +134,24 @@ def test_bad_geometry_falls_back_and_cancellation_stops_between_regions():
     assert not hasattr(blocks[-1], 'fg_colors')
 
 
+@pytest.mark.parametrize('ink,rim', [
+    ((239, 115, 55), (15, 18, 25)), ((248, 205, 100), (130, 40, 88)),
+    ((210, 100, 140), (150, 75, 95)), ((120, 180, 245), (90, 137, 185)),
+])
+def test_colored_ink_inside_a_thick_nonwhite_outline(ink, rim):
+    from PIL import Image, ImageDraw, ImageFont
+    paper = (239, 229, 205)
+    image = Image.new('RGB', (340, 88), paper)
+    draw, font = ImageDraw.Draw(image), ImageFont.load_default(size=32)
+    draw.text((16, 10), 'BIG MOMENT', font=font, fill=ink, stroke_fill=rim, stroke_width=6)
+    x, y, r, b = draw.textbbox((16, 10), 'BIG MOMENT', font=font, stroke_width=6)
+    paragraph = region([[[x-2, y-3], [r+3, y-3], [r+3, b+3], [x-2, b+3]]])
+    rgb = np.asarray(image)
+    sample_colors(rgb, [paragraph], np.uint8(np.any(rgb != paper, axis=2)) * 255)
+    np.testing.assert_allclose(paragraph.fg_colors, ink, atol=12, rtol=0)
+    np.testing.assert_allclose(paragraph.bg_colors, rim, atol=12, rtol=0)
+
+
 def test_color_checkpoint_preserves_prediction_until_rendering():
     block = SimpleNamespace(lines=np.zeros((1, 4, 2)), texts=['source'], font_size=36,
         angle=0, fg_colors=np.array([210, 40, 60]), bg_colors=np.array([120, 120, 120]),
@@ -172,3 +190,21 @@ def test_render_color_guard_preserves_fill_and_only_fixes_low_contrast(fg, bg, e
         np.testing.assert_array_equal(block.fg_colors, fg)
         np.testing.assert_array_equal(block.bg_colors, expected)
         assert not block.adjust_bg_color and block.default_stroke_width == .1
+
+
+@pytest.mark.parametrize('fg,bg,lighter', [
+    ((244, 204, 219), (226, 117, 154), False),
+    ((86, 52, 93), (141, 83, 147), True),
+    ((241, 172, 202), (242, 195, 247), False),  # White cannot reach 3:1; darken the outline.
+])
+def test_distinct_tinted_outline_keeps_its_color_at_render_contrast(fg, bg, lighter):
+    from mtu_engine.colors import _luminance
+    block = SimpleNamespace(fg_colors=fg, bg_colors=bg)
+    ensure_stroke_contrast(block)
+    stroke = np.asarray(block.bg_colors)
+    low, high = sorted((_luminance(fg), _luminance(stroke)))
+    assert (high + .05) / (low + .05) >= 3
+    assert np.ptp(stroke) > 0 and np.all(stroke >= bg if lighter else stroke <= bg)
+    assert block.fg_colors == fg
+    ensure_stroke_contrast(block)
+    np.testing.assert_array_equal(block.bg_colors, stroke)

@@ -102,7 +102,7 @@ class Renderer:
                bubble_prepared=False, bubble_components=None, font_id=None):
         from manga_translator.config import Direction
         from manga_translator.utils import TextBlock, erode_bubble_mask
-        from manga_translator.rendering.rich_text import legacy_line_breaks_to_document
+        from manga_translator.rendering.rich_text import legacy_line_breaks_to_document, normalize_rich_linebreaks
         config = configuration()
         target = LANGUAGES[language]
         config.translator.target_lang = target
@@ -118,7 +118,7 @@ class Renderer:
             config.render.bubble_layout_english = language != 'en'
         blocks = []
         for data, text in zip(regions, translations):
-            if not text.strip():
+            if not normalize_rich_linebreaks(text).strip():
                 continue
             block = TextBlock(**data)
             block.bubble_enclosed = data.get('bubble_enclosed')
@@ -161,7 +161,6 @@ class Renderer:
                 # Reuse the same native 2% inset and labels as solid-fill.
                 labels = cached_bubble_labels(bubble_mask)
             for block in blocks:
-                # Also retain the source scale for break-only paragraphs that MTU skips measuring.
                 block.original_font_size = _resolve_initial_layout_font_size(block, cleaned, config)
                 # Ownership uses the original mask, not its inset for padding.
                 # Legacy/direct prepared inputs without metadata stay strict.

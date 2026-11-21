@@ -29,7 +29,29 @@ def ensure_stroke_contrast(region):
     if (max(foreground, background) + 0.05) / (min(foreground, background) + 0.05) < 3:
         black_contrast = (foreground + 0.05) / 0.05
         white_contrast = 1.05 / (foreground + 0.05)
-        region.bg_colors = np.full(3, 0 if black_contrast >= white_contrast else 255)
+        end = 0 if black_contrast >= white_contrast else 255
+        ink, stroke = [tuple(map(int, c)) for c in (region.fg_colors, region.bg_colors)]
+        if (min(max(c) - min(c) for c in (ink, stroke)) > 22
+                and max(abs(a - b) for a, b in zip(ink, stroke)) >= 24):
+            # Keep a distinct tint on its original side of the fill when that side can reach 3:1.
+            if background > foreground and white_contrast >= 3:
+                end = 255
+            elif background < foreground and black_contrast >= 3:
+                end = 0
+            def shade(t):
+                return [(v * (255 - t) + end * t + 127) // 255 for v in stroke]
+
+            lo, hi = 0, 255
+            while lo < hi:
+                t = (lo + hi) // 2
+                dark, light = sorted((foreground, _luminance(shade(t))))
+                if light + .05 >= 3 * (dark + .05):
+                    hi = t
+                else:
+                    lo = t + 1
+            region.bg_colors = np.array(shade(lo))
+        else:
+            region.bg_colors = np.full(3, end)
     # Prevent upstream's gray-color heuristic from overriding this decision or
     # dropping the outline. This also covers older checkpoints without a flag.
     region.adjust_bg_color = False
@@ -104,31 +126,63 @@ def _masked(rgb, raw, quad, probe):
     return fill, paper
 
 
-def _white_outline(rgb, quad, fraction):
-    # Sample a few glyphs at their original aspect; a whole long line would collapse thin outlines.
-    segment = quad.copy()
-    segment[[1, 2]] = quad[[0, 3]] + fraction * (quad[[1, 2]] - quad[[0, 3]])
-    y, x = _points(rgb, segment, _OUTLINE)
-    crop = rgb[y, x].reshape(32, 96, 3)
-    white = cv2.inRange(crop, (220,) * 3, _WHITE)
-    if not white.size // 8 < cv2.countNonZero(white) < 3 * white.size // 4:
+def _enclosed_ink(crop, rim):
+    if not rim.size // 12 < cv2.countNonZero(rim) < 3 * rim.size // 4:
         return None
-    ring = cv2.copyMakeBorder(white, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    ring = cv2.copyMakeBorder(rim, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
     cv2.floodFill(ring, None, (0, 0), 128)
     ring = ring[1:-1, 1:-1]
     inside = cv2.erode(np.uint8(ring == 0), cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))) != 0
     outside = ring == 128
-    if inside.sum() < white.size // 100 or outside.sum() < white.size // 8:
+    if inside.sum() < rim.size // 100 or outside.sum() < rim.size // 8:
         return None
     pixels = crop[inside]
     ink = np.median(pixels, axis=0)
-    # Counters in ordinary white letters enclose the page rather than ink.
+    # Counters in ordinary letters enclose the page rather than ink.
     if (np.max(np.median(np.abs(pixels - ink), axis=0)) > 24
             or np.max(np.abs(ink - np.median(crop[outside], axis=0))) < 24):
         return None
-    stroke = np.median(crop[ring == 255], axis=0)
-    if _luminance(stroke) + .05 >= 3 * (_luminance(ink) + .05):
-        return ink, stroke
+    return ink, np.median(crop[ring == 255], axis=0)
+
+
+def _outline_colors(rgb, raw, quad, fraction, white):
+    # Preserve glyph thickness on a fixed grid rather than squeezing a whole long line.
+    segment = quad.copy()
+    segment[[1, 2]] = quad[[0, 3]] + fraction * (quad[[1, 2]] - quad[[0, 3]])
+    y, x = _points(rgb, segment, _OUTLINE)
+    crop = rgb[y, x].reshape(32, 96, 3)
+    if white:
+        result = _enclosed_ink(crop, cv2.inRange(crop, (220,) * 3, _WHITE))
+        if result is not None:
+            return result
+    # CTD ranks colors inside its stroke mask. Use joint RGB bins so channels stay paired.
+    support = raw[y, x]
+    samples = crop.reshape(-1, 3)
+    inside, outside = support >= 128, support < 64
+    ink, paper = samples[inside], samples[outside]
+    if len(ink) < 32 or len(paper) < 80:
+        return None
+    r, g, b = (ink.astype(np.int32) >> 4).T
+    counts = np.bincount((r << 8) + (g << 4) + b, minlength=4096)
+    for _ in range(2):
+        index = int(counts.argmax())
+        if counts[index] < len(ink) // 12:
+            break
+        bins = (index >> 8, index >> 4 & 15, index & 15)
+        peak = np.array(bins) * 16 + 8
+        rim = cv2.inRange(crop, peak - 30, peak + 30)
+        matches = rim.ravel()
+        # A color covering most of the outside edges must also prefer the detected strokes.
+        covers_edges = np.count_nonzero(rim[[0, -1]]) >= rim.shape[1]
+        if not covers_edges or np.mean(matches[inside]) > np.mean(matches[outside]):
+            result = _enclosed_ink(crop, rim)
+            if result is not None:
+                fill, stroke = result
+                distance = np.abs(paper - fill).max(axis=1)
+                separation = max(32, .18 * np.max(np.abs(fill - stroke)))
+                if np.mean(distance < 32) < 1 / 3 and np.max(np.abs(np.median(paper, axis=0) - fill)) >= separation:
+                    return result
+        counts.reshape(16, 16, 16)[tuple(slice(max(0, i - 2), i + 3) for i in bins)] = 0
     return None
 
 
@@ -156,7 +210,10 @@ def _region_colors(rgb, raw, lines):
         return _simple(pixels), False
     if colored < 3:
         pair = _gray(pixels, mask)
-        if pair[0][0] < 220:
+        if pair[0][0] >= 220:
+            if np.count_nonzero((mask >= 128) & (pixels[:, 1] < 200)) < 3:
+                return pair, False
+        elif pixels[:, 1].max() <= pair[1][0] + 32 or mask.max() < 128:
             return pair, False
     elif mask.max() < 128:
         return _simple(pixels), False
@@ -167,10 +224,8 @@ def _region_colors(rgb, raw, lines):
         long_sq, short_sq = short_sq, long_sq
     if colored >= 3:
         pair = _masked(rgb, raw, quad, pixels)
-    if min(pair[0]) >= 220 and np.count_nonzero((mask >= 128) & (pixels.min(axis=1) < 200)) >= 3:
-        fraction = min(1., 3 * np.sqrt(short_sq / max(1., long_sq)))
-        return _white_outline(rgb, quad, fraction) or pair, True
-    return pair, colored >= 3
+    fraction = min(1., 3 * np.sqrt(short_sq / max(1., long_sq)))
+    return _outline_colors(rgb, raw, quad, fraction, min(pair[0]) >= 220) or pair, True
 
 
 def sample_colors(rgb, regions, raw=None):

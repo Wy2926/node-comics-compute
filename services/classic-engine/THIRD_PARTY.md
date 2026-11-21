@@ -12,10 +12,11 @@ at revision `f5f0f617f5148f760074f743e25576f381992c34` (Apache-2.0).
 Its original FP32 `model.safetensors` is 633,564,960 bytes, SHA-256
 `a531fc49ff0ec978f0c1eb377d853bdbe9a400559afc1d15de53d1e1bf4767b1`.
 Preprocessing uses Supernova's `HayaiImageProcessor` with a fixed budget of 256 patches per crop.
-For isolated horizontal lines at least twice as wide as tall, OCR can read one extra 16 px
-patch on each side. Short vertical lines (2–4 character widths tall) can read one character width
+For isolated horizontal lines at least twice as wide as tall, OCR can read up to 16 px at
+the left and right ends. Vertical padding retains edge strokes up to the first paper-colored row, then uses the sampled paper color to preserve word spacing without including the next text line. Short vertical lines (2–4 character widths tall) can read one character width
 at either end, up to 32 px, to recover clipped glyphs without moving the source geometry.
 It keeps tight crops when a neighbor would enter the crop or more than 200 regions need OCR.
+Like [PaddleOCR's quad crops](https://github.com/PaddlePaddle/PaddleOCR/blob/release/2.7/tools/infer/utility.py), recognition honors line geometry. Hayai still reads a whole paragraph: foreign polygons in intersecting crops are filled with the local edge color, with the paragraph's own pixels taking precedence. Above the neighbor budget only owned polygons are exposed. Neither operation changes the source or repair mask.
 The [SigLIP2 NaFlex vision config](https://huggingface.co/google/siglip2-base-patch16-naflex)
 is pinned at `b53b807d3a2d5e2b3911292f2d69e5341cdc064c` (Apache-2.0);
 its weights are already included in the Hayai checkpoint and are not downloaded again.
@@ -79,7 +80,7 @@ The lock also records the DBNet checkpoint from [manga-image-translator](https:/
 
 On NVIDIA, explicit FP16 DBNet inference stores the folded convolution weights in PyTorch's `channels_last` format at load time to match the existing NHWC-backed image tensors. Checkpoint files and the FP32 path are unchanged.
 
-The node's [RGB sampler](mtu_engine/colors.py) sets fill and outline via MTU's `TextBlock.set_font_colors`. It reuses DBNet's existing stroke mask. Near-gray regions use a sparse NumPy probe; color regions use OpenCV's CPU distance transform on one small grid. When a near-white fill has dark detected pixels, a 96×32 line segment distinguishes ink enclosed by a white outline from background enclosed by a white letter. All backends share this path; no color weights or additional inference are required.
+The node's [RGB sampler](mtu_engine/colors.py) sets fill and outline via MTU's `TextBlock.set_font_colors`. It uses DBNet's existing stroke mask. Near-gray lines start with a sparse probe. For color or ambiguous polarity, a 96×32 line segment tests closed outlines. Inspired by the pinned [CTD masked histogram](https://github.com/hgmzhn/manga-translator-ui/blob/a1ad823b0d679d1a0665b8bc94de7e8a1c38e54d/manga_translator/detection/ctd_utils/textmask.py), at most two distinct joint-RGB peaks are considered in addition to white. Ink must be consistent and distinguishable from the page; ambiguous results keep the existing estimate. This avoids MTU's separate 48px OCR/color inference on every backend.
 
 The LaMa adapter in [inpainting.py](mtu_engine/inpainting.py) wraps the pinned
 upstream FP32 generator with PyTorch CUDA/HIP graphs, captured only during startup for
@@ -92,7 +93,7 @@ event; HIP synchronizes before releasing the lock. Unsupported shapes stay eager
 
 ## BallonsTranslator
 
-[dmMaze/BallonsTranslator](https://github.com/dmMaze/BallonsTranslator) supplies `group_output` paragraph grouping and reading order for MTU DBNet lines. Preparation retains its pinned source, resources, `BallonsTranslator-LICENSE` and dependency manifest. One [locked edit](mtu_engine/upstream.lock.json) adds an alignment check to `try_merge_textline`: even when adjacent upright columns overlap in height, their tops, bottoms or midpoints must align within 1.5 character widths before joining. This uses MTU's alignment principle without running a second detector or a page-wide graph. Intersecting lines, rotated text and horizontal grouping keep their existing rules.
+[dmMaze/BallonsTranslator](https://github.com/dmMaze/BallonsTranslator) supplies `group_output` and reading order for MTU DBNet lines. Preparation retains its pinned source, resources, `BallonsTranslator-LICENSE` and dependency manifest. A [locked edit](mtu_engine/upstream.lock.json) calls [grouping.py](mtu_engine/grouping.py) at the merge and containment decisions. Following [MTU's geometric merge](https://github.com/hgmzhn/manga-translator-ui/blob/a1ad823b0d679d1a0665b8bc94de7e8a1c38e54d/manga_translator/textline_merge/__init__.py), gap and alignment are measured in character widths along the lines' common axes. Bounding-box containment alone cannot discard a line. The node retains the local grouping pass instead of building a second page-wide graph.
 
 ## Runtime and data
 

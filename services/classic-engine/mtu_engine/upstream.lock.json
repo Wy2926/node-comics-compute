@@ -357,8 +357,24 @@
     "patches": {
       "ballontranslator/utils/textblock.py": [
         {
-          "before": "            if abs(distance_y) / min(h1, h2) < 0.4:\n                return False\n",
-          "after": "            if abs(distance_y) / min(h1, h2) < 0.4:\n                return False\n            # Node Comics: staggered captions and short asides can overlap without sharing a paragraph.\n            if abs(blk.angle) < 15 and abs(blk2.angle) < 15:\n                tolerance = 1.5 * min(blk.font_size, blk2.font_size)\n                if min(abs(xyxy1[1] - xyxy2[1]), abs(xyxy1[3] - xyxy2[3]),\n                       abs((xyxy1[1] + xyxy1[3]) - (xyxy2[1] + xyxy2[3])) / 2) > tolerance:\n                    return False\n"
+          "before": "def try_merge_textline(blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distance_tol=2, canvas=None) -> bool:\n",
+          "after": "from mtu_engine.grouping import adjacent_lines, covered_lines\n\n\ndef try_merge_textline(blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distance_tol=2, canvas=None) -> bool:\n"
+        },
+        {
+          "before": "    fntsize_div = blk.font_size / blk2.font_size\n",
+          "after": "    similar_size = max(blk.font_size, blk2.font_size) <= fntsize_tol * min(blk.font_size, blk2.font_size)\n    if not adjacent_lines(blk.lines, blk2.lines[0], blk.vertical, similar_size):\n        return False\n"
+        },
+        {
+          "before": "    vec_prod = blk.vec @ blk2.vec\n    vec_sum = blk.vec + blk2.vec\n    cos_vec = vec_prod / blk.norm / blk2.norm\n",
+          "after": "    vec_sum = blk.vec + blk2.vec\n"
+        },
+        {
+          "before": "    minrect1 = blk.min_rect(ids=[-1])[0]\n    xyxy1 = [*minrect1[0], *minrect1[2]]\n    minrect2 = blk2.min_rect(ids=[0])[0]\n    xyxy2 = [*minrect2[0], *minrect2[2]]\n    distance_x = max(xyxy1[0], xyxy2[0]) - min(xyxy1[2], xyxy2[2])\n    distance_y = max(xyxy1[1], xyxy2[1]) - min(xyxy1[3], xyxy2[3])\n    w1 = xyxy1[2] - xyxy1[0]\n    w2 = xyxy2[2] - xyxy2[0]\n    h1 = xyxy1[3] - xyxy1[1]\n    h2 = xyxy2[3] - xyxy2[1] \n\n    l1, l2 = Polygon(blk.lines[-1]), Polygon(blk2.lines[0])\n    if not l1.intersects(l2):\n        if blk.vertical:\n            if distance_y > 0:\n                return False\n            if distance_x > fntsz_avg * 0.8:\n                return False\n            if abs(distance_y) / min(h1, h2) < 0.4:\n                return False\n        else:\n            if distance_x > 0:\n                return False\n            fntsz_thr = 0.5\n            if fntsz_avg < 24:\n                fntsz_thr = 0.6\n            if distance_y > fntsz_avg * fntsz_thr:\n                return False\n            if abs(distance_x) / min(w1, w2) < 0.3:\n                return False\n        if fntsize_div > fntsize_tol or 1 / fntsize_div > fntsize_tol:\n            return False\n        if abs(cos_vec) < 0.866:   # cos30\n            return False\n",
+          "after": ""
+        },
+        {
+          "before": "                if inter_area / aarea > 0.9:\n",
+          "after": "                if inter_area / aarea > 0.9 and covered_lines(blk.lines, eb.lines):\n"
         }
       ]
     }

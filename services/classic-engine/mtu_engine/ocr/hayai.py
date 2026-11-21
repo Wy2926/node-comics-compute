@@ -10,7 +10,7 @@ from PIL import Image
 from classic_node.timing import record, stage, waiting_for
 from mtu_engine.backend import CUDA_GRAPH_MIN_FREE, check_cancelled, device_context
 from . import Reading
-from .crops import line_context_boxes, paragraph_box
+from .crops import line_context_boxes, paragraph_box, paragraph_crop
 from .models import verify_hayai
 
 MAX_PATCHES = 256
@@ -121,7 +121,7 @@ class HayaiOCR:
                 check_cancelled()
                 owners = indices[offset:offset + self.batch_size]
                 with stage('ocr_crop'):
-                    crops = [Image.fromarray(image[t:b, l:r]) for l, t, r, b in (boxes[i] for i in owners)]
+                    crops = [paragraph_crop(image, i, boxes, blocks, indices) for i in owners]
                 for i, text in zip(owners, self._recognize(crops), strict=True):
                     results[i] = Reading([text] + [''] * (len(blocks[i].lines) - 1))
         return results

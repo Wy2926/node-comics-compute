@@ -20,7 +20,8 @@ def test_cancelled_hayai_stops_before_next_crop_batch():
     ocr.batch_size = 2
     calls = []
     ocr._recognize = lambda crops: calls.append(len(crops)) or ['read'] * len(crops)
-    blocks = [SimpleNamespace(xyxy=(0, 0, 20, 20), lines=[None]) for _ in range(5)]
+    blocks = [SimpleNamespace(xyxy=(0, 0, 20, 20), lines=[[(0, 0), (20, 0), (20, 20), (0, 20)]])
+              for _ in range(5)]
     def check():
         if calls:
             raise NodeFailure('LEASE_STOPPED')

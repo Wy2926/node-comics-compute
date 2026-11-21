@@ -487,6 +487,32 @@ def test_staggered_vertical_captions_keep_reading_order_and_the_short_aside(asse
         assert groups([column(132, top, bottom), columns[0]]) == [[160, 132]]
 
 
+@pytest.mark.parametrize('angle', [-20, 0, 20])
+def test_rotated_captions_keep_their_two_groups_and_internal_reading_order(assets, angle):
+    import cv2
+    Renderer(*assets)
+    from ballontranslator.utils.textblock import group_output
+    q = [np.array([[x, y], [x+20, y], [x+20, y+h], [x, y+h]]) for x, y, h in
+         [(185, 35, 160), (161, 36, 185), (137, 34, 150),
+          (103, 114, 130), (79, 116, 116), (55, 115, 65)]]
+    rotation = cv2.getRotationMatrix2D((140, 140), angle, 1)
+    lines = [np.rint(np.c_[line, np.ones(4)] @ rotation.T).astype(int) for line in q]
+    ids = {tuple(sorted(map(tuple, line))): i for i, line in enumerate(lines)}
+    groups = [[ids[tuple(sorted(map(tuple, line)))] for line in block.lines]
+              for block in group_output([], lines[::-1], 300, 300)]
+    assert sorted(groups) == [[0, 1, 2], [3, 4, 5]]
+
+
+def test_empty_corner_of_a_group_is_not_a_duplicate_detection():
+    from mtu_engine.grouping import adjacent_lines, covered_lines
+    def quad(x, y, w, h):
+        return [[x, y], [x+w, y], [x+w, y+h], [x, y+h]]
+    outer = [quad(80, 20, 70, 20), quad(0, 45, 150, 20)]
+    assert not covered_lines([quad(8, 22, 28, 15)], outer)
+    assert covered_lines([quad(85, 20, 55, 18)], outer)
+    assert not adjacent_lines(outer, quad(0, 68, 40, 20), False, True)
+
+
 @pytest.mark.parametrize('horizontal', [False, True])
 @pytest.mark.parametrize('font_size', [18, 26])
 def test_long_page_cross_seam_lines_are_complete_without_duplicate_ocr(assets, offline, monkeypatch,
@@ -1101,6 +1127,7 @@ def test_qt_mask_optimization_preserves_pixels_and_layout(bubble_layout, monkeyp
     (True, True, True, [255, 255, 255], [240, 240, 240], [0, 0, 0]),
     (True, False, False, [245, 245, 245], [20, 40, 130], [20, 40, 130]),
     (False, False, True, [210, 40, 60], [205, 38, 58], [255, 255, 255]),
+    (False, True, False, [244, 204, 219], [226, 117, 154], [180, 93, 123]),
 ])
 def test_qt_guards_stroke_contrast_after_checkpoint_restore(
         assets, offline, enclosed, matching_background, adjust, fg, bg, stroke):
@@ -1635,6 +1662,80 @@ def test_free_short_word_grows_within_its_source_box(bubble_layout, overlapping_
     assert 45 <= ink_y.min() <= ink_y.max() <= 130
 
 
+@pytest.mark.parametrize('reverse', [False, True])
+def test_free_baselines_reserve_neighbouring_ink_before_paint(bubble_layout, reverse):
+    from manga_translator.utils import TextBlock
+    renderer, observed, native = bubble_layout
+    page = np.full((320, 360, 3), 246, np.uint8)
+    def box(l, t, r, b):
+        return [[l, t], [r, t], [r, b], [l, b]]
+    groups = [([box(90, 50, 278, 98), box(145, 172, 266, 223)], '我们可以走这条路。', 42),
+              ([box(97, 108, 170, 154)], '不行', 36)]
+    if reverse:
+        groups.reverse()
+    regions = [serialize_region(TextBlock(lines, ['source'] * len(lines), font_size=size, direction='h'))
+               for lines, _, size in groups]
+    renderer.render(page, page, regions, [t for _, t, _ in groups], 'zh-Hans', None)
+    assert all(b.font_size >= 12 for b in observed)
+    assert not native._polygons_overlap(observed[0].dst_points, observed[1].dst_points)
+    assert [b.lines.tolist() for b in observed] == [r['lines'] for r in regions]
+
+
+def test_unplaceable_free_translations_still_reach_the_finished_page(bubble_layout):
+    from io import BytesIO
+    from PIL import Image
+    from classic_node.render_pool import render_page
+    from manga_translator.utils import TextBlock
+    renderer, observed, _ = bubble_layout
+    page = np.full((96, 96, 3), 240, np.uint8)
+    region = serialize_region(TextBlock([[[35, 35], [36, 35], [36, 36], [35, 36]]],
+                                         ['.'], font_size=1, direction='h'))
+    other = serialize_region(TextBlock([[[24, 57], [80, 57], [80, 82], [24, 82]]],
+                                        ['source'], font_size=16, direction='h'))
+    expected = renderer.render(page, page, [other], ['OK'], 'en', None)
+    observed.clear()
+    regions = [dict(region, fg_color=color) for color in ([200, 20, 20], [20, 20, 200])] + [other]
+    packet = render_page(renderer, page, page, regions, ['M', 'N', 'OK'], 'en', None, alpha=None,
+                         version='test', analysis={}, translated={}, full_image_max_bytes=64 * 1024)
+    assert packet['result']['representation'] == 'full-image'
+    with Image.open(BytesIO(packet['output_bytes'])) as png:
+        pixels = np.array(png.convert('RGB'))
+    assert [b.translation for b in observed] == ['M', 'N', 'OK']
+    red, blue = pixels[:48, :, 0], pixels[:48, :, 2]
+    assert (red > blue).any() and (blue > red).any()
+    assert np.any(expected[48:] != page[48:]) and np.all(page == 240)
+    np.testing.assert_array_equal(pixels[48:], expected[48:])
+
+
+@pytest.mark.parametrize('enclosed', [False, True])
+def test_missing_layout_measurement_still_paints_at_the_source(bubble_layout, monkeypatch, enclosed):
+    from manga_translator.utils import TextBlock
+    renderer, observed, native = bubble_layout
+    page = np.full((100, 160, 3), 240, np.uint8)
+    region = serialize_region(TextBlock([[[45, 25], [115, 25], [115, 75], [45, 75]]],
+        ['source'], font_size=15, direction='h'))
+    monkeypatch.setattr(native, 'resize_regions_to_font_size', lambda image, blocks, *a, **kw: [None] * len(blocks))
+    monkeypatch.setattr(native, '_calc_region_dst_points_for_font', lambda *a, **kw: None)
+    mask = np.full(page.shape[:2], 255, np.uint8) if enclosed else None
+    result = renderer.render(page, page, [region], ['好[BR]呀'], 'zh-Hans', mask)
+    assert np.any(result[25:75, 45:115] != page[25:75, 45:115])
+    assert observed[0].translation == '好[BR]呀' and np.all(page == 240)
+
+
+def test_free_replies_can_slide_one_character_to_clear_overlapping_source_boxes(bubble_layout):
+    from manga_translator.utils import TextBlock
+    renderer, observed, native = bubble_layout
+    page = np.full((140, 160, 3), 242, np.uint8)
+    regions = [serialize_region(TextBlock([[[x, 55], [x+18, 55], [x+18, 73], [x, 73]]],
+        ['source'], font_size=18, direction='h')) for x in (65, 69)]
+    renderer.render(page, page, regions, ['M', 'N'], 'en', None)
+    assert len(observed) == 2 and min(b.font_size for b in observed) >= 8
+    assert not native._polygons_overlap(observed[0].dst_points, observed[1].dst_points)
+    for block, r in zip(observed, regions):
+        source = np.mean(r['lines'][0], axis=0)
+        assert np.linalg.norm(block.center - source) <= r['font_size'] + 1
+
+
 def test_roomy_balloon_keeps_the_source_type_hierarchy(bubble_layout):
     from manga_translator.utils import TextBlock
     renderer, observed, _ = bubble_layout
@@ -1650,14 +1751,19 @@ def test_roomy_balloon_keeps_the_source_type_hierarchy(bubble_layout):
             assert source_size <= size <= source_size + 4
 
 
-def test_break_only_reply_leaves_the_cleaned_page_visible(bubble_layout):
+@pytest.mark.parametrize('language,reply', [('en', 'Hello'), ('zh-Hans', '好')])
+def test_break_only_reply_does_not_reserve_space_for_invisible_ink(bubble_layout, language, reply):
     from manga_translator.utils import TextBlock
     renderer, _, _ = bubble_layout
     image = np.full((100, 140, 3), 255, np.uint8)
     region = serialize_region(TextBlock([[[35, 35], [95, 35], [95, 65], [35, 65]]],
         ['source'], font_size=12, direction='h'))
     for mask in (None, np.full(image.shape[:2], 255, np.uint8)):
-        np.testing.assert_array_equal(renderer.render(image, image, [region], ['[BR]'], 'en', mask), image)
+        blank = ' [bR]【BR】\n<br /> '
+        expected = renderer.render(image, image, [region], [reply], language, mask)
+        mixed = renderer.render(image, image, [region, region], [blank, reply], language, mask)
+        np.testing.assert_array_equal(mixed, expected)
+        np.testing.assert_array_equal(renderer.render(image, image, [region], [blank], language, mask), image)
 
 
 def test_roomy_bubble_can_move_a_short_reply_off_the_source_edge(bubble_layout, monkeypatch):
