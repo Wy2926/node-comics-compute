@@ -58,19 +58,19 @@ def test_hayai_prepares_next_page_outside_model_lock_and_keeps_results_local(mon
             assert self.kind == 'pixels', 'Native metadata should stay on CPU'
             return self
 
-    def processor(*, images, max_num_patches, return_tensors):
-        assert max_num_patches == MAX_PATCHES and return_tensors == 'pt'
+    def processor(*, images, max_patches, return_tensors):
+        assert max_patches == 256 and return_tensors == 'pt'
         if images[0] == 22:
             assert lock.locked()
             prepared.set()
-        return {'pixel_values': Tensor(images[0], 'pixels'),
+        return {'valid_indices': [0], 'pixel_values': Tensor(images[0], 'pixels'),
                 'pixel_attention_mask': Tensor(1, 'mask'), 'spatial_shapes': Tensor(2, 'shapes')}
 
-    def run(**kwargs):
+    def run(*, pixel_values, pixel_attention_mask, spatial_shapes, bos, eos, pad, max_new, use_graph):
         assert lock.locked()
-        assert kwargs['max_new'] == MAX_TOKENS
-        assert kwargs['use_graph'] is (backend != 'mps')
-        value = kwargs['pixel_values'].value
+        assert max_new == MAX_TOKENS
+        assert use_graph is (backend != 'mps')
+        value = pixel_values.value
         calls.append(value)
         if value == 11:
             entered.set()
@@ -207,6 +207,7 @@ def test_graph_lru_recaptures_evicted_shape_and_preserves_text(monkeypatch):
         ocr = HayaiOCR(model, backend=backend, batch_size=8)
         try:
             assert ocr.engine.MAX_STATES == capacity and ocr.identity['decoder_graph'] is graph
+            assert ocr.identity['max_num_patches'] == MAX_PATCHES == 256
             outputs.append([ocr._recognize([image] * n) for n in range(1, 6)])
             with collect() as timings:
                 assert ocr._recognize([image]) == outputs[-1][0]

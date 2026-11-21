@@ -10,6 +10,7 @@ from PIL import Image
 import pytest
 
 from classic_node.config import execution_settings, load
+from mtu_engine.ocr.crops import line_context_boxes
 from mtu_engine.ocr.hayai import HayaiOCR, complete_texts
 
 
@@ -70,6 +71,23 @@ def test_paragraph_batches_are_bounded_and_restore_geometry_order():
     assert regions[0].xyxy == (0, 0, 20, 20) and len(regions[0].lines) == 3
 
 
+def test_line_context_stays_on_page_and_outside_neighboring_paragraphs():
+    from classic_node.protocol import MAX_REGIONS
+    boxes = [(4, 3, 68, 15), (10, 60, 75, 76), (80, 69, 100, 80),
+             (120, 20, 135, 75), (20, 120, 100, 135), (130, 175, 188, 197)]
+    blocks = [block(box, 2 if i == 4 else 1) for i, box in enumerate(boxes)]
+    crops = line_context_boxes(boxes, blocks, range(len(boxes)), 200, 200)
+    assert crops == [(0, 0, 84, 31), *boxes[1:3], (112, 5, 143, 90), boxes[4], (114, 159, 200, 200)]
+    assert boxes == [b.xyxy for b in blocks]
+    crowded = [boxes[0]] * (MAX_REGIONS + 1)
+    assert line_context_boxes(crowded, [blocks[0]] * len(crowded), range(len(crowded)), 200, 200) is crowded
+
+
+def test_short_vertical_context_cannot_read_another_line_or_expand_a_long_caption():
+    boxes = [(10, 10, 30, 66), (12, 72, 32, 128), (70, 5, 90, 150)]
+    assert line_context_boxes(boxes, [block(b) for b in boxes], range(3), 100, 160) == boxes
+
+
 def test_empty_paragraphs_cannot_authorize_erasure_and_count_mismatch_fails():
     ocr = HayaiOCR.__new__(HayaiOCR)
     ocr.batch_size, ocr._recognize = 8, lambda crops: ['', '']
@@ -78,6 +96,15 @@ def test_empty_paragraphs_cannot_authorize_erasure_and_count_mismatch_fails():
     assert not any(''.join(row.texts) for row in rows)
     with pytest.raises(ValueError):
         asyncio.run(ocr.recognize(np.zeros((10, 10, 3), np.uint8), [block((0, 0, 5, 5))], None))
+
+
+@pytest.mark.parametrize('indices', [[0], [1, 0]])
+def test_processor_cannot_assign_text_to_the_wrong_crop(monkeypatch, indices):
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace())
+    ocr = HayaiOCR.__new__(HayaiOCR)
+    ocr.processor = lambda **_: {'valid_indices': indices}
+    with pytest.raises(ValueError, match='skipped or reordered'):
+        ocr._recognize([Image.new('RGB', (8, 8))] * 2)
 
 
 def test_explicit_retired_ocr_is_rejected_before_model_loading(tmp_path):
@@ -92,17 +119,16 @@ def test_truncated_or_empty_generation_cannot_authorize_erasure():
         '日本', '', '', '日']
 
 
-@pytest.mark.parametrize('corrupt', [False, True])
+@pytest.mark.parametrize('corrupt', [None, 'modeling_hayai.py', 'processing_hayai.py'])
 def test_preparation_publishes_only_verified_self_contained_assets(tmp_path, monkeypatch, corrupt):
     from tools import prepare_hayai
     from mtu_engine.ocr import models
     source, output = tmp_path / 'source', tmp_path / 'prepared'
     sources = {}
-    for folder, names in [('model', ['config.json', 'model.safetensors', 'modeling_hayai.py', 'README.md']),
-                          ('processor', ['config.json', 'preprocessor_config.json', 'README.md'])]:
+    for folder, spec in models.SOURCES.items():
         (source / folder).mkdir(parents=True)
         files = {}
-        for name in names:
+        for name in spec['files']:
             path = source / folder / name
             path.write_text('pinned ' + name)
             files[name] = models.file_hash(path)
@@ -110,7 +136,7 @@ def test_preparation_publishes_only_verified_self_contained_assets(tmp_path, mon
     monkeypatch.setattr(models, 'SOURCES', sources)
     monkeypatch.setattr(prepare_hayai, 'SOURCES', sources)
     if corrupt:
-        (source / 'model/modeling_hayai.py').write_text('modified executable code')
+        (source / 'model' / corrupt).write_text('modified executable code')
         with pytest.raises(ValueError, match='checksum'):
             prepare_hayai.prepare(source, output)
         assert not output.exists()

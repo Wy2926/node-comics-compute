@@ -15,7 +15,7 @@
 
 Windows 便携包使用 `data/node.json`；Linux 挂载 `node.local.json`。模型和字体从固定清单准备，运行时不下载。
 
-OCR 仅使用 Hayai，`engine.ocr_batch_size` 为 1–8。升级时先排空，配套更新运行环境和资产；原来显式设置 `engine.ocr_backend=classic` 的节点需删除该字段再 `check`。旧示例中的 `ocr_min_batch_size`、`ocr_arena_*` 已无效，可删除。没有指定 OCR 后端的旧配置会直接使用随包的 `models/hayai`。
+OCR 使用 Hayai v2.7 Supernova，每段最多 256 个图像块，`engine.ocr_batch_size` 为 1–8。从 v2.5 升级时先排空，按新锁准备资产，再运行 `check`。默认读取 `models/hayai`；若显式设置了 `engine.ocr_model`，须指向新准备的 v2.7 目录。旧配置中的 `engine.ocr_backend=classic` 需删除，`ocr_min_batch_size`、`ocr_arena_*` 已无效。
 
 CUDA、AMD 和 MPS 均从原图采样取色。旧 `engine.color_batch_size` 会被忽略，可直接沿用私有配置；恢复中的页继续使用检查点保存的颜色。
 

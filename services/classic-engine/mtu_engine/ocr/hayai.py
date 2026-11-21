@@ -10,10 +10,10 @@ from PIL import Image
 from classic_node.timing import record, stage, waiting_for
 from mtu_engine.backend import CUDA_GRAPH_MIN_FREE, check_cancelled, device_context
 from . import Reading
-from .crops import paragraph_box
+from .crops import line_context_boxes, paragraph_box
 from .models import verify_hayai
 
-MAX_PATCHES = 512
+MAX_PATCHES = 256
 MAX_TOKENS = 512
 
 
@@ -69,20 +69,21 @@ class HayaiOCR:
         self._lock = Lock()
         with device_context(backend, gpu):
             config = AutoConfig.from_pretrained(root / 'model', trust_remote_code=True, local_files_only=True)
-            vision = json.loads((root / 'processor/config.json').read_text())
-            config.vision_config = vision.get('vision_config', vision)
+            config.vision_config = json.loads((root / 'vision/config.json').read_text())['vision_config']
             model, loading = AutoModel.from_pretrained(root / 'model', config=config,
                 trust_remote_code=True, local_files_only=True, dtype=torch.float32, output_loading_info=True)
-            if (loading['missing_keys'] or loading.get('mismatched_keys') or loading.get('error_msgs')
-                    or set(loading['unexpected_keys']) != {'decoder.ids_norm.weight', 'decoder.ids_head.weight'}):
+            if any(loading[key] for key in ('missing_keys', 'mismatched_keys', 'unexpected_keys', 'error_msgs')):
                 raise ValueError('Hayai checkpoint does not match its pinned inference code')
+            model.drop_ids_head()
             model = model.to(self.device).eval()
-            self.processor = AutoImageProcessor.from_pretrained(root / 'processor', local_files_only=True)
+            self.processor = AutoImageProcessor.from_pretrained(root / 'model', trust_remote_code=True,
+                local_files_only=True, use_fast=False, num_workers=1)
             self.tokenizer = PreTrainedTokenizerFast.from_pretrained(root / 'model', local_files_only=True)
             # The pinned upstream engine exposes raw tokens and owns its fused
             # weights/KV cache. Avoid generate()'s silent FP32/reference fallback
             # and retain EOS information for truncation detection.
             self.engine = sys.modules[type(model).__module__]._FastEngine(model, torch.float16)
+            self.engine.MAX_STATES = 4  # Supernova caches eager KV states as well as graphs.
             free = torch.cuda.mem_get_info(gpu)[0] if backend != 'mps' else 0
             self.capture_lock = Lock() if backend == 'amd' else (
                 CudaModelCalls() if free >= CUDA_GRAPH_MIN_FREE else None)
@@ -112,6 +113,7 @@ class HayaiOCR:
         indices = sorted((i for i, (l, t, r, b) in enumerate(boxes)
                           if r > l and b > t and len(blocks[i].lines)),
                          key=lambda i: (boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1]))
+        boxes = line_context_boxes(boxes, blocks, indices, width, height)
         results = [Reading([]) for _ in blocks]
         record('ocr_paragraphs', len(indices))
         with stage('analyze_ocr'):
@@ -130,7 +132,9 @@ class HayaiOCR:
         record('ocr_batches', 1)
         record('ocr_batch_max', len(images), maximum=True)
         with stage('ocr_preprocess'):
-            inputs = self.processor(images=images, max_num_patches=MAX_PATCHES, return_tensors='pt')
+            inputs = self.processor(images=images, max_patches=MAX_PATCHES, return_tensors='pt')
+            if inputs.pop('valid_indices') != list(range(len(images))):
+                raise ValueError('Hayai processor skipped or reordered paragraph crops')
         with device_context(self.backend, self.gpu), waiting_for(
                 self._lock, 'ocr_lock_wait', 'ocr_model_lock_wait'), torch.inference_mode():
             check_cancelled()

@@ -14,6 +14,7 @@ from .timing import record, stage
 MAX_MASK_BYTES = 24 * 1024 * 1024
 MAX_RESULT_BYTES = 88 * 1024 * 1024
 MAX_CHECKPOINT_BYTES = 5 * 1024 * 1024
+MAX_REGIONS = 200
 
 
 def digest(value):

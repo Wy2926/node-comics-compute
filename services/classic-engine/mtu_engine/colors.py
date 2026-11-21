@@ -12,7 +12,7 @@ def _grid(width, height):
     return np.stack(((1 - u) * (1 - v), u * (1 - v), u * v, (1 - u) * v), axis=-1)
 
 
-_PROBE, _DETAIL = _grid(8, 8), _grid(64, 24)
+_PROBE, _DETAIL, _OUTLINE = _grid(8, 8), _grid(64, 24), _grid(96, 32)
 _BLACK, _WHITE = (0, 0, 0), (255, 255, 255)
 
 
@@ -104,6 +104,34 @@ def _masked(rgb, raw, quad, probe):
     return fill, paper
 
 
+def _white_outline(rgb, quad, fraction):
+    # Sample a few glyphs at their original aspect; a whole long line would collapse thin outlines.
+    segment = quad.copy()
+    segment[[1, 2]] = quad[[0, 3]] + fraction * (quad[[1, 2]] - quad[[0, 3]])
+    y, x = _points(rgb, segment, _OUTLINE)
+    crop = rgb[y, x].reshape(32, 96, 3)
+    white = cv2.inRange(crop, (220,) * 3, _WHITE)
+    if not white.size // 8 < cv2.countNonZero(white) < 3 * white.size // 4:
+        return None
+    ring = cv2.copyMakeBorder(white, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    cv2.floodFill(ring, None, (0, 0), 128)
+    ring = ring[1:-1, 1:-1]
+    inside = cv2.erode(np.uint8(ring == 0), cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))) != 0
+    outside = ring == 128
+    if inside.sum() < white.size // 100 or outside.sum() < white.size // 8:
+        return None
+    pixels = crop[inside]
+    ink = np.median(pixels, axis=0)
+    # Counters in ordinary white letters enclose the page rather than ink.
+    if (np.max(np.median(np.abs(pixels - ink), axis=0)) > 24
+            or np.max(np.abs(ink - np.median(crop[outside], axis=0))) < 24):
+        return None
+    stroke = np.median(crop[ring == 255], axis=0)
+    if _luminance(stroke) + .05 >= 3 * (_luminance(ink) + .05):
+        return ink, stroke
+    return None
+
+
 def _region_colors(rgb, raw, lines):
     if not len(lines):
         return (_BLACK, _WHITE), False
@@ -127,13 +155,22 @@ def _region_colors(rgb, raw, lines):
     if mask is None:
         return _simple(pixels), False
     if colored < 3:
-        return _gray(pixels, mask), False
-    if mask.max() < 128:
+        pair = _gray(pixels, mask)
+        if pair[0][0] < 220:
+            return pair, False
+    elif mask.max() < 128:
         return _simple(pixels), False
     ab, bc = quad[1] - quad[0], quad[2] - quad[1]
-    if ab @ ab < bc @ bc:
+    long_sq, short_sq = ab @ ab, bc @ bc
+    if long_sq < short_sq:
         quad = np.roll(quad, 1, axis=0)  # Align the long side to the 64-sample axis.
-    return _masked(rgb, raw, quad, pixels), True
+        long_sq, short_sq = short_sq, long_sq
+    if colored >= 3:
+        pair = _masked(rgb, raw, quad, pixels)
+    if min(pair[0]) >= 220 and np.count_nonzero((mask >= 128) & (pixels.min(axis=1) < 200)) >= 3:
+        fraction = min(1., 3 * np.sqrt(short_sq / max(1., long_sq)))
+        return _white_outline(rgb, quad, fraction) or pair, True
+    return pair, colored >= 3
 
 
 def sample_colors(rgb, regions, raw=None):

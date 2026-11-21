@@ -16,7 +16,7 @@ from mtu_engine.engine import Engine, serialize_region
 from mtu_engine.fonts import DEFAULT_FONT_IDS, FONT_CHOICES, resolve_font_id
 from .render_pool import RenderPool, RenderPoolError, RenderMemoryError, ipc_bytes, render_page
 from .operations import LOG
-from .protocol import MAX_CHECKPOINT_BYTES, NodeFailure, digest, mask_image, png64
+from .protocol import MAX_CHECKPOINT_BYTES, MAX_REGIONS, NodeFailure, digest, mask_image, png64
 from .timing import stage
 
 Image.MAX_IMAGE_PIXELS = None
@@ -164,7 +164,7 @@ class Runtime:
 
     def analyze(self, rgb, input_hash, *, masks=None):
         regions, mask, raw, bubbles = self.engine.analyze(rgb)
-        if len(regions) > 200:
+        if len(regions) > MAX_REGIONS:
             raise NodeFailure('CLASSIC_REGION_LIMIT_EXCEEDED')
         if any(len(region.text) > 4000 for region in regions):
             raise NodeFailure('CLASSIC_TEXT_LIMIT_EXCEEDED')

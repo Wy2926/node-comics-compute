@@ -4,14 +4,19 @@
 
 [websockets 17.4](https://pypi.org/project/websockets/17.4/) (BSD-3-Clause) implements the RFC 6455 client, keepalive, flow control and close handshake. [python-socks](https://pypi.org/project/python-socks/) (Apache-2.0) supports configured SOCKS proxies. Platform locks include wheel hashes; HTTP transfers remain on HTTPX.
 
-## Hayai OCR v2.5 Nova
+## Hayai OCR v2.7 Supernova
 
 [prepare_mtu.py](tools/prepare_mtu.py) includes
-[Hayai OCR v2.5 Nova](https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2.5-nova)
-at revision `2803d0dc005fa4396ab1e7c5a472d2c450a247f7` (Apache-2.0).
-Its original FP32 `model.safetensors` is 627,709,088 bytes, SHA-256
-`ac63cd177c5b68bd91e18dd4408e0400461c7cf19f484b0da1643e232d1ffc3a`.
-The [SigLIP2 NaFlex processor](https://huggingface.co/google/siglip2-base-patch16-naflex)
+[Hayai OCR v2.7 Supernova](https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2.7-supernova)
+at revision `f5f0f617f5148f760074f743e25576f381992c34` (Apache-2.0).
+Its original FP32 `model.safetensors` is 633,564,960 bytes, SHA-256
+`a531fc49ff0ec978f0c1eb377d853bdbe9a400559afc1d15de53d1e1bf4767b1`.
+Preprocessing uses Supernova's `HayaiImageProcessor` with a fixed budget of 256 patches per crop.
+For isolated horizontal lines at least twice as wide as tall, OCR can read one extra 16 px
+patch on each side. Short vertical lines (2–4 character widths tall) can read one character width
+at either end, up to 32 px, to recover clipped glyphs without moving the source geometry.
+It keeps tight crops when a neighbor would enter the crop or more than 200 regions need OCR.
+The [SigLIP2 NaFlex vision config](https://huggingface.co/google/siglip2-base-patch16-naflex)
 is pinned at `b53b807d3a2d5e2b3911292f2d69e5341cdc064c` (Apache-2.0);
 its weights are already included in the Hayai checkpoint and are not downloaded again.
 
@@ -28,7 +33,7 @@ specified in [the adapter](mtu_engine/ocr/hayai.py) and [its tests](tests/test_o
 
 On CUDA and Windows AMD, the adapter uses the upstream CUDA/HIP decoder graph path.
 At model load CUDA stays eager below 4 GiB free, and keeps up to five graph states
-with 4 to under 8 GiB free. AMD retains the native four-state LRU below 8 GiB.
+with 4 to under 8 GiB free. AMD below 8 GiB and eager-only backends keep at most four states.
 With at least 8 GiB free the limit is eight, or nine for batch size eight to retain
 one additional visual-prefix bucket. States are still allocated on demand, with
 native eviction and eager fallback on capture failure. The shared
@@ -55,7 +60,7 @@ Local source edits are recorded verbatim as ordered per-file patches in the lock
 - `DefaultDetector` in `manga_translator/detection/default.py` exposes the native batch limit as an instance attribute supplied by local node configuration and supplies the DBNet-specific 256-pixel alignment required by its 1/256 feature joins.
 - The loader calls `mtu_engine/detection.py` after loading the full checkpoint. For FP16 it first folds the pinned ResNet/Sequential Conv2d and ConvTranspose2d/BatchNorm pairs in FP32 using PyTorch's `fuse_conv_bn_eval`; any remaining BatchNorm2d rejects startup. The eval detector uses the native `conv_db.binarize` head directly: the DB decoder and debug path only consume channel 0, not the learned threshold channel. Both precision modes retain the native mask head. RGB bytes transfer before FP32 normalization and casting to model precision. DB sigmoid and CPU probability maps use FP32. Low precision can change OCR, masks and final pixels.
 - On the ordinary-page path the native OpenCV bilateral filter (diameter 17, both sigmas 80) runs before resize. On a matching OpenCL GPU each upload is limited to `detect_size²` pixels, independent of the DBNet batch size. Larger images use horizontal strips with eight context rows on each internal edge; only the interior is copied back. CPU filtering is retained if no GPU matches or the budget is too small for useful strips. CPU and OpenCL rounding can yield different detections. The long-page tiling path is separate.
-- Its DB postprocessor candidate budget scales by merged probability-map area, retaining 1,000 candidates per equivalent `detect_size²` input window with a 3,000-candidate cap, as in MMOCR's default decoder budget. `default_utils/dbnet_utils.py` passes a uint8 0/1 bitmap directly to OpenCV and skips empty or split unclip results; native contour-based scoring and valid box geometry remain intact.
+- Its DB postprocessor candidate budget scales by merged probability-map area, retaining 1,000 candidates per equivalent `detect_size²` input window with a 3,000-candidate cap, as in MMOCR's default decoder budget. `default_utils/dbnet_utils.py` passes a uint8 0/1 bitmap directly to OpenCV and skips empty or split unclip results. It compares the native box score at three decimal places to tolerate small re-encoding differences at the cutoff; it returns the original score and geometry.
 - `CommonDetector` only builds a pre-border rearrange plan for inputs whose short side needs border handling. Border removal rejects boxes wholly outside either axis, copies points before clipping, and discards zero-area results.
 - In `manga_translator/rendering/__init__.py`, polygon containment rasterizes only the clipped bounds. The [inscribed rectangle search](mtu_engine/inscribed_rect.py) updates one histogram row at a time and visits height changes, retaining MTU's row and tie order, including holes. Centering and fitting share the same region mask during one sizing pass.
 - The renderer accepts original-mask bubble ownership and uses the inset mask for fitting. Rich text can grow beyond the OCR box within the mask bounds, with native collision checks against placed and pending paragraphs. Dispatch can paint geometry prepared by [the layout adapter](mtu_engine/layout.py) directly; sizing policy is documented in [the pipeline](../../docs/PIPELINE.md).
@@ -74,7 +79,7 @@ The lock also records the DBNet checkpoint from [manga-image-translator](https:/
 
 On NVIDIA, explicit FP16 DBNet inference stores the folded convolution weights in PyTorch's `channels_last` format at load time to match the existing NHWC-backed image tensors. Checkpoint files and the FP32 path are unchanged.
 
-The node's [RGB sampler](mtu_engine/colors.py) sets fill and outline via MTU's `TextBlock.set_font_colors`. It reuses DBNet's existing stroke mask. Near-gray regions use a sparse NumPy probe; color regions use OpenCV's CPU distance transform on one small grid. All backends share this path; no color weights or additional inference are required.
+The node's [RGB sampler](mtu_engine/colors.py) sets fill and outline via MTU's `TextBlock.set_font_colors`. It reuses DBNet's existing stroke mask. Near-gray regions use a sparse NumPy probe; color regions use OpenCV's CPU distance transform on one small grid. When a near-white fill has dark detected pixels, a 96×32 line segment distinguishes ink enclosed by a white outline from background enclosed by a white letter. All backends share this path; no color weights or additional inference are required.
 
 The LaMa adapter in [inpainting.py](mtu_engine/inpainting.py) wraps the pinned
 upstream FP32 generator with PyTorch CUDA/HIP graphs, captured only during startup for
@@ -87,7 +92,7 @@ event; HIP synchronizes before releasing the lock. Unsupported shapes stay eager
 
 ## BallonsTranslator
 
-[dmMaze/BallonsTranslator](https://github.com/dmMaze/BallonsTranslator) supplies the unmodified `group_output` paragraph grouping and reading order, operating on MTU DBNet text lines. Its commit and archive SHA-256 are pinned in the same lock. Preparation retains `ballontranslator/`, the resources required by its library imports, `BallonsTranslator-LICENSE` and its dependency manifest under `upstream/`. No CTD checkpoint is distributed or executed. The adapter does not run the BallonsTranslator GUI or translation modules. No source extraction, rewritten grouping or upstream patch is maintained.
+[dmMaze/BallonsTranslator](https://github.com/dmMaze/BallonsTranslator) supplies `group_output` paragraph grouping and reading order for MTU DBNet lines. Preparation retains its pinned source, resources, `BallonsTranslator-LICENSE` and dependency manifest. One [locked edit](mtu_engine/upstream.lock.json) adds an alignment check to `try_merge_textline`: even when adjacent upright columns overlap in height, their tops, bottoms or midpoints must align within 1.5 character widths before joining. This uses MTU's alignment principle without running a second detector or a page-wide graph. Intersecting lines, rotated text and horizontal grouping keep their existing rules.
 
 ## Runtime and data
 

@@ -11,8 +11,8 @@ from tools import prepare_mtu
 
 def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cache(tmp_path, monkeypatch):
     output, cache = tmp_path / 'prepared', tmp_path / 'download-cache'
-    stale = ('models/retired/weights.bin', 'upstream/retired/module.py',
-             'upstream/retired/LICENSE', 'licenses/retired-model.txt',
+    stale = ('models/retired/weights.bin', 'models/hayai/processor/preprocessor_config.json',
+             'upstream/retired/module.py', 'upstream/retired/LICENSE', 'licenses/retired-model.txt',
              'fonts/RetiredFont.ttf', 'licenses/RetiredFont-OFL.txt',
              'models/ocr/ocr_ar_48px.ckpt', 'models/ocr/alphabet-all-v7.txt', 'upstream/comic_translate/LICENSE')
     for name in stale:
@@ -64,11 +64,12 @@ def test_prepare_removes_retired_generated_assets_but_preserves_samples_and_cach
     monkeypatch.setattr(prepare_mtu, 'download', download)
     manifest = prepare_mtu.prepare(output, cache)
     assert verify(output / 'models') == manifest
-    for relative, patches in LOCK['source']['patches'].items():
-        expected = '# Upstream license retained\n' + ''.join(p['before'] for p in patches) + '# Other source retained\n'
-        for patch in patches:
-            expected = expected.replace(patch['before'], patch['after'])
-        assert (output / 'upstream' / relative).read_text(encoding='utf-8') == expected
+    for key in ('source', 'ballons'):
+        for relative, patches in LOCK[key]['patches'].items():
+            expected = '# Upstream license retained\n' + ''.join(p['before'] for p in patches) + '# Other source retained\n'
+            for patch in patches:
+                expected = expected.replace(patch['before'], patch['after'])
+            assert (output / 'upstream' / relative).read_text(encoding='utf-8') == expected
     with pytest.raises(ValueError, match='target changed'):
         prepare_mtu.apply_source_patches(output / 'upstream')
     assert all(not (output / name).exists() for name in stale)

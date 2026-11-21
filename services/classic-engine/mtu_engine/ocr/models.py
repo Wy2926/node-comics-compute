@@ -1,4 +1,4 @@
-"""Pinned Hayai weights, inference code, tokenizer and SigLIP2 processor."""
+"""Pinned Hayai weights, inference code, processor, tokenizer and SigLIP2 vision config."""
 import json
 from pathlib import Path
 

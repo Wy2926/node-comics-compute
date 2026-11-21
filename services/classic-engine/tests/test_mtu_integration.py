@@ -418,6 +418,17 @@ def test_detection_skips_empty_or_split_unclip_results(assets, monkeypatch, part
     assert not boxes.any() and not scores.any()
 
 
+def test_detection_accepts_borderline_box_without_rounding_reported_score(assets):
+    from mtu_engine.assets import activate
+    activate(assets[0])
+    from manga_translator.detection.default_utils.dbnet_utils import SegDetectorRepresenter
+    pred = np.zeros((64, 100), np.float32)
+    for i, value in enumerate((.5994, .59995, .60044)):
+        pred[12:42, 8+i*32:22+i*32] = value
+    _, scores = SegDetectorRepresenter(.5, .6).boxes_from_bitmap(pred, pred > .5, 100, 64)
+    np.testing.assert_allclose(np.sort(scores[scores > 0]), [.59995, .60044], atol=1e-6)
+
+
 def test_detection_border_removal_rejects_padding_without_mutating_lines(assets):
     from types import SimpleNamespace
     from mtu_engine.assets import activate
@@ -456,6 +467,24 @@ def test_detection_only_plans_before_border_for_small_inputs(assets, shape, rear
     asyncio.run(Detector().detect(np.zeros((*shape, 3), np.uint8), 1280, .5, .6, 2.3))
     assert len(checks) == int(min(shape) < 400)
     assert sizes == [shape if rearrange else (400, 400)]
+
+
+def test_staggered_vertical_captions_keep_reading_order_and_the_short_aside(assets):
+    Renderer(*assets)
+    from ballontranslator.utils.textblock import group_output
+
+    def column(x, top, bottom):
+        return np.array([[x, top], [x+20, top], [x+20, bottom], [x, bottom]])
+
+    # Two pairs staggered by five glyphs; a short aside sits inside the last column's vertical span.
+    columns = [column(160, 10, 260), column(132, 12, 240), column(104, 110, 370),
+               column(76, 112, 325), column(48, 243, 285)]
+    def groups(lines):
+        return [[line[0][0] for line in block.lines] for block in group_output([], lines, 220, 400)]
+
+    assert groups(columns[::-1]) == [[160, 132], [104, 76], [48]]
+    for top, bottom in [(10, 210), (85, 185), (190, 260)]:  # top-, center-, and bottom-aligned dialogue
+        assert groups([column(132, top, bottom), columns[0]]) == [[160, 132]]
 
 
 @pytest.mark.parametrize('horizontal', [False, True])

@@ -105,6 +105,23 @@ def test_unusable_mask_falls_back_to_observed_pixels(shape, value):
     assert tuple(block.fg_colors) == (41, 99, 193) and tuple(block.bg_colors) == (235, 243, 239)
 
 
+@pytest.mark.parametrize('ink', [(108, 98, 96), (212, 72, 108), (255, 255, 255)])
+def test_thick_white_outline_is_not_mistaken_for_white_lettering(ink):
+    from PIL import Image, ImageDraw, ImageFont
+    paper, white = (160, 145, 140), (255,) * 3
+    image = Image.new('RGB', (260, 70), paper)
+    draw, font = ImageDraw.Draw(image), ImageFont.load_default(size=35)
+    text = 'BOBOBO'
+    draw.text((10, 9), text, font=font, fill=ink, stroke_fill=white, stroke_width=3)
+    l, t, r, b = draw.textbbox((10, 9), text, font=font, stroke_width=3)
+    block = region([[[l-3, t-3], [r+3, t-3], [r+3, b+3], [l-3, b+3]]])
+    rgb = np.asarray(image)
+    mask = np.any(rgb != paper, axis=2).astype(np.uint8) * 255
+    sample_colors(rgb, [block], mask)
+    np.testing.assert_allclose(block.fg_colors, ink, atol=3)
+    np.testing.assert_allclose(block.bg_colors, paper if ink == white else white, atol=16)
+
+
 def test_bad_geometry_falls_back_and_cancellation_stops_between_regions():
     blocks = [region([]), region([np.full((4, 2), np.nan)]), region([])]
     def stop():
