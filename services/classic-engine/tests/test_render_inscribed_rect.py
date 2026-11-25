@@ -72,6 +72,16 @@ def test_disconnected_components_holes_and_equal_area_order(helpers):
     assert helpers.rect(mask) == helpers.original(mask)
 
 
+def test_repeated_foreground_rows_cross_bands_and_keep_first_equal_winner(helpers):
+    mask = np.zeros((226, 30), np.int16)
+    mask[7:97, 3:13] = 1
+    mask[7:97:2, 3:13] = 9  # Same foreground, not necessarily the same pixel value.
+    mask[110:185, 14:26] = 1
+    assert helpers.rect(mask) == helpers.original(mask) == (3, 7, 10, 90)
+    mask[59, 6] = -1
+    assert helpers.rect(mask) == helpers.original(mask) == (14, 110, 12, 75)
+
+
 def test_cancellation_during_histogram_search_leaves_mask_reusable(helpers):
     from mtu_engine.backend import cancellation
     mask = np.ones((180, 9), np.uint8)

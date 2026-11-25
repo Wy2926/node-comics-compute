@@ -13,6 +13,24 @@
 
 主要入口：`classic_node/agent.py`、`pipeline.py`、`document_runner.py`（调度），`mtu_engine/engine.py`（图像阶段），`classic_node/protocol.py`（输出）。部署、排空与恢复见[节点配置](NODE_CONFIGURATION.md)。
 
+## 与开源上游的同图对照（2026-11-22）
+
+节点 `a4ee764` 的手工补丁及模型版本见[来源清单](../services/classic-engine/THIRD_PARTY.md)。[MTU main](https://github.com/hgmzhn/manga-translator-ui/compare/a1ad823b0d679d1a0665b8bc94de7e8a1c38e54d...8cd6feec33a66ace50042f75676965eb3d4d8a10) 比节点锁定版多 14 个提交，最新正式版为 `v3.0.4`；[BallonsTranslator dev](https://github.com/dmMaze/BallonsTranslator/compare/ea9dcd5e18fb26091ec5c44ed947ce5e11b6c8d8...b59f0031df85e5144bea13e7a6879a0bdbbc7699) 多 58 个，最新正式版为 `v1.5.23`。以下比较默认分支，不把桌面编辑功能计为自动翻译效果。
+
+**分组与嵌字。** 固定三套漫画的 102 页、2,059 个 DBNet 行框。OCR 前节点分成 753 段；MTU 分成 737 段、20 页归属不同；Ballons 分成 758 段、8 页不同且少归入 1 行；[manga-image-translator `89d7a8e`](https://github.com/zyddnys/manga-image-translator/tree/89d7a8ead7fc6f9b21236a6c51d3854ccfe0acbf) 分成 769 段、34 页不同。页数差异不是错误率：《第1话》第 5 页 MTU 和节点都能拆对两段旁白，`Chapter 513` 第 16 页 MTU 却把相邻分镜连成一段。另冻结 5 页的段框、抹字底图、字体和简中测试译文，76 段均出字；MTU 原生气泡模式与节点实测字迹重叠分别为 3 对和 0 对，均在越南语第 9 页。保留节点局部避让和拥挤回退。
+
+已采用 [MTU 的重复掩膜行合并](https://github.com/hgmzhn/manga-translator-ui/commit/45afc0af5e5ef76d2a393efc118c9ce3bc4dde26)来搜索气泡内可放字的最大矩形。104 个不同的真实局部掩膜，交错热测，单次搜索中位数从 **5.81 降到 2.13 ms**；6 页固定英文译文的 Qt 排版中位数之和 **3.14 → 3.01 s**（约少 4%，不含翻译和抹字）。102 页简中和 6 页英文的新旧排版逐像素相同。
+
+**OCR。** 从上述图集及另 1 张西语长图看图转写 70 段。固定行框归属，节点 Hayai v2.7 按段识别；[MTU 的 Paddle 适配器](https://github.com/hgmzhn/manga-translator-ui/blob/8cd6feec33a66ace50042f75676965eb3d4d8a10/manga_translator/ocr/model_paddleocr.py) 按行透视裁剪、识别后合回同段。下表是字符增删改次数，越少越好。统一大小写，保留重音及汉字；不计空白、数字、标点，日语只计正文。这是小样识别结果，不是 LLM 译文准确率。
+
+| 样本 | 正文字符 | 节点 Hayai | PP-OCRv6 medium | PP-OCRv5 Latin |
+| --- | ---: | ---: | ---: | ---: |
+| 西语横排，29 段 | 693 | 39 | 2 | 1 |
+| 越南语横排，31 段 | 567 | 185 | 146 | 152 |
+| 日语竖排，10 段 | 54 | 1 | 3 | — |
+
+西语同一批样本将 Hayai 视觉块预算由 256 提至 384、512 后，错误数分别为 44、42。优先验证按**源语**选用拉丁识别，而非对所有页提高分辨率；Paddle 两组权重只用于离线对照。翻译层另有取舍：中心互动请求有同页上下文，文件请求在模型容量内联合各页 OCR；[Ballons 的按页命中术语与项目记忆](https://github.com/dmMaze/BallonsTranslator/blob/b59f0031df85e5144bea13e7a6879a0bdbbc7699/README_EN.md#L43-L95)、[Comic Translate 的可选图像上下文](https://github.com/ogkalu2/comic-translate/blob/8977b91a4f7a40c3917c5a268e9e7d78e1d818da/README.md#translation)适合在中心评估。
+
 ## 并发与资源
 
 - 下载、分析／抹字、渲染、落盘和交付分别有界。页面、原生掩膜和渲染进程传输缓冲共用 `resident_bytes`。可选参考掩膜每页最多 64 MiB；内存不足不增加并发。文件拆页及 ZIP 另受工作区磁盘预算约束。
